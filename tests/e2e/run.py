@@ -467,7 +467,7 @@ def leases_deliver_renew_refuse_and_expire():
         s.frame()
         r.wait("/touch/t/down", since=m)
         short.none("/touch/t/down", during=0.3, since=ms)
-        ev = r.wait("/touch/event", lambda x: x.args[0] == "subscriber" and x.args[1].endswith("ended"), timeout=1)
+        ev = r.wait("/touch/event", lambda x: x.args[0] == "subscriber" and "ended" in x.args[1], timeout=1)
         check(str(short.port) in ev.args[1], "expiry event %s" % ev.args)
 
 
@@ -725,7 +725,7 @@ def status_describes_the_device():
         r.send("/touch/status/send")
         r.wait("/touch/run", since=m)
         log = c.daemons[0].log_text()
-        check("touch-to-osc 0.2.0 (osc_api 2)" in log, "banner")
+        check("touch-to-osc 0.2.1 (osc_api 2)" in log, "banner")
 
 
 @test()
@@ -779,13 +779,14 @@ def rotation_setting_restarts_reading_and_is_saved():
         check(req(r, "/touch/device/t/rotation", 90) == ["ok", ""], "rotation refused")
         cancel = r.wait("/touch/t/cancel", since=m)
         check(cancel.args[:2] == [c1, "reconfigured"], "cancel %s" % cancel.args)
-        r.wait("/touch/device/t/state", lambda x: x.args == ["restarting"], since=m)
-        r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m, timeout=3)
+        r.wait("/touch/event", lambda x: x.args[0] == "device" and "map differently" in x.args[1], since=m)
+        check(not try_grab(s.node), "the device was let go: a rotation must not reopen it")
         ev = r.wait("/touch/event", lambda x: x.args[0] == "settings", since=m)
         check(ev.args[1] == "t rotation 0 -> 90, from 127.0.0.1", "event %r" % ev.args[1])
         r.wait("/touch/device/t/rotation", lambda x: x.args == [90], since=m)
         r.wait("/touch/overrides", lambda x: x.args == ["device/t/rotation"], since=m)
         r.wait("/touch/settings_file", lambda x: x.args == [d.settings], since=m)
+        check(not r.all(m, "/touch/device/t/state", lambda x: x.args == ["restarting"]), "a rotation restarted the device")
         m2 = r.mark()
         s.touch(0, 1, 150, 150)
         s.frame()
@@ -946,8 +947,15 @@ def match_port_moves_reading_to_another_screen():
         c.daemon([device(p, port="tto-pa-%d" % os.getpid())])
         r = c.receiver()
         connected(r)
+        a.touch(0, 7, 50, 50)
+        a.frame()
+        held = r.wait("/touch/t/down").args[0]
         m = r.mark()
         check(req(r, "/touch/device/t/match_port", "tto-pb-%d" % os.getpid()) == ["ok", ""], "port")
+        cancel = r.wait("/touch/t/cancel", since=m)
+        check(cancel.args[:2] == [held, "reconfigured"], "cancel %s" % cancel.args)
+        a.lift(0)
+        a.frame()
         r.wait("/touch/device/t/state", lambda x: x.args == ["restarting"], since=m)
         r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m, timeout=3)
         m2 = r.mark()
@@ -1001,6 +1009,197 @@ def a_refused_settings_file_is_set_aside():
         check(any("device.t.rotation: must be 0, 90, 180 or 270" in a and ".refused" in a for a in reasons), "reasons %s" % reasons)
         check(os.path.exists(path + ".refused") and not os.path.exists(path), "the file was not set aside")
         r.wait("/touch/device/t/rotation", lambda x: x.args == [0])
+
+
+@test()
+def an_expired_lease_stops_getting_touches_while_others_renew():
+    import threading
+    with Ctx("leaserace") as c:
+        p = test_product()
+        s = c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver(subscribe=False)
+        stop = [False]
+
+        def hammer():
+            while not stop[0]:
+                r.subscribe(10)
+                time.sleep(0.02)
+
+        threading.Thread(target=hammer, daemon=True).start()
+        connected(r)
+        short = c.receiver(subscribe=False)
+        short.subscribe(1)
+        short.wait("/touch/osc_api", timeout=2)
+        time.sleep(2.5)
+        m = r.mark()
+        ms = short.mark()
+        s.touch(0, 1, 10, 10)
+        s.frame()
+        r.wait("/touch/t/down", since=m)
+        short.none("/touch/t/down", during=0.4, since=ms)
+        stop[0] = True
+
+
+@test()
+def an_unchanged_setting_is_neither_saved_nor_reported():
+    with Ctx("setsame") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        m = r.mark()
+        check(req(r, "/touch/device/t/rotation", 0) == ["ok", ""], "same value")
+        check(req(r, "/touch/settings/forget") == ["ok", ""], "forget nothing")
+        r.none("/touch/event", lambda x: x.args[0] == "settings", during=1.5, since=m)
+        check(not os.path.exists(d.settings), "an unchanged value was saved")
+
+
+@test()
+def a_burst_of_settings_is_saved_and_reported_sparingly():
+    import threading
+    import watch
+    with Ctx("setburst") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        inodes = set()
+        stop = [False]
+
+        def watch_file():
+            while not stop[0]:
+                try:
+                    st = os.stat(d.settings)
+                    inodes.add((st.st_ino, st.st_mtime_ns))
+                except OSError:
+                    pass
+                time.sleep(0.001)
+
+        t = threading.Thread(target=watch_file, daemon=True)
+        t.start()
+        m = r.mark()
+        for batch in range(4):
+            msgs = [watch.encode("/touch/device/t/label", "label %d" % (batch * 50 + k)) for k in range(50)]
+            r.sock.sendto(watch.encode_bundle(msgs), ("127.0.0.1", DAEMON_PORT))
+        r.wait("/touch/device/t/label", lambda x: x.args == ["label 199"], since=m, timeout=3)
+        time.sleep(2.5)
+        stop[0] = True
+        t.join()
+        with open(d.settings) as f:
+            text = f.read()
+        check("label 199" in text, "the last label was not saved: %s" % text)
+        check(len(inodes) <= 2, "the settings file was rewritten %d times for one burst" % len(inodes))
+        events = r.all(m, "/touch/event", lambda x: x.args[0] == "settings")
+        check(len(events) <= 12, "%d settings events for one burst" % len(events))
+        check(any("came too fast" in e.args[1] for e in events), "no summary of the suppressed events: %s" % [e.args for e in events[-3:]])
+        r.wait("/touch/alive", lambda x: x.at > time.time() - 1.5, timeout=2)
+
+
+@test()
+def a_removed_failing_destination_clears_the_warning():
+    with Ctx("setfail") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        m = r.mark()
+        check(req(r, "/touch/saved_destinations/add", "255.255.255.255:9") == ["ok", ""], "add")
+        r.wait("/touch/reasons", lambda x: any("sending to 255.255.255.255:9 fails" in a for a in x.args), since=m, timeout=3)
+        m = r.mark()
+        check(req(r, "/touch/saved_destinations/remove", "255.255.255.255:9") == ["ok", ""], "remove")
+        r.wait("/touch/health", lambda x: x.args == ["ok"], since=m, timeout=3)
+
+
+@test()
+def the_disabled_reason_says_where_it_came_from():
+    with Ctx("offreason") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p, enabled=False)])
+        r = c.receiver()
+        r.wait("/touch/device/t/reason", lambda x: "in the config file (enabled = false)" in x.args[0], timeout=3)
+        m = r.mark()
+        check(req(r, "/touch/device/t/enabled", 1) == ["ok", ""], "on")
+        r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m)
+    with Ctx("offreason2") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        m = r.mark()
+        check(req(r, "/touch/device/t/enabled", 0) == ["ok", ""], "off")
+        r.wait("/touch/device/t/reason", lambda x: "by a saved setting" in x.args[0] and "/touch/device/t/enabled 1" in x.args[0], since=m)
+
+
+@test()
+def text_settings_must_be_ascii():
+    with Ctx("ascii") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        got = req(r, "/touch/device/t/label", "Gesicht ö")
+        check(got == ["refused", "label may only use printable ASCII characters"], "got %s" % got)
+
+
+@test()
+def a_refused_settings_file_keeps_a_screen_turned_off():
+    with Ctx("keepoff") as c:
+        p = test_product()
+        c.screen(p)
+        os.makedirs(RUN_DIR, exist_ok=True)
+        path = os.path.join(RUN_DIR, "keepoff-settings.toml")
+        for f in (path, path + ".refused"):
+            if os.path.exists(f):
+                os.remove(f)
+        with open(path, "w") as f:
+            f.write("[device.t]\nenabled = false\nrotation = 45\n")
+        c.daemon([device(p)], name="keepoff", keep_settings=True)
+        r = c.receiver()
+        r.wait("/touch/device/t/state", lambda x: x.args == ["disabled"], timeout=3)
+        reasons = r.wait("/touch/reasons", lambda x: any("stays turned off" in a for a in x.args)).args
+        check(any("set aside" in a for a in reasons), "reasons %s" % reasons)
+        r.wait("/touch/settings_file", lambda x: x.args == [path], timeout=3)
+        with open(path) as f:
+            check("enabled = false" in f.read(), "the kept setting was not saved again")
+
+
+@test()
+def refusals_to_many_outside_hosts_are_capped():
+    import socket
+    import watch
+    with Ctx("outsiders") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        socks = []
+        try:
+            for k in range(2, 102):
+                s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s2.bind(("127.0.0.%d" % k, 19499))
+                s2.setblocking(False)
+                socks.append(s2)
+            for s2 in socks:
+                s2.sendto(watch.encode("/touch/ping"), ("127.0.0.1", DAEMON_PORT))
+            time.sleep(0.5)
+            answered = 0
+            for s2 in socks:
+                try:
+                    s2.recvfrom(65536)
+                    answered += 1
+                except BlockingIOError:
+                    pass
+        finally:
+            for s2 in socks:
+                s2.close()
+        MEASURED.append("100 outside hosts at once: %d refusals answered" % answered)
+        check(0 < answered <= 25, "%d of 100 outside hosts were answered" % answered)
 
 
 def replay(name, silence_ms=200, after=None):

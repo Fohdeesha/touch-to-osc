@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.2.1 - 2026-10-21
+
+Hardening for long, unattended running.
+
+- A subscriber whose lease ran out while another subscriber was renewing kept getting
+  touches; it no longer does.
+- Settings changed over OSC are written to disk at most once a second, a change that
+  changes nothing is neither saved nor reported, and a clean stop writes at once.
+- Rotation, mirror, calibration and aspect apply without reopening the screen; only
+  grab and the match settings reopen it.
+- Events of one kind are passed on 10 at once and then one a second, with a count of the
+  rest; refusals to hosts outside `allowed_ips` are capped at 20 a second; the memory of
+  refused hosts and of failing destinations no longer grows, and a removed failing
+  destination stops the health warning.
+- Logging never waits for the journal: lines it cannot take are dropped and counted.
+- A refused or unreadable settings file keeps a screen that it had turned off turned off,
+  and its warning stays until the next restart.
+- Text settings must be printable ASCII (a non-ASCII value could make the settings file
+  unreadable at the next start).
+- The disabled reason says whether the config file or a saved setting turned the screen
+  off, and how to turn it back on.
+- Retaking a screen from another program reads it afresh; with `grab = false`, a screen
+  that goes silent with fingers down is checked for another program holding it.
+- The device's clock is set before anything is queued (no false "events dropped"
+  warning when a screen is opened mid-touch), a permission refusal is reported only if it
+  lasts a second (udev applies the group a moment after the node appears), a reader that
+  hits an internal error cancels its contacts and starts again, and a failing wait no
+  longer loops.
+- Status goes out in bundles and only when something changed; the once-a-second work
+  follows the clock, not timer wakeups.
+- OSC packets up to 64 KB are read whole; frame numbers and contact ids wrap to 1.
+- The service restarts without limit.
+- `log.level = "debug"` logs every command and lease renewal.
+
 ## 0.2.0 - 2026-10-21
 
 OSC interface version 2: the daemon's health in a receiver's app, and its settings

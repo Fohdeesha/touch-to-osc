@@ -283,6 +283,32 @@ Result<SettingsLoad> parse_settings(const std::string& text, const std::string& 
     return out;
 }
 
+namespace {
+
+std::vector<std::string> keep_turned_off(const std::string& text, const Config& base, Overrides& o) {
+    std::vector<std::string> kept;
+    toml::table tbl;
+    try {
+        tbl = toml::parse(text, std::string("settings"));
+    } catch (const toml::parse_error&) {
+        return kept;
+    }
+    const toml::table* devices = tbl["device"].as_table();
+    if (!devices) return kept;
+    for (const auto& d : base.devices) {
+        const toml::node* v = devices->get(d.id);
+        const toml::table* t = v ? v->as_table() : nullptr;
+        const toml::node* e = t ? t->get("enabled") : nullptr;
+        if (e && e->is_boolean() && !e->as_boolean()->get() && d.enabled) {
+            o.devices[d.id].enabled = false;
+            kept.push_back(d.id);
+        }
+    }
+    return kept;
+}
+
+}
+
 SettingsLoad load_settings(const Config& base, bool set_aside_refused) {
     SettingsLoad none;
     const std::string& path = base.paths.settings;
@@ -290,26 +316,26 @@ SettingsLoad load_settings(const Config& base, bool set_aside_refused) {
     if (path.empty() || stat(path.c_str(), &st) != 0) return none;
     none.file_exists = true;
     auto text = read_file(path, 1 << 20);
-    if (!text) {
-        none.problem = "the settings file " + path + " cannot be read (" + text.error() + "); running on the config file alone";
-        return none;
+    Result<SettingsLoad> parsed = text ? parse_settings(*text, path, base) : Result<SettingsLoad>(err(text.error()));
+    if (parsed) {
+        parsed->file_exists = true;
+        return std::move(*parsed);
     }
-    auto parsed = parse_settings(*text, path, base);
-    if (!parsed) {
-        none.problem = "the settings file was refused: " + parsed.error();
-        if (set_aside_refused) {
-            std::string aside = path + ".refused";
-            if (std::rename(path.c_str(), aside.c_str()) == 0) {
-                none.problem += "; it was set aside as " + aside + " and touch-to-osc runs on the config file alone";
-                none.file_exists = false;
-            } else {
-                none.problem += "; setting it aside failed (" + errno_str() + ") and touch-to-osc runs on the config file alone";
-            }
+    none.problem = (text ? "the settings file was refused: " : "the settings file cannot be read: ") + parsed.error();
+    if (text) {
+        auto kept = keep_turned_off(*text, base, none.overrides);
+        for (const auto& id : kept) none.problem += "; device " + id + " stays turned off as it was saved";
+    }
+    if (set_aside_refused) {
+        std::string aside = path + ".refused";
+        if (std::rename(path.c_str(), aside.c_str()) == 0) {
+            none.problem += "; it was set aside as " + aside + " and touch-to-osc runs on the config file";
+            none.file_exists = false;
+        } else {
+            none.problem += "; setting it aside failed (" + errno_str() + ") and touch-to-osc runs on the config file";
         }
-        return none;
     }
-    parsed->file_exists = true;
-    return std::move(*parsed);
+    return none;
 }
 
 }

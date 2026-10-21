@@ -12,8 +12,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <exception>
 #include <poll.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -93,8 +95,7 @@ void DeviceReader::event(EventKind kind, log::Level level, const char* fmt, ...)
 void DeviceReader::publish_info() {
     if (!enabled_) {
         info_.state = DevState::disabled;
-        copy_text(info_.reason, sizeof info_.reason,
-                  "turned off by a command: send " + prefix_ + "/device/" + cfg_.id + "/enabled 1 to turn it back on (a restart also does)");
+        copy_text(info_.reason, sizeof info_.reason, "turned off");
     } else {
         info_.state = base_state_;
         copy_text(info_.reason, sizeof info_.reason, base_reason_);
@@ -119,15 +120,37 @@ void DeviceReader::run() {
     if (inotify_) inotify_add_watch(inotify_.get(), paths_.dev_input.c_str(), IN_CREATE | IN_ATTRIB | IN_MOVED_TO);
     publish_info();
     while (!sh_.stop.load()) {
-        if (open_device()) {
-            session();
-            continue;
+        try {
+            if (open_device()) {
+                session();
+                continue;
+            }
+            wait_for_change(2000);
+        } catch (const std::exception& e) {
+            recover(e.what());
+        } catch (...) {
+            recover("unknown error");
         }
-        wait_for_change(2000);
     }
     info_.connected = false;
     info_.grabbed = false;
     publish_info();
+}
+
+void DeviceReader::recover(const char* what) {
+    int n = 0;
+    try {
+        if (dev_) n = cancel("device lost");
+    } catch (...) {
+    }
+    close_device();
+    event(EventKind::device, log::Level::err, "%s: reading stopped on an internal error (%s); %d contact%s cancelled; trying again in a second", cfg_.id.c_str(), what, n,
+          plural(n));
+    try {
+        set_state(DevState::read_error, std::string("internal error while reading (") + what + "); touch-to-osc tries again every second");
+    } catch (...) {
+    }
+    wait_for_change(1000);
 }
 
 void DeviceReader::wait_for_change(int timeout_ms) {
@@ -137,9 +160,46 @@ void DeviceReader::wait_for_change(int timeout_ms) {
     if (p[0].revents) drain_fd(p[0].fd);
     if (p[1].revents) {
         drain_fd(p[1].fd);
-        if (sh_.cfg_gen.load() != cfg_gen_) take_new_config();
+        if (sh_.cfg_gen.load() != cfg_gen_) {
+            pull_config();
+            set_state(DevState::restarting, "restarting after a settings change");
+            publish_info();
+        }
         apply_enabled();
     }
+}
+
+void DeviceReader::pull_config() {
+    std::lock_guard<std::mutex> lock(sh_.cfg_mutex);
+    cfg_ = sh_.next_cfg;
+    cfg_gen_ = sh_.cfg_gen.load();
+    info_.cfg_gen = cfg_gen_;
+    warned_ambiguous_ = false;
+}
+
+bool DeviceReader::reconfigure() {
+    DeviceConfig old = cfg_;
+    pull_config();
+    bool reopen = old.grab != cfg_.grab || old.has_usb != cfg_.has_usb || old.vendor != cfg_.vendor || old.product != cfg_.product || old.serial != cfg_.serial ||
+                  old.port != cfg_.port;
+    if (reopen) {
+        int n = cancel("reconfigured");
+        event(EventKind::device, log::Level::notice, "%s: restarting after a settings change; %d contact%s cancelled", cfg_.id.c_str(), n, plural(n));
+        close_device();
+        set_state(DevState::restarting, "restarting after a settings change");
+        publish_info();
+        return true;
+    }
+    bool moved = old.rotation != cfg_.rotation || old.mirror_x != cfg_.mirror_x || old.mirror_y != cfg_.mirror_y || old.calibration != cfg_.calibration;
+    if (moved) {
+        int n = cancel("reconfigured");
+        event(EventKind::device, log::Level::notice, "%s: touch positions map differently after a settings change; %d contact%s cancelled", cfg_.id.c_str(), n,
+              plural(n));
+    }
+    mapping_ = Mapping(cfg_, ax_, ay_);
+    info_.aspect = mapping_.aspect();
+    publish_info();
+    return false;
 }
 
 bool DeviceReader::open_device() {
@@ -160,6 +220,7 @@ bool DeviceReader::open_device() {
         if (!pick && !claims_.claimed(n.sysname)) pick = &n;
     }
     if (!any) {
+        eacces_since_ = 0;
         set_state(DevState::not_connected,
                   "no input device matches " + cfg_.match_text() + ": plug the touchscreen in, or check the id with touch-to-osc --list");
         return false;
@@ -179,14 +240,22 @@ bool DeviceReader::open_device() {
     int fd = open(pick->node.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         int e = errno;
-        if (e == EACCES || e == EPERM)
-            set_state(DevState::no_permission, "cannot open " + pick->node + ": permission denied; run touch-to-osc as root or as a member of the input group");
-        else if (e == ENOENT || e == ENODEV || e == ENXIO)
+        if (e == EACCES || e == EPERM) {
+            // a new node is root-only until udev applies its group a moment later: only a refusal that lasts is a fault
+            Nanos now = monotonic_ns();
+            if (!eacces_since_) eacces_since_ = now;
+            if (now - eacces_since_ >= kSec)
+                set_state(DevState::no_permission, "cannot open " + pick->node + ": permission denied; run touch-to-osc as root or as a member of the input group");
+        } else if (e == ENOENT || e == ENODEV || e == ENXIO)
             set_state(DevState::not_connected, pick->node + " went away while opening it: check the touchscreen's USB cable");
         else
             set_state(DevState::read_error, "cannot open " + pick->node + ": " + errno_str(e) + "; unplug and replug the touchscreen");
         return false;
     }
+    eacces_since_ = 0;
+    // before anything is queued: changing the clock of a client with pending events makes the kernel flush them and report SYN_DROPPED
+    int clk = CLOCK_MONOTONIC;
+    clock_monotonic_ = ioctl(fd, EVIOCSCLOCKID, &clk) == 0;
     fd_.reset(fd);
     int rc = libevdev_new_from_fd(fd, &dev_);
     if (rc < 0) {
@@ -258,7 +327,8 @@ void DeviceReader::publish_active() {
 }
 
 void DeviceReader::send(int n, Nanos frame_t) {
-    int32_t frame = ++frame_;
+    frame_ = frame_ == INT32_MAX ? 1 : frame_ + 1;
+    int32_t frame = frame_;
     Nanos mono = monotonic_ns();
     int64_t t_us = ((frame_t ? frame_t : mono) + (realtime_ns() - mono)) / kUs;
     osc::Writer w(buf_, sizeof buf_);
@@ -315,6 +385,8 @@ int DeviceReader::cancel(const char* reason) {
 
 void DeviceReader::on_frame(const input_event& ev) {
     Nanos t = Nanos(ev.input_event_sec) * kSec + Nanos(ev.input_event_usec) * kUs;
+    if (!clock_monotonic_) t += monotonic_ns() - realtime_ns();
+    ++session_frames_;
     sh_.frames.fetch_add(1, std::memory_order_relaxed);
     if (raw_touched_ && prev_frame_ && t > prev_frame_) {
         sh_.touched_frames.fetch_add(1, std::memory_order_relaxed);
@@ -330,8 +402,12 @@ void DeviceReader::on_frame(const input_event& ev) {
 }
 
 void DeviceReader::on_resync() {
-    sh_.resyncs.fetch_add(1, std::memory_order_relaxed);
     read_raw();
+    if (session_frames_ == 0) {
+        tracker_.mute_down_slots();
+        return;
+    }
+    sh_.resyncs.fetch_add(1, std::memory_order_relaxed);
     if (!enabled_) return;
     int n = cancel("resync");
     event(EventKind::resync, log::Level::warning,
@@ -375,25 +451,13 @@ bool DeviceReader::silent(Nanos now) const {
     return enabled_ && ms > 0 && tracker_.announced() > 0 && now - last_frame_ >= Nanos(ms) * kMs;
 }
 
-void DeviceReader::take_new_config() {
-    {
-        std::lock_guard<std::mutex> lock(sh_.cfg_mutex);
-        cfg_ = sh_.next_cfg;
-        cfg_gen_ = sh_.cfg_gen.load();
-    }
-    info_.cfg_gen = cfg_gen_;
-    warned_ambiguous_ = false;
-    set_state(DevState::restarting, "restarting after a settings change");
-    publish_info();
-}
-
 void DeviceReader::apply_enabled() {
     bool want = sh_.want_enabled.load();
     if (want == enabled_) return;
     if (!want) {
         int n = dev_ ? cancel("device disabled") : 0;
         enabled_ = false;
-        event(EventKind::enabled, log::Level::notice, "%s turned off by a command; %d contact%s cancelled", cfg_.id.c_str(), n, plural(n));
+        event(EventKind::enabled, log::Level::notice, "%s turned off; %d contact%s cancelled", cfg_.id.c_str(), n, plural(n));
     } else {
         if (dev_) {
             read_raw();
@@ -405,20 +469,23 @@ void DeviceReader::apply_enabled() {
     publish_info();
 }
 
-void DeviceReader::retry_grab() {
-    if (libevdev_grab(dev_, LIBEVDEV_GRAB) != 0) return;
-    if (cfg_.grab) {
-        info_.grabbed = true;
-        event(EventKind::grab, log::Level::notice, "%s: the other program let go of %s; touch-to-osc holds it now", cfg_.id.c_str(), node_.c_str());
-    } else {
-        libevdev_grab(dev_, LIBEVDEV_UNGRAB);
-        event(EventKind::grab, log::Level::notice, "%s: the other program let go of %s; touches are read again", cfg_.id.c_str(), node_.c_str());
-    }
-    set_state(DevState::ok, "");
+bool DeviceReader::retry_grab() {
+    if (libevdev_grab(dev_, LIBEVDEV_GRAB) != 0) return false;
+    libevdev_grab(dev_, LIBEVDEV_UNGRAB);
+    event(EventKind::grab, log::Level::notice, "%s: the other program let go of %s; reading it afresh", cfg_.id.c_str(), node_.c_str());
+    return true;
+}
+
+bool DeviceReader::foreign_grab() {
+    if (cfg_.grab) return false;
+    if (libevdev_grab(dev_, LIBEVDEV_GRAB) != 0) return true;
+    libevdev_grab(dev_, LIBEVDEV_UNGRAB);
+    return false;
 }
 
 void DeviceReader::session() {
     libevdev_set_clock_id(dev_, CLOCK_MONOTONIC);
+    session_frames_ = 0;
     bool foreign = false;
     info_.grabbed = false;
     if (libevdev_grab(dev_, LIBEVDEV_GRAB) == 0) {
@@ -427,7 +494,8 @@ void DeviceReader::session() {
     } else {
         foreign = true;
     }
-    Axis ax, ay;
+    Axis& ax = ax_;
+    Axis& ay = ay_;
     auto axis = [&](unsigned code) {
         Axis a;
         if (const input_absinfo* i = libevdev_get_abs_info(dev_, code)) {
@@ -487,6 +555,7 @@ void DeviceReader::session() {
             event(EventKind::device, log::Level::err, "%s lost: waiting for it failed (%s); %d contact%s cancelled", cfg_.id.c_str(), errno_str(e).c_str(), n, plural(n));
             close_device();
             set_state(DevState::read_error, "waiting for " + node_ + " failed: " + errno_str(e));
+            wait_for_change(500);
             return;
         }
         if (r > 0 && p[1].revents) {
@@ -497,13 +566,7 @@ void DeviceReader::session() {
                 close_device();
                 return;
             }
-            if (sh_.cfg_gen.load() != cfg_gen_) {
-                int n = cancel("reconfigured");
-                event(EventKind::device, log::Level::notice, "%s: restarting after a settings change; %d contact%s cancelled", cfg_.id.c_str(), n, plural(n));
-                close_device();
-                take_new_config();
-                return;
-            }
+            if (sh_.cfg_gen.load() != cfg_gen_ && reconfigure()) return;
             apply_enabled();
         }
         int rc = 0;
@@ -531,8 +594,14 @@ void DeviceReader::session() {
             event(EventKind::silence, log::Level::warning,
                   "%s sent nothing for %lld ms with contacts down; %d contact%s cancelled. If this repeats, check the touchscreen's USB cable", cfg_.id.c_str(),
                   (long long)(quiet / kMs), n, plural(n));
+            if (foreign_grab())
+                set_state(DevState::grab_refused,
+                          "another program took " + node_ + " exclusively, so no touches reach touch-to-osc: stop that program (fuser -v " + node_ + " names it)");
         }
-        if (r == 0 && base_state_ == DevState::grab_refused) retry_grab();
+        if (r == 0 && base_state_ == DevState::grab_refused && retry_grab()) {
+            close_device();
+            return;
+        }
     }
 }
 

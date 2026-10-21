@@ -53,8 +53,11 @@ private:
     void send(int n, Nanos frame_t);
     void publish_active();
     void apply_enabled();
-    void retry_grab();
-    void take_new_config();
+    bool retry_grab();
+    bool foreign_grab();
+    void pull_config();
+    bool reconfigure();
+    void recover(const char* what);
     void set_state(DevState st, const std::string& reason);
     void publish_info();
     void event(EventKind kind, log::Level level, const char* fmt, ...) __attribute__((format(printf, 4, 5)));
@@ -82,6 +85,11 @@ private:
     int32_t single_seq_ = 0;
     ContactTracker tracker_;
     Mapping mapping_;
+    Axis ax_;
+    Axis ay_;
+    bool clock_monotonic_ = true;
+    uint64_t session_frames_ = 0;
+    Nanos eacces_since_ = 0;
     bool enabled_ = true;
     bool raw_touched_ = false;
     Nanos prev_frame_ = 0;
@@ -94,7 +102,8 @@ private:
     bool warned_ambiguous_ = false;
     std::string addr_down_, addr_move_, addr_up_, addr_cancel_;
     TouchEvent evs_[kMaxFrameEvents];
-    uint8_t buf_[16384];
+    // a full frame of the largest message (64-character prefix, 32-character id, a cancel) fits: 128 x 152 bytes + the header
+    uint8_t buf_[32768];
 };
 
 }

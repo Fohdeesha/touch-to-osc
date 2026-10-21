@@ -34,7 +34,7 @@ public:
         if (s.size() > max_len) return fail(key, "is too long (at most " + std::to_string(max_len) + " characters)");
         if (!allow_empty && s.empty()) return fail(key, "must not be empty");
         for (unsigned char c : s) {
-            if (c < 0x20 || c == 0x7f) return fail(key, "contains control characters");
+            if (c < 0x20 || c >= 0x7f) return fail(key, "may only use printable ASCII characters");
         }
         out = std::move(s);
         return ok();

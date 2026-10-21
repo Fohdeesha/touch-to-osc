@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace tto::log {
@@ -14,14 +15,25 @@ namespace {
 
 std::atomic<int> g_min{int(Level::info)};
 std::atomic<int> g_journal{-1};
+std::atomic<uint64_t> g_dropped{0};
 
 bool to_journal() {
     int j = g_journal.load(std::memory_order_relaxed);
     if (j < 0) {
         j = std::getenv("JOURNAL_STREAM") ? 1 : 0;
+        // a stalled journal must never stall the daemon: lines that cannot be written at once are dropped and counted
+        if (j == 1) {
+            int fl = fcntl(2, F_GETFL);
+            if (fl >= 0) fcntl(2, F_SETFL, fl | O_NONBLOCK);
+        }
         g_journal.store(j, std::memory_order_relaxed);
     }
     return j == 1;
+}
+
+bool put(const char* line, size_t len) {
+    ssize_t n = ::write(2, line, len);
+    return n == ssize_t(len);
 }
 
 const char* level_name(Level l) {
@@ -81,8 +93,14 @@ void write(Level level, const char* fmt, ...) {
         if (buf[i] == '\n') buf[i] = ' ';
     }
     buf[len++] = '\n';
-    ssize_t ignored = ::write(2, buf, len);
-    (void)ignored;
+    uint64_t dropped = g_dropped.load(std::memory_order_relaxed);
+    if (dropped) {
+        char note[160];
+        int k = std::snprintf(note, sizeof note, "%s%llu log lines were dropped because the journal could not keep up\n", to_journal() ? "<4>" : "",
+                              (unsigned long long)dropped);
+        if (k > 0 && put(note, size_t(k))) g_dropped.fetch_sub(dropped, std::memory_order_relaxed);
+    }
+    if (!put(buf, len)) g_dropped.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool rate_ok(std::atomic<Nanos>& last, Nanos interval) {

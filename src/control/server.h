@@ -5,6 +5,7 @@
 #include "control/requests.h"
 #include "control/shared.h"
 #include "core/fd.h"
+#include "core/log.h"
 #include "input/probe.h"
 #include "input/reader.h"
 #include "osc/osc.h"
@@ -56,6 +57,12 @@ private:
         std::string level;
         std::vector<std::string> reasons;
     };
+    struct Limit {
+        double tokens = 0;
+        Nanos last = 0;
+        uint64_t suppressed = 0;
+        std::string kind;
+    };
 
     bool open_sockets();
     void banner();
@@ -86,6 +93,12 @@ private:
     void send_status_changes(bool full);
     void send_alive(Nanos now);
     void send_event(const std::string& kind, const std::string& text);
+    void emit(const std::string& key, log::Level level, const std::string& kind, const std::string& text);
+    void report_suppressed(Nanos now);
+    void expire_leases(Nanos now);
+    void prune(Nanos now);
+    void send_bundled(const Peer& to, const std::vector<osc::Message>& msgs);
+    std::string disabled_reason(size_t index) const;
     void send_bye();
     void report_destinations(Nanos now);
 
@@ -98,6 +111,7 @@ private:
     Overrides over_;
     Config cfg_;
     std::vector<std::string> settings_notes_;
+    std::string settings_load_problem_;
     std::string settings_problem_;
     std::string settings_file_;
     std::string config_path_;
@@ -111,6 +125,17 @@ private:
     std::vector<std::unique_ptr<DeviceReader>> readers_;
     std::vector<DevStats> stats_;
     std::vector<uint32_t> cfg_gen_;
+    std::vector<uint32_t> restart_gen_;
+    std::vector<uint8_t> rx_;
+    std::map<std::string, Limit> limits_;
+    double refusal_tokens_ = 0;
+    Nanos refusal_last_ = 0;
+    uint64_t refusals_dropped_ = 0;
+    Nanos next_second_ = 0;
+    Nanos last_save_ = 0;
+    Nanos dirty_since_ = 0;
+    bool settings_dirty_ = false;
+    bool status_dirty_ = true;
     UniqueFd osc_fd_;
     UniqueFd send_fd_;
     UniqueFd notify_fd_;

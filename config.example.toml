@@ -16,7 +16,8 @@ allowed_ips = ["127.0.0.1"]
 open_to_any = false
 
 [log]
-# crit, error, warning, notice, info or debug. Nothing is logged per touch below debug.
+# crit, error, warning, notice, info or debug. debug adds a line for every command and
+# lease renewal. Touches are never logged.
 level = "info"
 
 [paths]
@@ -53,7 +54,8 @@ usb = "0712:0009"
 serial = ""
 port = ""
 # Hold the device exclusively, so nothing else on the machine (the console) acts on
-# the touches.
+# the touches, and no other program can take it away. With false, another program that
+# takes it exclusively is only noticed when silence_ms is on.
 grab = true
 # Turns touch positions clockwise by 0, 90, 180 or 270 degrees to match the display:
 # with 90, a touch at the panel's top left lands at the display's top right. Then

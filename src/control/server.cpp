@@ -29,8 +29,18 @@ constexpr Nanos kTick = 100 * kMs;
 constexpr Nanos kFullEvery = 10 * kSec;
 constexpr Nanos kStatusReplyEvery = 200 * kMs;
 constexpr Nanos kLatencyWindow = 10 * kSec;
+constexpr size_t kMaxLatencySamples = 4096;
 constexpr Nanos kHealthWindow = 60 * kSec;
 constexpr Nanos kReportEvery = 10 * kSec;
+constexpr Nanos kSaveSettle = 300 * kMs;
+constexpr Nanos kSaveEvery = kSec;
+constexpr double kEventBurst = 10;
+constexpr double kEventsPerSecond = 1;
+constexpr double kRefusalBurst = 20;
+constexpr double kRefusalsPerSecond = 20;
+constexpr size_t kMaxRefusedHosts = 1024;
+constexpr Nanos kRefusedMemory = 10 * kSec;
+constexpr size_t kBundleBytes = 1200;
 
 std::optional<int64_t> integer(const osc::Arg& a) {
     if (auto i = std::get_if<int32_t>(&a)) return *i;
@@ -103,9 +113,41 @@ std::string cal_text(const std::vector<double>& c) {
     return s;
 }
 
-bool needs_restart(const DeviceConfig& a, const DeviceConfig& b) {
-    return a.rotation != b.rotation || a.mirror_x != b.mirror_x || a.mirror_y != b.mirror_y || a.calibration != b.calibration || a.aspect != b.aspect ||
-           a.grab != b.grab || a.has_usb != b.has_usb || a.vendor != b.vendor || a.product != b.product || a.serial != b.serial || a.port != b.port;
+bool reopens(const DeviceConfig& a, const DeviceConfig& b) {
+    return a.grab != b.grab || a.has_usb != b.has_usb || a.vendor != b.vendor || a.product != b.product || a.serial != b.serial || a.port != b.port;
+}
+
+bool remaps(const DeviceConfig& a, const DeviceConfig& b) {
+    return a.rotation != b.rotation || a.mirror_x != b.mirror_x || a.mirror_y != b.mirror_y || a.calibration != b.calibration || a.aspect != b.aspect;
+}
+
+bool take_token(double& tokens, Nanos& last, Nanos now, double burst, double per_second) {
+    if (last) tokens = std::min(burst, tokens + double(now - last) / 1e9 * per_second);
+    else tokens = burst;
+    last = now;
+    if (tokens < 1.0) return false;
+    tokens -= 1.0;
+    return true;
+}
+
+int32_t next_counter(int32_t v) { return v == INT32_MAX ? 1 : v + 1; }
+
+std::vector<std::vector<uint8_t>> pack(const std::vector<osc::Message>& msgs) {
+    std::vector<std::vector<uint8_t>> out;
+    std::vector<osc::Message> group;
+    size_t size = 16;
+    for (const auto& m : msgs) {
+        size_t n = osc::encode(m).size() + 4;
+        if (!group.empty() && size + n > kBundleBytes) {
+            out.push_back(osc::encode_bundle(group));
+            group.clear();
+            size = 16;
+        }
+        group.push_back(m);
+        size += n;
+    }
+    if (!group.empty()) out.push_back(osc::encode_bundle(group));
+    return out;
 }
 
 }
@@ -115,13 +157,14 @@ Server::Server(Config base, SettingsLoad settings, std::string config_path, SysP
       over_(std::move(settings.overrides)),
       cfg_(apply_overrides(base_, over_)),
       settings_notes_(std::move(settings.notes)),
-      settings_problem_(std::move(settings.problem)),
+      settings_load_problem_(std::move(settings.problem)),
       settings_file_(settings.file_exists && !over_.empty() ? base_.paths.settings : std::string()),
       config_path_(std::move(config_path)),
       paths_(std::move(paths)),
       prefix_(base_.osc.prefix) {
     char host[256] = {};
     if (gethostname(host, sizeof host - 1) == 0) host_ = host;
+    if (!over_.empty() && !settings.file_exists) settings_dirty_ = true;
 }
 
 Server::~Server() {
@@ -176,7 +219,7 @@ void Server::banner() {
         TTO_NOTICE("saved settings from %s win over the config: %s", base_.paths.settings.c_str(), names.c_str());
     }
     for (const auto& n : settings_notes_) TTO_WARN("%s", n.c_str());
-    if (!settings_problem_.empty()) TTO_WARN("%s", settings_problem_.c_str());
+    if (!settings_load_problem_.empty()) TTO_WARN("%s", settings_load_problem_.c_str());
 }
 
 int Server::run() {
@@ -217,7 +260,10 @@ int Server::run() {
         shared_.push_back(std::move(sh));
         stats_.emplace_back();
         cfg_gen_.push_back(0);
+        restart_gen_.push_back(0);
     }
+    rx_.resize(65536);
+    next_second_ = monotonic_ns() + kSec;
     publish_dests();
     for (auto& r : readers_) r->start();
     sd_notify_msg("READY=1");
@@ -255,6 +301,7 @@ int Server::run() {
     }
     for (auto& r : readers_) r->join();
     drain_reader_events();
+    if (settings_dirty_) save_settings();
     send_bye();
     TTO_NOTICE("stopped");
     return 0;
@@ -264,36 +311,88 @@ void Server::on_tick() {
     Nanos now = monotonic_ns();
     drain_reader_events();
     drain_latency(now);
-    if (++ticks_ % 10 == 0) every_second(now);
-    else send_status_changes(false);
+    if (settings_dirty_ && now - dirty_since_ >= kSaveSettle && now - last_save_ >= kSaveEvery) save_settings();
+    if (now >= next_second_) {
+        next_second_ = now - next_second_ > 2 * kSec ? now + kSec : next_second_ + kSec;
+        every_second(now);
+    } else if (status_dirty_) {
+        send_status_changes(false);
+    }
 }
 
 void Server::every_second(Nanos now) {
-    for (const auto& p : leases_.expire(now)) {
-        publish_dests();
-        TTO_NOTICE("subscriber %s ended (its lease ran out)", p.text().c_str());
-        send_event("subscriber", p.text() + " ended");
-    }
+    expire_leases(now);
+    prune(now);
     sample(now);
     bool full = now - full_at_ >= kFullEvery;
     if (full) full_at_ = now;
     send_status_changes(full);
+    alive_ = next_counter(alive_);
     send_alive(now);
     report_destinations(now);
+    report_suppressed(now);
     if (sd_watchdog_enabled()) sd_notify_msg("WATCHDOG=1");
+}
+
+void Server::expire_leases(Nanos now) {
+    auto ended = leases_.expire(now);
+    if (ended.empty()) return;
+    publish_dests();
+    status_dirty_ = true;
+    for (const auto& p : ended) emit("subscriber", log::Level::notice, "subscriber", p.text() + " ended (its lease ran out)");
+}
+
+void Server::prune(Nanos now) {
+    for (auto it = refused_at_.begin(); it != refused_at_.end();) {
+        if (now - it->second > kRefusedMemory) it = refused_at_.erase(it);
+        else ++it;
+    }
+    auto tg = targets();
+    for (auto it = dest_health_.begin(); it != dest_health_.end();) {
+        bool current = std::any_of(tg.begin(), tg.end(), [&](const Target& t) { return t.peer.text() == it->first; });
+        if (current) ++it;
+        else it = dest_health_.erase(it);
+    }
+}
+
+void Server::emit(const std::string& key, log::Level level, const std::string& kind, const std::string& text) {
+    Limit& l = limits_[key];
+    l.kind = kind;
+    if (!take_token(l.tokens, l.last, monotonic_ns(), kEventBurst, kEventsPerSecond)) {
+        ++l.suppressed;
+        return;
+    }
+    log::write(level, "%s: %s", kind.c_str(), text.c_str());
+    send_event(kind, text);
+}
+
+void Server::report_suppressed(Nanos now) {
+    for (auto& [key, l] : limits_) {
+        if (!l.suppressed || !take_token(l.tokens, l.last, now, kEventBurst, kEventsPerSecond)) continue;
+        std::string text = std::to_string(l.suppressed) + " more \"" + l.kind + "\" events (" + key + ") came too fast to report one by one";
+        l.suppressed = 0;
+        TTO_WARN("%s", text.c_str());
+        send_event(l.kind, text);
+    }
+    if (refusals_dropped_) {
+        TTO_WARN("%llu refusals to hosts outside osc.allowed_ips were not answered (too many)", (unsigned long long)refusals_dropped_);
+        refusals_dropped_ = 0;
+    }
 }
 
 void Server::drain_reader_events() {
     for (size_t i = 0; i < shared_.size(); ++i) {
         ReaderEvent e;
+        bool any = false;
         while (shared_[i]->events.pop(e)) {
-            log::write(log::Level(e.level), "%s", e.text);
-            send_event(event_kind_name(e.kind), e.text);
+            any = true;
+            emit(cfg_.devices[i].id + "/" + event_kind_name(e.kind), log::Level(e.level), event_kind_name(e.kind), e.text);
         }
+        if (any) status_dirty_ = true;
         uint64_t lost = shared_[i]->lost_events.load(std::memory_order_relaxed);
         if (lost != stats_[i].lost_events_seen) {
-            TTO_WARN("%s: %llu device messages were dropped because they came too fast", cfg_.devices[i].id.c_str(),
-                     (unsigned long long)(lost - stats_[i].lost_events_seen));
+            emit(cfg_.devices[i].id + "/lost", log::Level::warning, "device",
+                 cfg_.devices[i].id + ": " + std::to_string(lost - stats_[i].lost_events_seen) + " device messages were dropped because they came too fast");
             stats_[i].lost_events_seen = lost;
         }
     }
@@ -304,7 +403,7 @@ void Server::drain_latency(Nanos now) {
         uint32_t v;
         auto& lat = stats_[i].latency;
         while (shared_[i]->latency_us.pop(v)) lat.emplace_back(now, v);
-        while (!lat.empty() && now - lat.front().first > kLatencyWindow) lat.pop_front();
+        while (!lat.empty() && (now - lat.front().first > kLatencyWindow || lat.size() > kMaxLatencySamples)) lat.pop_front();
     }
 }
 
@@ -391,6 +490,7 @@ void Server::report_destinations(Nanos now) {
 }
 
 void Server::send_status_changes(bool full) {
+    status_dirty_ = false;
     std::vector<Target> tg;
     for (const auto& t : targets()) {
         if (t.status) tg.push_back(t);
@@ -399,22 +499,27 @@ void Server::send_status_changes(bool full) {
         last_status_.clear();
         return;
     }
-    std::vector<std::vector<uint8_t>> send;
-    for (const auto& m : status_messages()) {
+    std::vector<osc::Message> changed;
+    for (auto& m : status_messages()) {
         auto bytes = osc::encode(m);
         auto it = last_status_.find(m.address);
         if (full || it == last_status_.end() || it->second != bytes) {
-            last_status_[m.address] = bytes;
-            send.push_back(std::move(bytes));
+            last_status_[m.address] = std::move(bytes);
+            changed.push_back(std::move(m));
         }
     }
+    if (changed.empty()) return;
+    auto bundles = pack(changed);
     for (const auto& t : tg) {
-        for (const auto& b : send) send_target(t, b);
+        for (const auto& b : bundles) send_target(t, b);
     }
 }
 
+void Server::send_bundled(const Peer& to, const std::vector<osc::Message>& msgs) {
+    for (const auto& b : pack(msgs)) send_bytes(to, b);
+}
+
 void Server::send_alive(Nanos now) {
-    ++alive_;
     auto tg = targets();
     if (tg.empty()) return;
     Health h = health(now);
@@ -464,10 +569,10 @@ Server::Health Server::health(Nanos now) {
     for (size_t i = 0; i < shared_.size(); ++i) {
         const DeviceConfig& d = cfg_.devices[i];
         const DevInfo& info = shared_[i]->info.latest();
-        if (info.cfg_gen != cfg_gen_[i] || info.state == DevState::restarting) {
+        if (info.cfg_gen < restart_gen_[i] || info.state == DevState::restarting) {
             warnings.push_back(d.label + " is restarting after a settings change");
         } else if (!info.enabled) {
-            warnings.push_back(d.label + " is turned off by a command");
+            warnings.push_back(d.label + " is turned off" + (base_.devices[i].enabled ? " (a saved setting)" : " in the config file"));
         } else {
             switch (info.state) {
             case DevState::ok: break;
@@ -488,6 +593,7 @@ Server::Health Server::health(Nanos now) {
     for (const auto& [key, h] : dest_health_) {
         if (h.failing) warnings.push_back("sending to " + key + " fails: " + h.error);
     }
+    if (!settings_load_problem_.empty()) warnings.push_back(settings_load_problem_);
     if (!settings_problem_.empty()) warnings.push_back(settings_problem_);
     (void)now;
     Health out;
@@ -495,6 +601,12 @@ Server::Health Server::health(Nanos now) {
     out.reasons = faults;
     out.reasons.insert(out.reasons.end(), warnings.begin(), warnings.end());
     return out;
+}
+
+std::string Server::disabled_reason(size_t index) const {
+    std::string on = "send " + prefix_ + "/device/" + cfg_.devices[index].id + "/enabled 1 to turn it back on";
+    if (!base_.devices[index].enabled) return "turned off in the config file (enabled = false): set it to true there, or " + on;
+    return "turned off by a saved setting: " + on;
 }
 
 std::vector<osc::Message> Server::status_messages() {
@@ -527,13 +639,13 @@ std::vector<osc::Message> Server::status_messages() {
     for (size_t i = 0; i < shared_.size(); ++i) {
         const DeviceConfig& d = cfg_.devices[i];
         const DevInfo& info = shared_[i]->info.latest();
-        bool restarting = info.cfg_gen != cfg_gen_[i];
+        bool restarting = info.cfg_gen < restart_gen_[i];
         std::string b = "device/" + d.id + "/";
         add(b + "label", {d.label});
         add(b + "enabled", {int32_t(info.enabled ? 1 : 0)});
         add(b + "connected", {int32_t(info.connected ? 1 : 0)});
         add(b + "state", {std::string(restarting ? "restarting" : state_name(info.state))});
-        add(b + "reason", {std::string(restarting ? "restarting after a settings change" : info.reason)});
+        add(b + "reason", {restarting ? std::string("restarting after a settings change") : !info.enabled ? disabled_reason(i) : std::string(info.reason)});
         add(b + "match_usb", {d.usb_setting()});
         add(b + "match_serial", {d.serial});
         add(b + "match_port", {d.port});
@@ -594,42 +706,49 @@ std::vector<osc::Message> Server::counter_messages(Nanos now) {
 
 void Server::on_osc() {
     for (int n = 0; n < 64; ++n) {
-        uint8_t buf[8192];
         sockaddr_in from{};
         socklen_t len = sizeof from;
-        ssize_t got = recvfrom(osc_fd_.get(), buf, sizeof buf, 0, reinterpret_cast<sockaddr*>(&from), &len);
-        if (got < 0) return;
+        ssize_t got = recvfrom(osc_fd_.get(), rx_.data(), rx_.size(), MSG_TRUNC, reinterpret_cast<sockaddr*>(&from), &len);
+        if (got < 0) break;
         char ip[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip);
         Peer peer{ip, ntohs(from.sin_port)};
-        auto msgs = osc::decode_packet(buf, size_t(got));
+        if (size_t(got) > rx_.size()) {
+            TTO_LOG_EVERY(30 * kSec, log::Level::warning, "an OSC packet of %zd bytes from %s was dropped: larger than %zu", got, ip, rx_.size());
+            continue;
+        }
+        auto msgs = osc::decode_packet(rx_.data(), size_t(got));
         if (!msgs) {
             TTO_LOG_EVERY(30 * kSec, log::Level::warning, "a malformed OSC packet from %s was dropped", ip);
             continue;
         }
         bool allowed = cfg_.osc.open_to_any || std::find(cfg_.osc.allowed_ips.begin(), cfg_.osc.allowed_ips.end(), peer.ip) != cfg_.osc.allowed_ips.end();
-        for (const auto& m : *msgs) {
-            if (!allowed) {
-                refuse(peer, m.address, peer.ip + " may not send commands here: add it to osc.allowed_ips in " + config_path_, true);
-                continue;
-            }
-            command(m, peer);
+        if (!allowed) {
+            if (!msgs->empty()) refuse(peer, msgs->front().address, peer.ip + " may not send commands here: add it to osc.allowed_ips in " + config_path_, true);
+            continue;
         }
+        for (const auto& m : *msgs) command(m, peer);
     }
+    if (status_dirty_) send_status_changes(false);
 }
 
 void Server::refuse(const Peer& peer, const std::string& address, const std::string& why, bool limited) {
     if (limited) {
         Nanos now = monotonic_ns();
-        Nanos& at = refused_at_[peer.ip];
-        if (at && now - at < 5 * kSec) return;
-        at = now;
+        auto it = refused_at_.find(peer.ip);
+        if (it != refused_at_.end() && now - it->second < 5 * kSec) return;
+        if (refused_at_.size() >= kMaxRefusedHosts || !take_token(refusal_tokens_, refusal_last_, now, kRefusalBurst, kRefusalsPerSecond)) {
+            ++refusals_dropped_;
+            return;
+        }
+        refused_at_[peer.ip] = now;
     }
     TTO_LOG_EVERY(5 * kSec, log::Level::warning, "OSC %s from %s refused: %s", address.c_str(), peer.ip.c_str(), why.c_str());
     send_to(peer, {{addr("error"), {address, why}}});
 }
 
 bool Server::command(const osc::Message& m, const Peer& peer) {
+    TTO_DEBUG("OSC %s from %s:%u", m.address.c_str(), peer.ip.c_str(), unsigned(peer.port));
     if (m.address == addr("request")) return request(m, peer);
     Status st = apply(m, peer);
     if (!st) {
@@ -687,7 +806,7 @@ Status Server::apply(const osc::Message& m, const Peer& peer) {
         status_reply_at_ = now;
         auto msgs = status_messages();
         for (auto& c : counter_messages(now)) msgs.push_back(std::move(c));
-        send_to(reply_peer(), msgs);
+        send_bundled(reply_peer(), msgs);
         return {};
     }
     if (parts.size() == 1 && parts[0] == "subscribe") return subscribe(m, peer);
@@ -856,6 +975,7 @@ Status Server::set_global(const std::vector<std::string>& parts, const std::vect
 
 Status Server::commit(Overrides next, const Peer& peer, const std::string& what) {
     drop_unchanged(next, base_);
+    if (settings_text(next, "") == settings_text(over_, "")) return {};
     Config eff = apply_overrides(base_, next);
     for (const auto& d : eff.devices) {
         if (!d.has_usb && d.port.empty()) return err("device " + d.id + " would match nothing: it needs a usb id or a port");
@@ -869,10 +989,10 @@ Status Server::commit(Overrides next, const Peer& peer, const std::string& what)
     over_ = std::move(next);
     cfg_ = std::move(eff);
     apply_effects(old);
-    save_settings();
-    TTO_NOTICE("settings: %s, from %s", what.c_str(), peer.ip.c_str());
-    send_event("settings", what + ", from " + peer.ip);
-    send_status_changes(false);
+    if (!settings_dirty_) dirty_since_ = monotonic_ns();
+    settings_dirty_ = true;
+    status_dirty_ = true;
+    emit("settings", log::Level::notice, "settings", what + ", from " + peer.ip);
     return {};
 }
 
@@ -882,7 +1002,10 @@ void Server::apply_effects(const Config& old) {
         log::parse_level(cfg_.log.level.c_str(), l);
         log::set_min_level(l);
     }
-    if (!(old.destinations == cfg_.destinations)) publish_dests();
+    if (!(old.destinations == cfg_.destinations)) {
+        publish_dests();
+        prune(monotonic_ns());
+    }
     for (size_t i = 0; i < shared_.size(); ++i) {
         const DeviceConfig& a = old.devices[i];
         const DeviceConfig& b = cfg_.devices[i];
@@ -896,11 +1019,13 @@ void Server::apply_effects(const Config& old) {
             sh.silence_ms.store(b.silence_ms);
             wake = true;
         }
-        if (needs_restart(a, b)) {
+        bool reopen = reopens(a, b);
+        if (reopen || remaps(a, b)) {
             std::lock_guard<std::mutex> lock(sh.cfg_mutex);
             sh.next_cfg = b;
             cfg_gen_[i] = sh.cfg_gen.load() + 1;
             sh.cfg_gen.store(cfg_gen_[i]);
+            if (reopen) restart_gen_[i] = cfg_gen_[i];
             wake = true;
         }
         if (wake) write_one(sh.wake.get());
@@ -909,6 +1034,10 @@ void Server::apply_effects(const Config& old) {
 
 void Server::save_settings() {
     const std::string& path = base_.paths.settings;
+    Nanos now = monotonic_ns();
+    settings_dirty_ = false;
+    status_dirty_ = true;
+    last_save_ = now;
     if (path.empty()) return;
     if (over_.empty()) {
         if (unlink(path.c_str()) == 0 || errno == ENOENT) {
@@ -916,16 +1045,16 @@ void Server::save_settings() {
             settings_problem_.clear();
         } else {
             settings_problem_ = "removing the settings file " + path + " failed (" + errno_str() + "): its old settings come back at a restart";
-            TTO_ERR("%s", settings_problem_.c_str());
-            send_event("settings", settings_problem_);
+            emit("settings-save", log::Level::err, "settings", settings_problem_);
         }
         return;
     }
     Status st = write_file_atomic(path, settings_text(over_, config_path_));
     if (!st) {
-        settings_problem_ = "saving the settings to " + path + " failed (" + st.error() + "): changes made over OSC are lost at a restart";
-        TTO_ERR("%s", settings_problem_.c_str());
-        send_event("settings", settings_problem_);
+        settings_problem_ = "saving the settings to " + path + " failed (" + st.error() + "): changes made over OSC are lost at a restart; trying again every 10 s";
+        emit("settings-save", log::Level::err, "settings", settings_problem_);
+        settings_dirty_ = true;
+        last_save_ = now + 9 * kSec;
         return;
     }
     settings_problem_.clear();
@@ -944,25 +1073,24 @@ Status Server::subscribe(const osc::Message& m, const Peer& peer) {
         secs = *s;
     }
     Nanos now = monotonic_ns();
-    for (const auto& p : leases_.expire(now)) {
-        TTO_NOTICE("subscriber %s ended (its lease ran out)", p.text().c_str());
-        send_event("subscriber", p.text() + " ended");
-    }
+    expire_leases(now);
     Peer to{peer.ip, uint16_t(*port)};
     std::vector<osc::Message> ack{{addr("subscribed"), {int32_t(*port), int32_t(secs)}}};
     send_status_changes(false);
     switch (leases_.subscribe(to, int(secs), now)) {
-    case Leases::Outcome::renewed: send_to(to, ack); return {};
+    case Leases::Outcome::renewed:
+        TTO_DEBUG("subscriber %s renewed (lease %lld s)", to.text().c_str(), (long long)secs);
+        send_to(to, ack);
+        return {};
     case Leases::Outcome::full: return err("at most " + std::to_string(kMaxLeases) + " subscribers; this one is refused");
     case Leases::Outcome::added: break;
     }
     publish_dests();
     auto full = status_messages();
     for (const auto& msg : full) last_status_[msg.address] = osc::encode(msg);
-    ack.insert(ack.end(), full.begin(), full.end());
     send_to(to, ack);
-    TTO_NOTICE("subscriber %s added (lease %lld s)", to.text().c_str(), (long long)secs);
-    send_event("subscriber", to.text() + " added");
+    send_bundled(to, full);
+    emit("subscriber", log::Level::notice, "subscriber", to.text() + " added (lease " + std::to_string(secs) + " s)");
     return {};
 }
 
@@ -972,8 +1100,8 @@ Status Server::unsubscribe(const osc::Message& m, const Peer& peer) {
     Peer to{peer.ip, uint16_t(*port)};
     if (leases_.unsubscribe(to)) {
         publish_dests();
-        TTO_NOTICE("subscriber %s ended (it unsubscribed)", to.text().c_str());
-        send_event("subscriber", to.text() + " ended");
+        status_dirty_ = true;
+        emit("subscriber", log::Level::notice, "subscriber", to.text() + " ended (it unsubscribed)");
     }
     send_to(to, {{addr("unsubscribed"), {int32_t(*port)}}});
     return {};

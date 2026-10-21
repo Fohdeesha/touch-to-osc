@@ -52,9 +52,10 @@ checks it, and installs the systemd unit. Settings changed over OSC are saved in
 `/var/lib/touch-to-osc/settings.toml`. `scripts/uninstall.sh` removes the program and the
 unit again (`--purge` also removes the config and the saved settings).
 
-The service runs as an unprivileged user in the `input` group, restarts after a failure,
-stays stopped when the config is refused (fix it, then `systemctl restart touch-to-osc`),
-and reports its version, run and settings in the journal when it starts:
+The service runs as an unprivileged user in the `input` group, restarts after a failure
+(every second, without giving up), stays stopped when the config is refused (fix it, then
+`systemctl restart touch-to-osc`), and reports its version, run and settings in the
+journal when it starts:
 
     journalctl -u touch-to-osc
 
@@ -80,9 +81,17 @@ Studio. Those changes are saved in the daemon's own settings file, `[paths] sett
 (`/var/lib/touch-to-osc/settings.toml` by default), and win over the config file at every
 start; the config file itself is never written. The status lists which settings come from
 there (`/touch/overrides`), and `/touch/settings/forget` puts one or all of them back to
-the config file's values. A settings file the daemon refuses at start (a value it would
-not accept) is renamed to `settings.toml.refused`, reported in the health, and the daemon
-runs on the config file alone. `--check-config` checks the settings file too.
+the config file's values. Changes are written within about a second; several changes in
+quick succession are written once, and a clean stop writes at once. A settings file the
+daemon refuses or cannot read at start is renamed to `settings.toml.refused` and reported
+in the health until the next restart, and the daemon runs on the config file, except that
+a screen the file had turned off stays off. `--check-config` checks the settings file too.
+
+Text settings (labels, serials, ports) may only use printable ASCII.
+
+With `grab = false` and `silence_ms = 0`, the daemon cannot notice another program taking
+the screen exclusively while a finger is down; with `silence_ms` on it cancels that
+contact and reports the screen as held by another program.
 
 Several screens work side by side. Two identical screens are told apart by `port` (the
 USB socket they are plugged into, as `--list` shows it) or by `serial` when theirs
@@ -138,7 +147,8 @@ holds one message per contact that changed:
 - `frame`: the number of this bundle on this device, counting from 1 within a run. Every
   message in one bundle has the same number, and the next bundle has the next number, so
   a gap means a bundle was lost. Screen frames in which nothing changed send nothing and
-  use no number.
+  use no number. After 2147483647 it starts again at 1 (years of touching); contact ids
+  do the same.
 - `t_us`: when the screen reported the frame, as Unix time in microseconds (the moment of
   sending for cancels the daemon makes itself). With synced clocks a receiver can measure
   the whole path.
@@ -160,7 +170,7 @@ holds one message per contact that changed:
 
 - A lease is kept per (sender IP, port), 1-60 s, 10 by default, at most 8 at once, in
   memory only. Renew it every few seconds. A renewal answers only `subscribed`; a new
-  lease gets `subscribed`, the full status, then the event "subscriber IP:PORT added".
+  lease gets `subscribed`, the full status, then the event "IP:PORT added (lease N s)".
 - `alive` goes out every second to every subscriber and saved destination, in one bundle
   with one `active` message per configured device. `active` lists the contacts down on
   that device as of bundle `frame` (no contacts: just the frame). `run` is a random
@@ -181,8 +191,9 @@ What a receiver does with these:
 
 ### Status
 
-Sent in full on a new lease, on `status/send` and every 10 s; any part that changes goes
-out within 0.1 s:
+Sent in full on a new lease, on `status/send` and every 10 s, and each part again as soon
+as it changes (the health and reasons that look back over the last minute within a
+second). Status messages may arrive one by one or several to a bundle:
 
     /touch/osc_api                  i 2
     /touch/version                  s
@@ -218,8 +229,8 @@ out within 0.1 s:
     /touch/device/face/silence_ms   i        settable; 0 when off
     /touch/device/face/grabbed      i 0|1    held exclusively by the daemon now
 
-`restarting` lasts from a settings change that restarts reading the screen until it has
-been opened again; then the state is whatever the reopen found.
+`restarting` lasts from a settings change that reopens the screen (`grab` or a `match_`
+setting) until it has been opened again; then the state is whatever the reopen found.
 
 With every alive, to the receivers that get status:
 
@@ -250,7 +261,13 @@ after a settings change), `resync`, `silence`, `grab` (another program let go), 
 (turned off or on), `settings` (a setting changed, with the old and new value and who sent
 it, or the settings file could not be saved), `subscriber` (added, ended), `send` (a
 destination failing, at most once per 10 s each, with a count). Each event is also a line
-in the journal.
+in the journal. Events of one kind from one source are passed on up to 10 at once and then
+one a second; the rest are counted and reported in one event ("N more ... came too fast to
+report one by one").
+
+Logging never holds the daemon up: when the journal cannot take a line at once, the line is
+dropped and counted, and the count is logged as soon as it can be. `log.level = "debug"`
+adds a line for every command and every lease renewal; touches are never logged.
 
 ### Commands
 
@@ -287,12 +304,14 @@ Settings: each one is changed at the same address the status reports it on, and 
   or every host (`allowed_ips`).
 - The status shows a new value once it is in effect, and every change is a `settings`
   event and a journal line.
-- `label`, `enabled`, `silence_ms`, the log level and the lists apply at once.
-  `rotation`, `mirror`, `calibration`, `aspect`, `grab` and the three `match_` settings
-  restart reading that device: its contacts are cancelled `reconfigured`, its state reads
-  `restarting` until it is open again, and fingers still on it are not announced until
-  they lift.
-- A value set back to what the config file says stops being an override.
+- `label`, `enabled`, `silence_ms`, `aspect`, the log level and the lists apply at once.
+  `rotation`, `mirror` and `calibration` apply at once too, but cancel the device's
+  contacts (`reconfigured`), since positions jump. `grab` and the three `match_` settings
+  reopen the device: its contacts are cancelled `reconfigured` and its state reads
+  `restarting` until it is open again. Either way, fingers still on it are not announced
+  until they lift.
+- A value set back to what the config file says stops being an override, and a command
+  that changes nothing is answered `ok` without being saved or reported.
 - `osc.listen`, `osc.prefix`, `open_to_any` and adding or removing devices stay in the
   config file.
 
@@ -302,7 +321,8 @@ Settings: each one is changed at the same address the status reports it on, and 
   another command").
 - A bare command works too; a refusal then answers `/touch/error s address s note`.
 - Commands and subscriptions from a host outside `osc.allowed_ips` are answered with
-  `/touch/error` saying so (at most once per 5 s per host) and otherwise ignored.
+  `/touch/error` saying so (at most once per 5 s per host, and at most 20 such answers a
+  second in all) and otherwise ignored.
 - There is deliberately no command that creates a touch or writes the config file.
 
 ## Watching it

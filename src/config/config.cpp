@@ -179,7 +179,7 @@ std::string check_usb(const std::string& v, uint16_t* vendor, uint16_t* product)
 std::string check_text(const std::string& v, size_t max_len) {
     if (v.size() > max_len) return "is too long (at most " + std::to_string(max_len) + " characters)";
     for (unsigned char c : v) {
-        if (c < 0x20 || c == 0x7f) return "contains control characters";
+        if (c < 0x20 || c >= 0x7f) return "may only use printable ASCII characters";
     }
     return {};
 }

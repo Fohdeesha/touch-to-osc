@@ -52,7 +52,8 @@ int ContactTracker::end_frame(TouchEvent* out, Nanos now) {
             mute(s, r.tracking);
             continue;
         }
-        s.contact = next_contact_++;
+        s.contact = next_contact_;
+        next_contact_ = next_contact_ == INT32_MAX ? 1 : next_contact_ + 1;
         s.tracking = r.tracking;
         s.x = r.x;
         s.y = r.y;
