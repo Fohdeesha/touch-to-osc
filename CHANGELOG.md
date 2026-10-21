@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.0 - 2026-10-21
+
+OSC interface version 2: the daemon's health in a receiver's app, and its settings
+changed from there.
+
+- New status: uptime (with each alive), host name, config and settings file paths, log
+  level, allowed hosts, saved destinations, which settings are saved overrides, and per
+  device the usb id, serial and port it matches, its calibration and whether it grabs.
+- Settings commands at the same addresses as their status: label, on/off, rotation,
+  mirror, calibration, aspect, silence, grab and the three match settings per device; the
+  log level; adding and removing allowed hosts and saved destinations; `settings/forget`
+  for one setting or all of them. Checked with the config's own rules and words; a change
+  that would lock out the sending host, or every host, is refused.
+- Changes are saved in the daemon's own settings file (`[paths] settings`, by default
+  `/var/lib/touch-to-osc/settings.toml`) and win over the config file at every start; the
+  config file is never written. A settings file that would be refused is set aside as
+  `settings.toml.refused` and reported in the health. `--check-config` checks it too.
+- A change to how a screen is read cancels its contacts with the new reason
+  `reconfigured` and reopens it; its state reads `restarting` meanwhile. Label, on/off,
+  silence and the lists apply without a restart.
+- Turning a device off over OSC is now saved like every other setting.
+- The service has a state directory for the settings file.
+
 ## 0.1.0 - 2026-10-21
 
 First version.

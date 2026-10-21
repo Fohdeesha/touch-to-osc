@@ -1,5 +1,6 @@
 #include "control/server.h"
 
+#include "config/atomic_file.h"
 #include "core/log.h"
 #include "core/process.h"
 
@@ -10,6 +11,7 @@
 #include <cerrno>
 #include <cmath>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -72,10 +74,55 @@ bool to_sockaddr(const Peer& p, sockaddr_in& a) {
 
 float round1(double v) { return float(std::round(v * 10.0) / 10.0); }
 
+std::optional<double> number(const osc::Arg& a) {
+    if (auto i = std::get_if<int32_t>(&a)) return double(*i);
+    if (auto h = std::get_if<int64_t>(&a)) return double(*h);
+    if (auto f = std::get_if<float>(&a)) {
+        if (std::isfinite(*f)) return double(*f);
+    }
+    return std::nullopt;
 }
 
-Server::Server(Config cfg, std::string config_path, SysPaths paths)
-    : cfg_(std::move(cfg)), config_path_(std::move(config_path)), paths_(std::move(paths)), prefix_(cfg_.osc.prefix) {}
+const std::string* one_string(const std::vector<osc::Arg>& args) {
+    if (args.size() != 1) return nullptr;
+    return std::get_if<std::string>(&args[0]);
+}
+
+std::string num_text(double v) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%g", v);
+    return b;
+}
+
+std::string quoted(const std::string& s) { return "\"" + s + "\""; }
+
+std::string cal_text(const std::vector<double>& c) {
+    if (c.empty()) return "none";
+    std::string s;
+    for (double v : c) s += (s.empty() ? "" : " ") + num_text(v);
+    return s;
+}
+
+bool needs_restart(const DeviceConfig& a, const DeviceConfig& b) {
+    return a.rotation != b.rotation || a.mirror_x != b.mirror_x || a.mirror_y != b.mirror_y || a.calibration != b.calibration || a.aspect != b.aspect ||
+           a.grab != b.grab || a.has_usb != b.has_usb || a.vendor != b.vendor || a.product != b.product || a.serial != b.serial || a.port != b.port;
+}
+
+}
+
+Server::Server(Config base, SettingsLoad settings, std::string config_path, SysPaths paths)
+    : base_(std::move(base)),
+      over_(std::move(settings.overrides)),
+      cfg_(apply_overrides(base_, over_)),
+      settings_notes_(std::move(settings.notes)),
+      settings_problem_(std::move(settings.problem)),
+      settings_file_(settings.file_exists && !over_.empty() ? base_.paths.settings : std::string()),
+      config_path_(std::move(config_path)),
+      paths_(std::move(paths)),
+      prefix_(base_.osc.prefix) {
+    char host[256] = {};
+    if (gethostname(host, sizeof host - 1) == 0) host_ = host;
+}
 
 Server::~Server() {
     for (auto& sh : shared_) {
@@ -119,6 +166,17 @@ void Server::banner() {
     for (const auto& d : cfg_.destinations)
         TTO_NOTICE("destination %s:%d gets %s", d.address.host.c_str(), d.address.port,
                    d.touches && d.status ? "touches and status" : d.touches ? "touches (and the alive)" : "status (and the alive)");
+    if (base_.paths.settings.empty()) {
+        TTO_NOTICE("settings changed over OSC are kept until a restart (paths.settings is empty)");
+    } else if (over_.empty()) {
+        TTO_NOTICE("no saved settings; changes made over OSC are saved in %s", base_.paths.settings.c_str());
+    } else {
+        std::string names;
+        for (const auto& n : override_names(over_)) names += (names.empty() ? "" : ", ") + n;
+        TTO_NOTICE("saved settings from %s win over the config: %s", base_.paths.settings.c_str(), names.c_str());
+    }
+    for (const auto& n : settings_notes_) TTO_WARN("%s", n.c_str());
+    if (!settings_problem_.empty()) TTO_WARN("%s", settings_problem_.c_str());
 }
 
 int Server::run() {
@@ -132,6 +190,10 @@ int Server::run() {
     while (run_ == 0) {
         if (getrandom(&run_, sizeof run_, 0) != sizeof run_) run_ = int32_t(uint32_t(realtime_ns()) | 1u);
     }
+    started_ = monotonic_ns();
+    log::Level level = log::Level::info;
+    log::parse_level(cfg_.log.level.c_str(), level);
+    log::set_min_level(level);
     if (!open_sockets()) return 3;
     notify_fd_.reset(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
     timer_fd_.reset(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC));
@@ -154,6 +216,7 @@ int Server::run() {
         readers_.push_back(std::make_unique<DeviceReader>(d, prefix_, *sh, notify_fd_.get(), claims_, paths_));
         shared_.push_back(std::move(sh));
         stats_.emplace_back();
+        cfg_gen_.push_back(0);
     }
     publish_dests();
     for (auto& r : readers_) r->start();
@@ -401,7 +464,9 @@ Server::Health Server::health(Nanos now) {
     for (size_t i = 0; i < shared_.size(); ++i) {
         const DeviceConfig& d = cfg_.devices[i];
         const DevInfo& info = shared_[i]->info.latest();
-        if (!info.enabled) {
+        if (info.cfg_gen != cfg_gen_[i] || info.state == DevState::restarting) {
+            warnings.push_back(d.label + " is restarting after a settings change");
+        } else if (!info.enabled) {
             warnings.push_back(d.label + " is turned off by a command");
         } else {
             switch (info.state) {
@@ -423,6 +488,7 @@ Server::Health Server::health(Nanos now) {
     for (const auto& [key, h] : dest_health_) {
         if (h.failing) warnings.push_back("sending to " + key + " fails: " + h.error);
     }
+    if (!settings_problem_.empty()) warnings.push_back(settings_problem_);
     (void)now;
     Health out;
     out.level = !faults.empty() ? "fault" : !warnings.empty() ? "warning" : "ok";
@@ -441,18 +507,40 @@ std::vector<osc::Message> Server::status_messages() {
     add("health", {h.level});
     std::vector<osc::Arg> reasons(h.reasons.begin(), h.reasons.end());
     add("reasons", reasons);
+    add("host", {host_});
+    add("config", {config_path_});
+    add("settings_file", {settings_file_});
+    add("log_level", {cfg_.log.level});
+    std::vector<osc::Arg> allowed;
+    if (cfg_.osc.open_to_any) allowed.emplace_back(std::string("any"));
+    for (const auto& ip : cfg_.osc.allowed_ips) allowed.emplace_back(ip);
+    add("allowed_ips", allowed);
+    std::vector<osc::Arg> saved;
+    for (const auto& d : cfg_.destinations) saved.emplace_back(destination_text(d));
+    add("saved_destinations", saved);
+    std::vector<osc::Arg> overrides;
+    for (const auto& n : override_names(over_)) overrides.emplace_back(n);
+    add("overrides", overrides);
     std::vector<osc::Arg> ids;
     for (const auto& d : cfg_.devices) ids.emplace_back(d.id);
     add("devices", ids);
     for (size_t i = 0; i < shared_.size(); ++i) {
         const DeviceConfig& d = cfg_.devices[i];
         const DevInfo& info = shared_[i]->info.latest();
+        bool restarting = info.cfg_gen != cfg_gen_[i];
         std::string b = "device/" + d.id + "/";
         add(b + "label", {d.label});
         add(b + "enabled", {int32_t(info.enabled ? 1 : 0)});
         add(b + "connected", {int32_t(info.connected ? 1 : 0)});
-        add(b + "state", {std::string(state_name(info.state))});
-        add(b + "reason", {std::string(info.reason)});
+        add(b + "state", {std::string(restarting ? "restarting" : state_name(info.state))});
+        add(b + "reason", {std::string(restarting ? "restarting after a settings change" : info.reason)});
+        add(b + "match_usb", {d.usb_setting()});
+        add(b + "match_serial", {d.serial});
+        add(b + "match_port", {d.port});
+        std::vector<osc::Arg> cal;
+        for (double v : d.calibration) cal.emplace_back(float(v));
+        add(b + "calibration", cal);
+        add(b + "grab", {int32_t(d.grab ? 1 : 0)});
         add(b + "name", {std::string(info.connected ? info.name : "")});
         add(b + "usb", {std::string(info.connected ? info.usb : "")});
         add(b + "port", {std::string(info.connected ? info.port : "")});
@@ -460,7 +548,7 @@ std::vector<osc::Message> Server::status_messages() {
         add(b + "size_mm", {info.connected ? info.w_mm : 0.0f, info.connected ? info.h_mm : 0.0f});
         add(b + "rotation", {int32_t(d.rotation)});
         add(b + "mirror", {d.mirror_text()});
-        add(b + "aspect", {info.aspect > 0 ? info.aspect : float(d.aspect)});
+        add(b + "aspect", {d.aspect > 0 ? float(d.aspect) : info.aspect});
         add(b + "silence_ms", {int32_t(d.silence_ms)});
         add(b + "grabbed", {int32_t(info.connected && info.grabbed ? 1 : 0)});
     }
@@ -470,6 +558,7 @@ std::vector<osc::Message> Server::status_messages() {
 std::vector<osc::Message> Server::counter_messages(Nanos now) {
     std::vector<osc::Message> out;
     auto add = [&](const std::string& rest, std::vector<osc::Arg> args) { out.push_back({addr(rest), std::move(args)}); };
+    add("uptime_s", {int32_t(std::min<Nanos>((now - started_) / kSec, INT32_MAX))});
     for (size_t i = 0; i < shared_.size(); ++i) {
         DeviceShared& sh = *shared_[i];
         std::string b = "device/" + cfg_.devices[i].id + "/";
@@ -603,20 +692,244 @@ Status Server::apply(const osc::Message& m, const Peer& peer) {
     }
     if (parts.size() == 1 && parts[0] == "subscribe") return subscribe(m, peer);
     if (parts.size() == 1 && parts[0] == "unsubscribe") return unsubscribe(m, peer);
-    if (parts.size() == 3 && parts[0] == "device" && parts[2] == "enabled") {
+    if (parts.size() == 3 && parts[0] == "device") {
         auto it = std::find_if(cfg_.devices.begin(), cfg_.devices.end(), [&](const DeviceConfig& d) { return d.id == parts[1]; });
         if (it == cfg_.devices.end()) return err("no device " + parts[1]);
-        auto v = m.args.size() == 1 ? integer(m.args[0]) : std::nullopt;
-        if (!v || (*v != 0 && *v != 1)) return err("enabled needs 0 or 1");
-        DeviceShared& sh = *shared_[size_t(it - cfg_.devices.begin())];
-        bool want = *v == 1;
-        if (sh.want_enabled.exchange(want) != want) {
-            TTO_NOTICE("device %s %s over OSC from %s", it->id.c_str(), want ? "turned on" : "turned off", peer.ip.c_str());
-            write_one(sh.wake.get());
-        }
+        return set_device(size_t(it - cfg_.devices.begin()), parts[2], m.args, peer);
+    }
+    return set_global(parts, m.args, peer);
+}
+
+Status Server::set_device(size_t index, const std::string& key, const std::vector<osc::Arg>& args, const Peer& peer) {
+    const DeviceConfig& cur = cfg_.devices[index];
+    Overrides next = over_;
+    DeviceOverrides& x = next.devices[cur.id];
+    std::string what = cur.id + " " + key + " ";
+    auto text = [&](size_t max_len, std::string& out) -> Status {
+        const std::string* s = one_string(args);
+        if (!s) return err(key + " needs one string");
+        std::string problem = check_text(*s, max_len);
+        if (!problem.empty()) return err(key + " " + problem);
+        out = *s;
         return {};
+    };
+    auto flag = [&](bool& out) -> Status {
+        auto v = args.size() == 1 ? integer(args[0]) : std::nullopt;
+        if (!v || (*v != 0 && *v != 1)) return err(key + " needs 0 or 1");
+        out = *v == 1;
+        return {};
+    };
+    auto whole = [&](long long& out) -> Status {
+        auto v = args.size() == 1 ? integer(args[0]) : std::nullopt;
+        if (!v) return err(key + " needs one whole number");
+        out = *v;
+        return {};
+    };
+    std::string s;
+    bool b = false;
+    long long n = 0;
+    if (key == "label") {
+        if (Status st = text(64, s); !st) return st;
+        x.label = s;
+        what += quoted(cur.label) + " -> " + quoted(s.empty() ? cur.id : s);
+    } else if (key == "enabled") {
+        if (Status st = flag(b); !st) return st;
+        x.enabled = b;
+        what = cur.id + (b ? " turned on" : " turned off");
+    } else if (key == "rotation") {
+        if (Status st = whole(n); !st) return st;
+        if (std::string p = check_rotation(n); !p.empty()) return err("rotation " + p);
+        x.rotation = int(n);
+        what += std::to_string(cur.rotation) + " -> " + std::to_string(n);
+    } else if (key == "mirror") {
+        if (Status st = text(4, s); !st) return st;
+        if (std::string p = check_mirror(s); !p.empty()) return err("mirror " + p);
+        x.mirror = s;
+        what += quoted(cur.mirror_text()) + " -> " + quoted(s);
+    } else if (key == "calibration") {
+        std::vector<double> c;
+        for (const auto& a : args) {
+            auto v = number(a);
+            if (!v) return err("calibration needs six numbers, or none to remove it");
+            c.push_back(*v);
+        }
+        if (std::string p = check_calibration(c); !p.empty()) return err("calibration " + p);
+        x.calibration = c;
+        what += cal_text(cur.calibration) + " -> " + cal_text(c);
+    } else if (key == "aspect") {
+        auto v = args.size() == 1 ? number(args[0]) : std::nullopt;
+        if (!v) return err("aspect needs one number");
+        if (std::string p = check_aspect(*v); !p.empty()) return err("aspect " + p);
+        x.aspect = *v;
+        what += num_text(cur.aspect) + " -> " + num_text(*v);
+    } else if (key == "silence_ms") {
+        if (Status st = whole(n); !st) return st;
+        if (std::string p = check_silence(n); !p.empty()) return err("silence_ms " + p);
+        x.silence_ms = int(n);
+        what += std::to_string(cur.silence_ms) + " -> " + std::to_string(n);
+    } else if (key == "grab") {
+        if (Status st = flag(b); !st) return st;
+        x.grab = b;
+        what += std::string(cur.grab ? "1" : "0") + " -> " + (b ? "1" : "0");
+    } else if (key == "match_usb") {
+        if (Status st = text(16, s); !st) return st;
+        if (std::string p = check_usb(s, nullptr, nullptr); !p.empty()) return err("match_usb " + p);
+        x.match_usb = s;
+        what += quoted(cur.usb_setting()) + " -> " + quoted(s);
+    } else if (key == "match_serial") {
+        if (Status st = text(128, s); !st) return st;
+        x.match_serial = s;
+        what += quoted(cur.serial) + " -> " + quoted(s);
+    } else if (key == "match_port") {
+        if (Status st = text(64, s); !st) return st;
+        x.match_port = s;
+        what += quoted(cur.port) + " -> " + quoted(s);
+    } else {
+        return err("unknown address");
+    }
+    return commit(std::move(next), peer, what);
+}
+
+Status Server::set_global(const std::vector<std::string>& parts, const std::vector<osc::Arg>& args, const Peer& peer) {
+    Overrides next = over_;
+    const std::string* s = one_string(args);
+    if (parts.size() == 1 && parts[0] == "log_level") {
+        if (!s) return err("log_level needs one string");
+        if (std::string p = check_log_level(*s); !p.empty()) return err("log_level " + p);
+        next.log_level = *s;
+        return commit(std::move(next), peer, "log level " + cfg_.log.level + " -> " + *s);
+    }
+    if (parts.size() == 2 && parts[0] == "allowed_ips" && (parts[1] == "add" || parts[1] == "remove")) {
+        if (!s) return err("allowed_ips/" + parts[1] + " needs one IPv4 address");
+        if (std::string p = check_ipv4(*s); !p.empty()) return err(p);
+        std::vector<std::string> list = cfg_.osc.allowed_ips;
+        auto it = std::find(list.begin(), list.end(), *s);
+        if (parts[1] == "add") {
+            if (it != list.end()) return err(*s + " is already allowed");
+            if (list.size() >= kMaxAllowedIps) return err("at most " + std::to_string(kMaxAllowedIps) + " allowed hosts");
+            list.push_back(*s);
+        } else {
+            if (it == list.end()) return err(*s + " is not in allowed_ips");
+            list.erase(it);
+        }
+        next.allowed_ips = list;
+        return commit(std::move(next), peer, "allowed host " + *s + (parts[1] == "add" ? " added" : " removed"));
+    }
+    if (parts.size() == 2 && parts[0] == "saved_destinations" && (parts[1] == "add" || parts[1] == "remove")) {
+        const std::string* address = args.empty() ? nullptr : std::get_if<std::string>(&args[0]);
+        if (!address) return err("saved_destinations/" + parts[1] + " needs \"IP:PORT\"" + (parts[1] == "add" ? " and optionally touches and status (0 or 1)" : ""));
+        DestinationConfig d;
+        if (std::string p = check_destination(*address, d.address); !p.empty()) return err("the destination " + p);
+        std::vector<DestinationConfig> list = cfg_.destinations;
+        auto it = std::find_if(list.begin(), list.end(), [&](const DestinationConfig& x) { return x.address.text() == d.address.text(); });
+        if (parts[1] == "add") {
+            if (args.size() != 1 && args.size() != 3) return err("saved_destinations/add needs \"IP:PORT\", or \"IP:PORT\" touches status (each 0 or 1)");
+            if (args.size() == 3) {
+                auto t = integer(args[1]), st = integer(args[2]);
+                if (!t || !st || (*t != 0 && *t != 1) || (*st != 0 && *st != 1)) return err("touches and status must each be 0 or 1");
+                d.touches = *t == 1;
+                d.status = *st == 1;
+            }
+            if (!d.touches && !d.status) return err("a destination needs touches or status, or both");
+            if (it != list.end()) return err(d.address.text() + " is already a saved destination");
+            if (list.size() >= kMaxDestinations) return err("at most " + std::to_string(kMaxDestinations) + " saved destinations");
+            list.push_back(d);
+        } else {
+            if (args.size() != 1) return err("saved_destinations/remove needs \"IP:PORT\"");
+            if (it == list.end()) return err(d.address.text() + " is not a saved destination");
+            list.erase(it);
+        }
+        next.saved_destinations = list;
+        return commit(std::move(next), peer, "saved destination " + (parts[1] == "add" ? destination_text(d) + " added" : d.address.text() + " removed"));
+    }
+    if (parts.size() == 2 && parts[0] == "settings" && parts[1] == "forget") {
+        if (args.empty()) {
+            if (over_.empty()) return {};
+            return commit(Overrides{}, peer, "every saved setting forgotten: back to the config file");
+        }
+        if (!s) return err("settings/forget takes the name of one setting (as /touch/overrides lists them), or nothing to forget them all");
+        if (!forget_override(next, *s)) return err("nothing is saved for " + *s);
+        return commit(std::move(next), peer, *s + " forgotten: back to the config file");
     }
     return err("unknown address");
+}
+
+Status Server::commit(Overrides next, const Peer& peer, const std::string& what) {
+    drop_unchanged(next, base_);
+    Config eff = apply_overrides(base_, next);
+    for (const auto& d : eff.devices) {
+        if (!d.has_usb && d.port.empty()) return err("device " + d.id + " would match nothing: it needs a usb id or a port");
+    }
+    if (!eff.osc.open_to_any) {
+        if (eff.osc.allowed_ips.empty()) return err("this would lock out every host: at least one must stay allowed");
+        if (std::find(eff.osc.allowed_ips.begin(), eff.osc.allowed_ips.end(), peer.ip) == eff.osc.allowed_ips.end())
+            return err("this would lock out " + peer.ip + ", the host sending this command");
+    }
+    Config old = cfg_;
+    over_ = std::move(next);
+    cfg_ = std::move(eff);
+    apply_effects(old);
+    save_settings();
+    TTO_NOTICE("settings: %s, from %s", what.c_str(), peer.ip.c_str());
+    send_event("settings", what + ", from " + peer.ip);
+    send_status_changes(false);
+    return {};
+}
+
+void Server::apply_effects(const Config& old) {
+    if (old.log.level != cfg_.log.level) {
+        log::Level l = log::Level::info;
+        log::parse_level(cfg_.log.level.c_str(), l);
+        log::set_min_level(l);
+    }
+    if (!(old.destinations == cfg_.destinations)) publish_dests();
+    for (size_t i = 0; i < shared_.size(); ++i) {
+        const DeviceConfig& a = old.devices[i];
+        const DeviceConfig& b = cfg_.devices[i];
+        DeviceShared& sh = *shared_[i];
+        bool wake = false;
+        if (a.enabled != b.enabled) {
+            sh.want_enabled.store(b.enabled);
+            wake = true;
+        }
+        if (a.silence_ms != b.silence_ms) {
+            sh.silence_ms.store(b.silence_ms);
+            wake = true;
+        }
+        if (needs_restart(a, b)) {
+            std::lock_guard<std::mutex> lock(sh.cfg_mutex);
+            sh.next_cfg = b;
+            cfg_gen_[i] = sh.cfg_gen.load() + 1;
+            sh.cfg_gen.store(cfg_gen_[i]);
+            wake = true;
+        }
+        if (wake) write_one(sh.wake.get());
+    }
+}
+
+void Server::save_settings() {
+    const std::string& path = base_.paths.settings;
+    if (path.empty()) return;
+    if (over_.empty()) {
+        if (unlink(path.c_str()) == 0 || errno == ENOENT) {
+            settings_file_.clear();
+            settings_problem_.clear();
+        } else {
+            settings_problem_ = "removing the settings file " + path + " failed (" + errno_str() + "): its old settings come back at a restart";
+            TTO_ERR("%s", settings_problem_.c_str());
+            send_event("settings", settings_problem_);
+        }
+        return;
+    }
+    Status st = write_file_atomic(path, settings_text(over_, config_path_));
+    if (!st) {
+        settings_problem_ = "saving the settings to " + path + " failed (" + st.error() + "): changes made over OSC are lost at a restart";
+        TTO_ERR("%s", settings_problem_.c_str());
+        send_event("settings", settings_problem_);
+        return;
+    }
+    settings_problem_.clear();
+    settings_file_ = path;
 }
 
 Status Server::subscribe(const osc::Message& m, const Peer& peer) {

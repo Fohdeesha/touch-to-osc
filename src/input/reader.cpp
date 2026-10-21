@@ -57,6 +57,7 @@ DeviceReader::DeviceReader(DeviceConfig cfg, const std::string& prefix, DeviceSh
     addr_cancel_ = base + "cancel";
     enabled_ = cfg_.enabled;
     sh_.want_enabled.store(cfg_.enabled);
+    sh_.silence_ms.store(cfg_.silence_ms);
     info_.enabled = enabled_;
 }
 
@@ -136,6 +137,7 @@ void DeviceReader::wait_for_change(int timeout_ms) {
     if (p[0].revents) drain_fd(p[0].fd);
     if (p[1].revents) {
         drain_fd(p[1].fd);
+        if (sh_.cfg_gen.load() != cfg_gen_) take_new_config();
         apply_enabled();
     }
 }
@@ -369,7 +371,20 @@ int DeviceReader::drain() {
 }
 
 bool DeviceReader::silent(Nanos now) const {
-    return enabled_ && cfg_.silence_ms > 0 && tracker_.announced() > 0 && now - last_frame_ >= Nanos(cfg_.silence_ms) * kMs;
+    int32_t ms = sh_.silence_ms.load(std::memory_order_relaxed);
+    return enabled_ && ms > 0 && tracker_.announced() > 0 && now - last_frame_ >= Nanos(ms) * kMs;
+}
+
+void DeviceReader::take_new_config() {
+    {
+        std::lock_guard<std::mutex> lock(sh_.cfg_mutex);
+        cfg_ = sh_.next_cfg;
+        cfg_gen_ = sh_.cfg_gen.load();
+    }
+    info_.cfg_gen = cfg_gen_;
+    warned_ambiguous_ = false;
+    set_state(DevState::restarting, "restarting after a settings change");
+    publish_info();
 }
 
 void DeviceReader::apply_enabled() {
@@ -458,8 +473,9 @@ void DeviceReader::session() {
     for (;;) {
         int timeout = -1;
         Nanos now = monotonic_ns();
-        if (enabled_ && cfg_.silence_ms > 0 && tracker_.announced() > 0) {
-            Nanos due = last_frame_ + Nanos(cfg_.silence_ms) * kMs;
+        int32_t silence = sh_.silence_ms.load(std::memory_order_relaxed);
+        if (enabled_ && silence > 0 && tracker_.announced() > 0) {
+            Nanos due = last_frame_ + Nanos(silence) * kMs;
             timeout = int(std::max<Nanos>(0, (due - now + kMs - 1) / kMs));
         }
         if (base_state_ == DevState::grab_refused) timeout = timeout < 0 ? 2000 : std::min(timeout, 2000);
@@ -479,6 +495,13 @@ void DeviceReader::session() {
                 int n = cancel("stopping");
                 if (n) event(EventKind::device, log::Level::notice, "%s: stopping; %d contact%s cancelled", cfg_.id.c_str(), n, plural(n));
                 close_device();
+                return;
+            }
+            if (sh_.cfg_gen.load() != cfg_gen_) {
+                int n = cancel("reconfigured");
+                event(EventKind::device, log::Level::notice, "%s: restarting after a settings change; %d contact%s cancelled", cfg_.id.c_str(), n, plural(n));
+                close_device();
+                take_new_config();
                 return;
             }
             apply_enabled();

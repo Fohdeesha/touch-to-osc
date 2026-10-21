@@ -21,7 +21,9 @@ where a picture shown on the screen sits.
   has to lift first; its next touch is a new contact.
 - A `cancel` is never a tap. The kernel's own release of a device that is going away is
   read as the device being lost, never as a finger lifting.
-- No command, file or signal creates a touch.
+- No command, file or signal creates a touch. A settings change that alters how a screen
+  is read (its alignment, its exclusive hold, which device it matches) cancels that
+  screen's contacts and reads it again from scratch.
 - Reading a touch never waits on the network, the disk or the status work: each device has
   its own reader thread that sends without blocking (a full socket drops the datagram and
   counts it).
@@ -46,8 +48,9 @@ also need `python3`.
 
 `install.sh` installs `/usr/local/bin/touch-to-osc`, writes
 `/etc/touch-to-osc/touch-to-osc.toml` from `config.example.toml` if there is none yet,
-checks it, and installs the systemd unit. `scripts/uninstall.sh` removes them again
-(`--purge` also removes the config).
+checks it, and installs the systemd unit. Settings changed over OSC are saved in
+`/var/lib/touch-to-osc/settings.toml`. `scripts/uninstall.sh` removes the program and the
+unit again (`--purge` also removes the config and the saved settings).
 
 The service runs as an unprivileged user in the `input` group, restarts after a failure,
 stays stopped when the config is refused (fix it, then `systemctl restart touch-to-osc`),
@@ -72,6 +75,15 @@ and reports its version, run and settings in the journal when it starts:
 Unknown keys, wrong types and out-of-range values are refused with a message that names
 the key. `touch-to-osc --check-config=FILE` checks a file without opening anything.
 
+Settings can also be changed over OSC (see Commands below), for example from Bridge
+Studio. Those changes are saved in the daemon's own settings file, `[paths] settings`
+(`/var/lib/touch-to-osc/settings.toml` by default), and win over the config file at every
+start; the config file itself is never written. The status lists which settings come from
+there (`/touch/overrides`), and `/touch/settings/forget` puts one or all of them back to
+the config file's values. A settings file the daemon refuses at start (a value it would
+not accept) is renamed to `settings.toml.refused`, reported in the health, and the daemon
+runs on the config file alone. `--check-config` checks the settings file too.
+
 Several screens work side by side. Two identical screens are told apart by `port` (the
 USB socket they are plugged into, as `--list` shows it) or by `serial` when theirs
 differ.
@@ -79,7 +91,7 @@ differ.
 ## Command line
 
     touch-to-osc [--config=FILE]            run (default /etc/touch-to-osc/touch-to-osc.toml)
-    touch-to-osc --check-config[=FILE]      check a config, exit 0 (good) or 2 (refused)
+    touch-to-osc --check-config[=FILE]      check a config and its saved settings, exit 0 (good) or 2 (refused)
     touch-to-osc --list [--config=FILE]     every input device and what the config makes of it
     touch-to-osc --dump[=ID] [--config=FILE]  one line per touch frame of a configured device
     touch-to-osc --version
@@ -100,7 +112,7 @@ To record a screen for the tests, stop the service and use evemu:
 Exit codes: 0 clean stop, 1 wrong command line, 2 config refused, 3 the listen port cannot
 be bound, 4 internal error.
 
-## OSC interface (osc_api 1)
+## OSC interface (osc_api 2)
 
 All addresses start with the prefix (`/touch` here) and devices appear by their config
 `id` (`face` here). Number arguments in commands may be `i`, `h` or a whole `f`; the
@@ -135,7 +147,8 @@ holds one message per contact that changed:
   device), `device silent` (the screen sent nothing for `silence_ms` with the contact
   down), `device disabled` (a command), `resync` (the kernel dropped events because they
   were not read in time; the state was read again), `palm` (the screen marked the contact
-  as a palm), `stopping` (the daemon is stopping).
+  as a palm), `reconfigured` (a settings change restarts reading the screen), `stopping`
+  (the daemon is stopping).
 
 ### Liveness
 
@@ -171,30 +184,46 @@ What a receiver does with these:
 Sent in full on a new lease, on `status/send` and every 10 s; any part that changes goes
 out within 0.1 s:
 
-    /touch/osc_api                  i 1
+    /touch/osc_api                  i 2
     /touch/version                  s
     /touch/run                      i
     /touch/health                   s ok|warning|fault
     /touch/reasons                  s ...    one string per reason, in plain words
+    /touch/host                     s        the machine's host name
+    /touch/config                   s        path of the config file
+    /touch/settings_file            s        path of the saved settings, "" when nothing is saved
+    /touch/log_level                s        settable
+    /touch/allowed_ips              s ...    hosts allowed to send commands ("any" first with open_to_any)
+    /touch/saved_destinations       s ...    "ip:port touches status", "ip:port touches" or "ip:port status"
+    /touch/overrides                s ...    the settings that come from the settings file, by name
     /touch/devices                  s id ...
-    /touch/device/face/label        s
-    /touch/device/face/enabled      i 0|1    the applied state
+    /touch/device/face/label        s        settable
+    /touch/device/face/enabled      i 0|1    settable; the applied state
     /touch/device/face/connected    i 0|1
-    /touch/device/face/state        s ok|not connected|disabled|no permission|grab refused|read error|not a touchscreen
+    /touch/device/face/state        s ok|not connected|disabled|no permission|grab refused|read error|not a touchscreen|restarting
     /touch/device/face/reason       s        what to do about the state
+    /touch/device/face/match_usb    s        settable: the "vvvv:pppp" it matches, or ""
+    /touch/device/face/match_serial s        settable
+    /touch/device/face/match_port   s        settable
+    /touch/device/face/calibration  f a f b f c f d f e f f   settable; no arguments when none
+    /touch/device/face/grab         i 0|1    settable: whether to hold it exclusively
     /touch/device/face/name         s        the kernel's name for the device
     /touch/device/face/usb          s        "vvvv:pppp serial"
     /touch/device/face/port         s        the USB port path
     /touch/device/face/slots        i        contacts it can track at once
     /touch/device/face/size_mm      f w  f h  0 0 when the device does not say
-    /touch/device/face/rotation     i 0|90|180|270
-    /touch/device/face/mirror       s ""|x|y|xy
-    /touch/device/face/aspect       f        width / height of its display area
-    /touch/device/face/silence_ms   i        0 when off
-    /touch/device/face/grabbed      i 0|1    held exclusively by the daemon
+    /touch/device/face/rotation     i 0|90|180|270   settable
+    /touch/device/face/mirror       s ""|x|y|xy      settable
+    /touch/device/face/aspect       f        settable: width / height of its display area
+    /touch/device/face/silence_ms   i        settable; 0 when off
+    /touch/device/face/grabbed      i 0|1    held exclusively by the daemon now
+
+`restarting` lasts from a settings change that restarts reading the screen until it has
+been opened again; then the state is whatever the reopen found.
 
 With every alive, to the receivers that get status:
 
+    /touch/uptime_s                 i        seconds since this run started
     /touch/device/face/contacts     i        down now
     /touch/device/face/oldest_s     f        age of the oldest contact down, -1 when none
     /touch/device/face/last_event_s f        seconds since the screen's last frame, -1 never
@@ -206,18 +235,22 @@ With every alive, to the receivers that get status:
 
 `health` is `fault` when an enabled device is not working (not connected, no permission,
 held by another program, read error, not a touchscreen) and `warning` when a device is
-turned off by a command, when the kernel dropped events, a screen went silent or touch
-messages could not be sent in the last minute, or when sending to a destination fails.
-`reasons` says which, in words that say what to do.
+turned off or restarting after a settings change, when the kernel dropped events, a
+screen went silent or touch messages could not be sent in the last minute, when sending to
+a destination fails, or when the settings file was refused or could not be saved.
+`reasons` says which, in words that say what to do. The heartbeat is the alive's
+`counter`.
 
 ### Events
 
     /touch/event  s kind  s text
 
-Kinds: `device` (connected, lost, released by the kernel, two screens match), `resync`,
-`silence`, `grab` (another program let go), `enabled` (turned off or on), `subscriber`
-(added, ended), `send` (a destination failing, at most once per 10 s each, with a count).
-Each event is also a line in the journal.
+Kinds: `device` (connected, lost, released by the kernel, two screens match, restarting
+after a settings change), `resync`, `silence`, `grab` (another program let go), `enabled`
+(turned off or on), `settings` (a setting changed, with the old and new value and who sent
+it, or the settings file could not be saved), `subscriber` (added, ended), `send` (a
+destination failing, at most once per 10 s each, with a count). Each event is also a line
+in the journal.
 
 ### Commands
 
@@ -225,9 +258,43 @@ Each event is also a line in the journal.
 
     /touch/ping [i port]                  -> /touch/pong i run
     /touch/status/send [i port]           -> the full status and the counters (at most 5 a second)
-    /touch/device/face/enabled  i 0|1     turn a device off (its contacts are cancelled) or on;
-                                             kept until the daemon restarts
     /touch/subscribe, /touch/unsubscribe  as above
+
+Settings: each one is changed at the same address the status reports it on, and saved.
+
+    /touch/device/face/label         s
+    /touch/device/face/enabled       i 0|1      off cancels the device's contacts
+    /touch/device/face/rotation      i 0|90|180|270
+    /touch/device/face/mirror        s ""|x|y|xy
+    /touch/device/face/calibration   f a f b f c f d f e f f, or no arguments to remove it
+    /touch/device/face/aspect        f          0 takes it from the device
+    /touch/device/face/silence_ms    i          0 (off) or 50-10000
+    /touch/device/face/grab          i 0|1
+    /touch/device/face/match_usb     s          "vvvv:pppp", or "" to match by port alone
+    /touch/device/face/match_serial  s
+    /touch/device/face/match_port    s
+    /touch/log_level                 s          crit|error|warning|notice|info|debug
+    /touch/allowed_ips/add           s ip
+    /touch/allowed_ips/remove        s ip
+    /touch/saved_destinations/add    s "ip:port" [i touches  i status]   (both 1 by default)
+    /touch/saved_destinations/remove s "ip:port"
+    /touch/settings/forget           [s name]   one setting, by its name in /touch/overrides,
+                                                or all of them: back to the config file
+
+- A value is checked with the config file's own rules and refused in the same words
+  ("rotation must be 0, 90, 180 or 270"). Also refused: a change that would leave a device
+  matching nothing (no usb and no port), and one that would lock out the host sending it
+  or every host (`allowed_ips`).
+- The status shows a new value once it is in effect, and every change is a `settings`
+  event and a journal line.
+- `label`, `enabled`, `silence_ms`, the log level and the lists apply at once.
+  `rotation`, `mirror`, `calibration`, `aspect`, `grab` and the three `match_` settings
+  restart reading that device: its contacts are cancelled `reconfigured`, its state reads
+  `restarting` until it is open again, and fingers still on it are not announced until
+  they lift.
+- A value set back to what the config file says stops being an override.
+- `osc.listen`, `osc.prefix`, `open_to_any` and adding or removing devices stay in the
+  config file.
 
 - Every command can go inside a request and then gets exactly one reply. Replies are kept
   per (IP, port, seq) for 30 s or 64 newer requests: an exact repeat gets the kept reply
@@ -236,7 +303,7 @@ Each event is also a line in the journal.
 - A bare command works too; a refusal then answers `/touch/error s address s note`.
 - Commands and subscriptions from a host outside `osc.allowed_ips` are answered with
   `/touch/error` saying so (at most once per 5 s per host) and otherwise ignored.
-- There is deliberately no command that creates a touch or writes the config.
+- There is deliberately no command that creates a touch or writes the config file.
 
 ## Watching it
 

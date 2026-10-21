@@ -54,6 +54,7 @@ private:
     void publish_active();
     void apply_enabled();
     void retry_grab();
+    void take_new_config();
     void set_state(DevState st, const std::string& reason);
     void publish_info();
     void event(EventKind kind, log::Level level, const char* fmt, ...) __attribute__((format(printf, 4, 5)));
@@ -86,6 +87,7 @@ private:
     Nanos prev_frame_ = 0;
     Nanos last_frame_ = 0;
     int32_t frame_ = 0;
+    uint32_t cfg_gen_ = 0;
     DevState base_state_ = DevState::starting;
     std::string base_reason_;
     DevInfo info_;

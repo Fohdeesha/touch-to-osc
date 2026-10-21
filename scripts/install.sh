@@ -26,4 +26,4 @@ install -m 0644 "$here/packaging/touch-to-osc.service" /etc/systemd/system/touch
 systemctl daemon-reload
 
 echo "start with: systemctl enable --now touch-to-osc"
-echo "remove with: $here/scripts/uninstall.sh (add --purge to remove the config too)"
+echo "remove with: $here/scripts/uninstall.sh (add --purge to remove the config and the saved settings too)"

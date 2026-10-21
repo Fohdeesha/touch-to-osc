@@ -15,8 +15,8 @@ import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import (DAEMON_PORT, TEST_VENDOR, Daemon, Failure, Receiver, check, device,  # noqa: E402
-                     test_product)
+from harness import (BUILD, DAEMON_PORT, RUN_DIR, TEST_VENDOR, Daemon, Failure, Receiver, check,  # noqa: E402
+                     device, test_product)
 from uinput import TouchScreen, try_grab  # noqa: E402
 
 TRACES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "traces")
@@ -52,8 +52,8 @@ class Ctx:
         self.screens.append(s)
         return s
 
-    def daemon(self, devices, **kw):
-        d = Daemon("%s-%d" % (self.name, len(self.daemons)), devices, **kw)
+    def daemon(self, devices, name=None, **kw):
+        d = Daemon(name or "%s-%d" % (self.name, len(self.daemons)), devices, **kw)
         self.daemons.append(d)
         return d
 
@@ -688,7 +688,17 @@ def status_describes_the_device():
         r = c.receiver()
         connected(r)
         want = {
-            "/touch/osc_api": [1],
+            "/touch/osc_api": [2],
+            "/touch/config": [c.daemons[0].config],
+            "/touch/settings_file": [""],
+            "/touch/log_level": ["info"],
+            "/touch/allowed_ips": ["127.0.0.1"],
+            "/touch/saved_destinations": [],
+            "/touch/overrides": [],
+            "/touch/device/t/match_usb": ["%04x:%04x" % (TEST_VENDOR, p)],
+            "/touch/device/t/match_port": [""],
+            "/touch/device/t/calibration": [],
+            "/touch/device/t/grab": [1],
             "/touch/devices": ["t"],
             "/touch/device/t/label": ["test screen"],
             "/touch/device/t/state": ["ok"],
@@ -707,11 +717,15 @@ def status_describes_the_device():
         r.wait("/touch/device/t/aspect", lambda m: abs(m.args[0] - 16 / 9) < 1e-3)
         r.wait("/touch/device/t/counts", timeout=2.5)
         r.wait("/touch/device/t/latency_us", timeout=2.5)
+        check(r.wait("/touch/host").args[0] != "", "no host name")
+        u1 = r.wait("/touch/uptime_s", timeout=2.5)
+        u2 = r.wait("/touch/uptime_s", lambda m: m.at > u1.at + 1.5, timeout=3)
+        check(u2.args[0] > u1.args[0], "uptime %s then %s" % (u1.args, u2.args))
         m = r.mark()
         r.send("/touch/status/send")
         r.wait("/touch/run", since=m)
         log = c.daemons[0].log_text()
-        check("touch-to-osc 0.1.0 (osc_api 1)" in log, "banner")
+        check("touch-to-osc 0.2.0 (osc_api 2)" in log, "banner")
 
 
 @test()
@@ -727,7 +741,7 @@ def no_permission_says_what_to_do():
         d.config = "/tmp/tto-e2e/noperm.toml"
         d.log_path = "/tmp/tto-e2e/noperm.log"
         with open(d.config, "w") as f:
-            f.write('[osc]\nlisten = "127.0.0.1:%d"\nallowed_ips = ["127.0.0.1"]\n[[device]]\nid = "t"\nusb = "%04x:%04x"\n' % (DAEMON_PORT, TEST_VENDOR, p))
+            f.write('[osc]\nlisten = "127.0.0.1:%d"\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = ""\n[[device]]\nid = "t"\nusb = "%04x:%04x"\n' % (DAEMON_PORT, TEST_VENDOR, p))
         os.chmod(d.config, 0o644)
         d.log = open(d.log_path, "w")
         binary = os.path.join(os.environ.get("TTO_BUILD", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "build")), "touch-to-osc")
@@ -737,6 +751,256 @@ def no_permission_says_what_to_do():
         r.wait("/touch/device/t/state", lambda m: m.args == ["no permission"], timeout=5)
         reason = r.wait("/touch/device/t/reason", lambda m: m.args[0] != "").args[0]
         check("permission denied" in reason and "input group" in reason, "reason %r" % reason)
+
+
+_seq = [1000]
+
+
+def req(r, address, *args):
+    _seq[0] += 1
+    s = _seq[0]
+    m = r.mark()
+    r.send("/touch/request", s, address, *args)
+    return r.wait("/touch/reply", lambda x: x.args[0] == s, since=m).args[1:]
+
+
+@test()
+def rotation_setting_restarts_reading_and_is_saved():
+    with Ctx("setrot") as c:
+        p = test_product()
+        s = c.screen(p)
+        d = c.daemon([device(p)], name="setrot")
+        r = c.receiver()
+        connected(r)
+        s.touch(0, 1, 100, 100)
+        s.frame()
+        c1 = r.wait("/touch/t/down").args[0]
+        m = r.mark()
+        check(req(r, "/touch/device/t/rotation", 90) == ["ok", ""], "rotation refused")
+        cancel = r.wait("/touch/t/cancel", since=m)
+        check(cancel.args[:2] == [c1, "reconfigured"], "cancel %s" % cancel.args)
+        r.wait("/touch/device/t/state", lambda x: x.args == ["restarting"], since=m)
+        r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m, timeout=3)
+        ev = r.wait("/touch/event", lambda x: x.args[0] == "settings", since=m)
+        check(ev.args[1] == "t rotation 0 -> 90, from 127.0.0.1", "event %r" % ev.args[1])
+        r.wait("/touch/device/t/rotation", lambda x: x.args == [90], since=m)
+        r.wait("/touch/overrides", lambda x: x.args == ["device/t/rotation"], since=m)
+        r.wait("/touch/settings_file", lambda x: x.args == [d.settings], since=m)
+        m2 = r.mark()
+        s.touch(0, 1, 150, 150)
+        s.frame()
+        r.none("/touch/t/down", during=0.3, since=m2)
+        s.lift(0)
+        s.frame()
+        s.touch(0, 2, 0, 0)
+        s.frame()
+        down = r.wait("/touch/t/down", since=m2)
+        check(abs(down.args[1] - 1) < 1e-3 and abs(down.args[2]) < 1e-3, "rotated down at %s" % down.args)
+        with open(d.settings) as f:
+            text = f.read()
+        check("rotation = 90" in text, "settings file: %s" % text)
+        s.lift(0)
+        s.frame()
+        check(d.stop() == 0, "exit code")
+        c.daemons.remove(d)
+        d2 = c.daemon([device(p)], name="setrot", keep_settings=True)
+        m3 = r.mark()
+        r.wait("/touch/device/t/rotation", lambda x: x.args == [90], since=m3, timeout=5)
+        r.wait("/touch/overrides", lambda x: x.args == ["device/t/rotation"], since=m3)
+        check("saved settings from" in d2.log_text(), "the banner does not mention the saved settings")
+        m4 = r.mark()
+        check(req(r, "/touch/settings/forget", "device/t/rotation") == ["ok", ""], "forget")
+        r.wait("/touch/device/t/rotation", lambda x: x.args == [0], since=m4)
+        r.wait("/touch/overrides", lambda x: x.args == [], since=m4)
+        r.wait("/touch/settings_file", lambda x: x.args == [""], since=m4)
+        check(not os.path.exists(d.settings), "the settings file is still there")
+
+
+@test()
+def bad_settings_are_refused_in_the_configs_words():
+    with Ctx("setbad") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        cases = [
+            (("/touch/device/t/rotation", 45), "rotation must be 0, 90, 180 or 270"),
+            (("/touch/device/t/mirror", "z"), 'mirror must be "", "x", "y" or "xy"'),
+            (("/touch/device/t/silence_ms", 10), "silence_ms must be 0 (off) or between 50 and 10000"),
+            (("/touch/device/t/calibration", 1.0, 2.0, 3.0), "calibration must be six numbers (an affine map, each at most 100), or none"),
+            (("/touch/device/t/match_usb", "zz"), 'match_usb must be vendor:product in hex, like "0712:0009" (touch-to-osc --list shows it)'),
+            (("/touch/device/t/aspect", 50.0), "aspect must be 0 (taken from the device) or between 0.1 and 10"),
+            (("/touch/log_level", "loud"), "log_level must be crit, error, warning, notice, info or debug"),
+            (("/touch/device/t/connected", 1), "unknown address"),
+            (("/touch/allowed_ips/add", "nowhere"), "'nowhere' is not an IPv4 address"),
+            (("/touch/saved_destinations/add", "1.2.3.4"), 'the destination must be an IPv4 address and a port, like "192.168.1.27:9481"'),
+            (("/touch/settings/forget", "device/t/rotation"), "nothing is saved for device/t/rotation"),
+            (("/touch/device/t/match_usb", ""), "device t would match nothing: it needs a usb id or a port"),
+        ]
+        for address_args, why in cases:
+            got = req(r, *address_args)
+            check(got == ["refused", why], "%s -> %s" % (address_args, got))
+        r.none("/touch/event", lambda x: x.args[0] == "settings", during=0.2, since=0)
+        check(not os.path.exists(d.settings), "a refused change was saved")
+
+
+@test()
+def a_host_cannot_lock_itself_out():
+    with Ctx("lockout") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)], allowed=("127.0.0.1", "10.0.0.9"))
+        r = c.receiver()
+        connected(r)
+        got = req(r, "/touch/allowed_ips/remove", "127.0.0.1")
+        check(got == ["refused", "this would lock out 127.0.0.1, the host sending this command"], "own address: %s" % got)
+        m = r.mark()
+        check(req(r, "/touch/allowed_ips/add", "10.9.8.7") == ["ok", ""], "add")
+        r.wait("/touch/allowed_ips", lambda x: x.args == ["127.0.0.1", "10.0.0.9", "10.9.8.7"], since=m)
+        r.wait("/touch/overrides", lambda x: x.args == ["allowed_ips"], since=m)
+        check(req(r, "/touch/allowed_ips/add", "10.9.8.7") == ["refused", "10.9.8.7 is already allowed"], "twice")
+        m = r.mark()
+        check(req(r, "/touch/allowed_ips/remove", "10.9.8.7") == ["ok", ""], "remove")
+        r.wait("/touch/allowed_ips", lambda x: x.args == ["127.0.0.1", "10.0.0.9"], since=m)
+        r.wait("/touch/overrides", lambda x: x.args == [], since=m)
+        check(req(r, "/touch/allowed_ips/remove", "10.0.0.9") == ["ok", ""], "remove the other")
+        got = req(r, "/touch/allowed_ips/remove", "127.0.0.1")
+        check(got == ["refused", "this would lock out every host: at least one must stay allowed"], "last address: %s" % got)
+
+
+@test()
+def a_saved_destination_added_over_osc_gets_touches():
+    with Ctx("setdest") as c:
+        p = test_product()
+        s = c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        plain = c.receiver(subscribe=False)
+        m = r.mark()
+        check(req(r, "/touch/saved_destinations/add", "127.0.0.1:%d" % plain.port, 1, 0) == ["ok", ""], "add")
+        r.wait("/touch/saved_destinations", lambda x: x.args == ["127.0.0.1:%d touches" % plain.port], since=m)
+        plain.wait("/touch/alive", timeout=2.5)
+        s.touch(0, 1, 10, 10)
+        s.frame()
+        plain.wait("/touch/t/down")
+        check(not plain.all(0, "/touch/health"), "a touches-only destination got the status")
+        check(req(r, "/touch/saved_destinations/remove", "127.0.0.1:%d" % plain.port) == ["ok", ""], "remove")
+        m2 = plain.mark()
+        s.lift(0)
+        s.frame()
+        plain.none("/touch/t/up", during=0.3, since=m2)
+
+
+@test()
+def label_and_silence_apply_without_a_restart():
+    with Ctx("setlive") as c:
+        p = test_product()
+        s = c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        s.touch(0, 1, 10, 10)
+        s.frame()
+        c1 = r.wait("/touch/t/down").args[0]
+        m = r.mark()
+        check(req(r, "/touch/device/t/label", "front screen") == ["ok", ""], "label")
+        r.wait("/touch/device/t/label", lambda x: x.args == ["front screen"], since=m)
+        check(req(r, "/touch/device/t/silence_ms", 200) == ["ok", ""], "silence")
+        cancel = r.wait("/touch/t/cancel", since=m, timeout=2)
+        check(cancel.args[:2] == [c1, "device silent"], "the held contact ended %s" % cancel.args)
+        check(not r.all(m, "/touch/device/t/state", lambda x: x.args == ["restarting"]), "a live setting restarted the device")
+
+
+@test()
+def enabled_is_saved_and_forget_all_restores_the_config():
+    with Ctx("setenabled") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)], name="setenabled")
+        r = c.receiver()
+        connected(r)
+        check(req(r, "/touch/device/t/enabled", 0) == ["ok", ""], "off")
+        check(req(r, "/touch/log_level", "debug") == ["ok", ""], "log level")
+        check(d.stop() == 0, "exit code")
+        c.daemons.remove(d)
+        c.daemon([device(p)], name="setenabled", keep_settings=True)
+        m = r.mark()
+        r.wait("/touch/device/t/state", lambda x: x.args == ["disabled"], since=m, timeout=5)
+        r.wait("/touch/log_level", lambda x: x.args == ["debug"], since=m)
+        r.wait("/touch/overrides", lambda x: sorted(x.args) == ["device/t/enabled", "log_level"], since=m)
+        m = r.mark()
+        check(req(r, "/touch/settings/forget") == ["ok", ""], "forget all")
+        r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m)
+        r.wait("/touch/log_level", lambda x: x.args == ["info"], since=m)
+        r.wait("/touch/overrides", lambda x: x.args == [], since=m)
+
+
+@test()
+def match_port_moves_reading_to_another_screen():
+    with Ctx("setport") as c:
+        p = test_product()
+        a = c.screen(p, phys="tto-pa-%d" % os.getpid())
+        b = c.screen(p, phys="tto-pb-%d" % os.getpid())
+        c.daemon([device(p, port="tto-pa-%d" % os.getpid())])
+        r = c.receiver()
+        connected(r)
+        m = r.mark()
+        check(req(r, "/touch/device/t/match_port", "tto-pb-%d" % os.getpid()) == ["ok", ""], "port")
+        r.wait("/touch/device/t/state", lambda x: x.args == ["restarting"], since=m)
+        r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m, timeout=3)
+        m2 = r.mark()
+        a.touch(0, 1, 10, 10)
+        a.frame()
+        r.none("/touch/t/down", during=0.3, since=m2)
+        b.touch(0, 1, 10, 10)
+        b.frame()
+        r.wait("/touch/t/down", since=m2)
+
+
+@test()
+def grab_setting_lets_go_of_the_device():
+    with Ctx("setgrab") as c:
+        p = test_product()
+        s = c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        r.wait("/touch/device/t/grabbed", lambda x: x.args == [1])
+        m = r.mark()
+        check(req(r, "/touch/device/t/grab", 0) == ["ok", ""], "grab 0")
+        r.wait("/touch/device/t/grab", lambda x: x.args == [0], since=m)
+        r.wait("/touch/device/t/grabbed", lambda x: x.args == [0], since=m, timeout=3)
+        check(try_grab(s.node), "the device is still held")
+
+
+@test()
+def a_refused_settings_file_is_set_aside():
+    import subprocess
+    with Ctx("setrefused") as c:
+        p = test_product()
+        c.screen(p)
+        os.makedirs(RUN_DIR, exist_ok=True)
+        path = os.path.join(RUN_DIR, "setrefused-settings.toml")
+        for f in (path, path + ".refused"):
+            if os.path.exists(f):
+                os.remove(f)
+        with open(path, "w") as f:
+            f.write("[device.t]\nrotation = 45\n")
+        cfg = os.path.join(RUN_DIR, "setrefused-check.toml")
+        with open(cfg, "w") as f:
+            f.write('[osc]\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = "%s"\n[[device]]\nid = "t"\nusb = "%04x:%04x"\n' % (path, TEST_VENDOR, p))
+        chk = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--check-config=" + cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        check(chk.returncode == 2 and "device.t.rotation: must be 0, 90, 180 or 270" in chk.stdout, "--check-config said %d: %s" % (chk.returncode, chk.stdout))
+        c.daemon([device(p)], name="setrefused", keep_settings=True)
+        r = c.receiver()
+        connected(r)
+        r.wait("/touch/health", lambda x: x.args == ["warning"])
+        reasons = r.wait("/touch/reasons", lambda x: any("settings file was refused" in a for a in x.args)).args
+        check(any("device.t.rotation: must be 0, 90, 180 or 270" in a and ".refused" in a for a in reasons), "reasons %s" % reasons)
+        check(os.path.exists(path + ".refused") and not os.path.exists(path), "the file was not set aside")
+        r.wait("/touch/device/t/rotation", lambda x: x.args == [0])
 
 
 def replay(name, silence_ms=200, after=None):

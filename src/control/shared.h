@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <netinet/in.h>
 
 namespace tto {
@@ -21,11 +22,12 @@ struct DestSet {
     sockaddr_in addr[kMaxSendTargets] = {};
 };
 
-enum class DevState : uint8_t { starting, ok, not_connected, disabled, no_permission, grab_refused, read_error, not_touchscreen };
+enum class DevState : uint8_t { starting, ok, not_connected, disabled, no_permission, grab_refused, read_error, not_touchscreen, restarting };
 
 inline const char* state_name(DevState s) {
     switch (s) {
     case DevState::starting: return "starting";
+    case DevState::restarting: return "restarting";
     case DevState::ok: return "ok";
     case DevState::not_connected: return "not connected";
     case DevState::disabled: return "disabled";
@@ -38,6 +40,7 @@ inline const char* state_name(DevState s) {
 }
 
 struct DevInfo {
+    uint32_t cfg_gen = 0;
     DevState state = DevState::starting;
     bool connected = false;
     bool grabbed = false;
@@ -86,7 +89,11 @@ struct DeviceShared {
     SpscRing<ReaderEvent, 64> events;
     SpscRing<uint32_t, 2048> latency_us;
     std::atomic<bool> want_enabled{true};
+    std::atomic<int32_t> silence_ms{0};
     std::atomic<bool> stop{false};
+    std::mutex cfg_mutex;
+    DeviceConfig next_cfg;
+    std::atomic<uint32_t> cfg_gen{0};
     std::atomic<int32_t> contacts{0};
     std::atomic<int64_t> oldest_down_ns{0};
     std::atomic<int64_t> last_frame_ns{0};

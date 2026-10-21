@@ -138,12 +138,18 @@ def device_block(d):
 
 
 class Daemon:
-    def __init__(self, name, devices, extra="", destinations=()):
+    def __init__(self, name, devices, extra="", destinations=(), keep_settings=False, allowed=("127.0.0.1",)):
         os.makedirs(RUN_DIR, exist_ok=True)
         self.name = name
         self.config = os.path.join(RUN_DIR, name + ".toml")
         self.log_path = os.path.join(RUN_DIR, name + ".log")
-        text = '[osc]\nlisten = "127.0.0.1:%d"\nallowed_ips = ["127.0.0.1"]\n%s\n' % (DAEMON_PORT, extra)
+        self.settings = os.path.join(RUN_DIR, name + "-settings.toml")
+        if not keep_settings:
+            for f in (self.settings, self.settings + ".refused"):
+                if os.path.exists(f):
+                    os.remove(f)
+        text = '[osc]\nlisten = "127.0.0.1:%d"\nallowed_ips = [%s]\n%s\n[paths]\nsettings = "%s"\n' % (
+            DAEMON_PORT, ", ".join('"%s"' % a for a in allowed), extra, self.settings)
         for dest in destinations:
             text += '[[destination]]\naddress = "%s"\n' % dest
         text += "\n".join(device_block(d) for d in devices) + "\n"

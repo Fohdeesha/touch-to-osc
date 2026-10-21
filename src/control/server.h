@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config/config.h"
+#include "config/settings.h"
 #include "control/requests.h"
 #include "control/shared.h"
 #include "core/fd.h"
@@ -16,11 +17,11 @@
 
 namespace tto {
 
-constexpr int32_t kOscApi = 1;
+constexpr int32_t kOscApi = 2;
 
 class Server {
 public:
-    Server(Config cfg, std::string config_path, SysPaths paths = SysPaths());
+    Server(Config base, SettingsLoad settings, std::string config_path, SysPaths paths = SysPaths());
     ~Server();
     int run();
 
@@ -70,6 +71,11 @@ private:
     Status apply(const osc::Message& m, const Peer& peer);
     Status subscribe(const osc::Message& m, const Peer& peer);
     Status unsubscribe(const osc::Message& m, const Peer& peer);
+    Status set_device(size_t index, const std::string& key, const std::vector<osc::Arg>& args, const Peer& peer);
+    Status set_global(const std::vector<std::string>& parts, const std::vector<osc::Arg>& args, const Peer& peer);
+    Status commit(Overrides next, const Peer& peer, const std::string& what);
+    void apply_effects(const Config& old);
+    void save_settings();
     void refuse(const Peer& peer, const std::string& address, const std::string& why, bool limited);
 
     std::vector<Target> targets() const;
@@ -88,15 +94,23 @@ private:
     Health health(Nanos now);
     std::string addr(const std::string& rest) const { return prefix_ + "/" + rest; }
 
+    Config base_;
+    Overrides over_;
     Config cfg_;
+    std::vector<std::string> settings_notes_;
+    std::string settings_problem_;
+    std::string settings_file_;
     std::string config_path_;
     SysPaths paths_;
     std::string prefix_;
+    std::string host_;
     int32_t run_ = 0;
+    Nanos started_ = 0;
     NodeClaims claims_;
     std::vector<std::unique_ptr<DeviceShared>> shared_;
     std::vector<std::unique_ptr<DeviceReader>> readers_;
     std::vector<DevStats> stats_;
+    std::vector<uint32_t> cfg_gen_;
     UniqueFd osc_fd_;
     UniqueFd send_fd_;
     UniqueFd notify_fd_;

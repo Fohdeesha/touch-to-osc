@@ -1,4 +1,5 @@
 #include "config/config.h"
+#include "config/settings.h"
 #include "control/server.h"
 #include "core/log.h"
 #include "tools/tools.h"
@@ -80,6 +81,21 @@ int run_main(int argc, char** argv) {
         }
         std::printf("%s is good: %zu device%s, %zu saved destination%s, OSC on %s:%d\n", path.c_str(), cfg->devices.size(), cfg->devices.size() == 1 ? "" : "s",
                     cfg->destinations.size(), cfg->destinations.size() == 1 ? "" : "s", cfg->osc.listen.host.c_str(), cfg->osc.listen.port);
+        auto settings = tto::load_settings(*cfg, false);
+        for (const auto& n : settings.notes) std::printf("%s\n", n.c_str());
+        if (!settings.problem.empty()) {
+            std::fprintf(stderr, "%s\n", settings.problem.c_str());
+            return 2;
+        }
+        if (cfg->paths.settings.empty()) {
+            std::printf("settings changed over OSC are kept until a restart (paths.settings is empty)\n");
+        } else if (settings.overrides.empty()) {
+            std::printf("no saved settings in %s\n", cfg->paths.settings.c_str());
+        } else {
+            std::string names;
+            for (const auto& n : tto::override_names(settings.overrides)) names += (names.empty() ? "" : ", ") + n;
+            std::printf("%s is good and wins over the config for: %s\n", cfg->paths.settings.c_str(), names.c_str());
+        }
         return 0;
     }
     if (opts.count("list")) {
@@ -90,17 +106,19 @@ int run_main(int argc, char** argv) {
             std::fprintf(stderr, "(config not used: %s)\n", cfg.error().c_str());
             return tto::list_devices(nullptr, tto::SysPaths());
         }
-        return tto::list_devices(&*cfg, tto::SysPaths());
+        tto::Config effective = tto::apply_overrides(*cfg, tto::load_settings(*cfg, false).overrides);
+        return tto::list_devices(&effective, tto::SysPaths());
     }
     auto cfg = tto::load_config(path);
     if (!cfg) {
         TTO_CRIT("config refused: %s", cfg.error().c_str());
         return 2;
     }
-    if (opts.count("dump")) return tto::dump_device(*cfg, opts["dump"], tto::SysPaths());
-    tto::log::Level level = tto::log::Level::info;
-    tto::log::parse_level(cfg->log.level.c_str(), level);
-    tto::log::set_min_level(level);
-    tto::Server server(std::move(*cfg), path);
+    if (opts.count("dump")) {
+        tto::Config effective = tto::apply_overrides(*cfg, tto::load_settings(*cfg, false).overrides);
+        return tto::dump_device(effective, opts["dump"], tto::SysPaths());
+    }
+    auto settings = tto::load_settings(*cfg, true);
+    tto::Server server(std::move(*cfg), std::move(settings), path);
     return server.run();
 }

@@ -19,6 +19,13 @@ open_to_any = false
 # crit, error, warning, notice, info or debug. Nothing is logged per touch below debug.
 level = "info"
 
+[paths]
+# Settings changed over OSC (for example from Bridge Studio) are saved here, and win over
+# this file at every start. This file is never written. "" keeps such changes only until
+# a restart. The status lists which settings come from there (/touch/overrides), and
+# <prefix>/settings/forget puts them back to what this file says.
+settings = "/var/lib/touch-to-osc/settings.toml"
+
 # Receivers that always get touches and status, without subscribing. None by default:
 # a receiver normally subscribes (see the README). Copy this block for each one.
 #
