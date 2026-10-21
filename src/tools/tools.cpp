@@ -149,7 +149,7 @@ int dump_device(const Config& cfg, const std::string& id, const SysPaths& paths)
     Mapping map(*d, axis(o.dev, mt ? ABS_MT_POSITION_X : ABS_X), axis(o.dev, mt ? ABS_MT_POSITION_Y : ABS_Y));
     std::printf("dumping %s (%s) on %s as device %s: rotation %d, mirror \"%s\"%s. Ctrl+C stops.\n", n->node.c_str(), printable(n->name).c_str(),
                 n->usb_port.c_str(), d->id.c_str(), d->rotation, d->mirror_text().c_str(), d->calibration.empty() ? "" : ", calibrated");
-    std::printf("each line: kernel time, frame, then per contact: id phase raw x,y -> picture x,y (0..1 from the top left)\n");
+    std::printf("each line: kernel time, frame, then per contact: id phase raw x,y -> display x,y (0..1 from the top left)\n");
     std::fflush(stdout);
     ContactTracker tracker(slots);
     int32_t seq = 0;

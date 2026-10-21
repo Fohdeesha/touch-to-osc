@@ -48,18 +48,19 @@ port = ""
 # Hold the device exclusively, so nothing else on the machine (the console) acts on
 # the touches.
 grab = true
-# Turns touch positions clockwise by 0, 90, 180 or 270 degrees to match the picture:
-# with 90, a touch at the panel's top left lands at the picture's top right. Then
+# Turns touch positions clockwise by 0, 90, 180 or 270 degrees to match the display:
+# with 90, a touch at the panel's top left lands at the display's top right. Then
 # mirror flips the result: "x" left-right, "y" top-bottom, "xy" both. Check with a
 # finger on each corner: touch-to-osc --dump
 rotation = 0
 mirror = ""
-# Width / height of the picture on the screen, sent in the status so receivers can keep
+# Width / height of the screen's display area, sent in the status so receivers can keep
 # circles round. 0 takes it from the device's size (and rotation).
 aspect = 0
 # An optional fine correction applied after rotation and mirror, as six numbers
 # [a, b, c, d, e, f]: x' = a*x + b*y + c, y' = d*x + e*y + f, on 0..1 positions.
-# [] for none.
+# It lines the touch panel up with the display; never use it for a picture scaled or
+# letterboxed on the display (the receiver works that out). [] for none.
 calibration = []
 # Cancel the contacts that are down when the device sends nothing for this long, in
 # milliseconds. Screens like this one report every 16-24 ms while a finger is down,

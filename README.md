@@ -5,7 +5,8 @@ every touch as OSC over UDP. It reports its own health over OSC as well: a heart
 status that receivers subscribe to, and an answer to every command.
 
 It does not know what the touches are for. Positions go out as 0..1 fractions of the
-picture on the screen; the receiver decides what a touch at that place means.
+screen's display area; the receiver decides what a touch at that place means, including
+where a picture shown on the screen sits.
 
 ## What it guarantees
 
@@ -64,8 +65,8 @@ and reports its version, run and settings in the journal when it starts:
 - `[[destination]]` (optional, none by default): receivers that get everything without
   subscribing.
 - `[[device]]`, one per screen: an `id` that becomes part of the addresses, which device
-  it is (`usb` vendor:product, `serial`, `port`), and how its touches map onto the
-  picture (`rotation`, `mirror`, `calibration`, `aspect`). `silence_ms` cancels held
+  it is (`usb` vendor:product, `serial`, `port`), how its touch panel lines up with the
+  screen's display (`rotation`, `mirror`, `calibration`), and the display's `aspect`. `silence_ms` cancels held
   contacts when the screen stops reporting; see the example config before changing it.
 
 Unknown keys, wrong types and out-of-range values are refused with a message that names
@@ -88,7 +89,7 @@ serial and port, whether it is a touchscreen (contacts, axis ranges, size), and 
 `[[device]]` would read it.
 
 `--dump` prints each frame with the kernel time, every contact's raw position and where it
-lands in the picture. Touch the four corners to check `rotation` and `mirror`. The service
+lands on the display. Touch the four corners to check `rotation` and `mirror`. The service
 holds the screen exclusively, so stop it first (`systemctl stop touch-to-osc`); `--dump`
 says so if it finds the screen held.
 
@@ -117,9 +118,11 @@ holds one message per contact that changed:
 
 - `contact`: the daemon's own id, counting up from 1 within a run and never reused, so a
   quick second tap is always a new contact.
-- `x`, `y`: 0..1 in the picture as shown on that screen: origin top left, x to the right,
+- `x`, `y`: 0..1 of the screen's display area: origin at its top left, x to the right,
   y down, after rotation, mirror and calibration, clamped to 0..1. `up` carries where the
-  finger lifted.
+  finger lifted. Where a picture sits inside that area (a scaled or letterboxed video
+  feed, say) is the receiver's to work out: calibration lines the touch panel up with the
+  display, never with a picture on it.
 - `frame`: the number of this bundle on this device, counting from 1 within a run. Every
   message in one bundle has the same number, and the next bundle has the next number, so
   a gap means a bundle was lost. Screen frames in which nothing changed send nothing and
@@ -186,7 +189,7 @@ out within 0.1 s:
     /touch/device/face/size_mm      f w  f h  0 0 when the device does not say
     /touch/device/face/rotation     i 0|90|180|270
     /touch/device/face/mirror       s ""|x|y|xy
-    /touch/device/face/aspect       f        width / height of the picture on it
+    /touch/device/face/aspect       f        width / height of its display area
     /touch/device/face/silence_ms   i        0 when off
     /touch/device/face/grabbed      i 0|1    held exclusively by the daemon
 

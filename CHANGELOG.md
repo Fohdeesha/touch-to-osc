@@ -6,7 +6,7 @@ First version.
 
 - Reads multitouch (and single-touch) USB touchscreens through libevdev and sends each
   changed frame as one OSC bundle of `down`, `move`, `up` and `cancel` messages with
-  positions in the picture (0..1), the daemon's own contact ids, a frame number and the
+  positions on the screen's display area (0..1), the daemon's own contact ids, a frame number and the
   screen's time stamp.
 - Every announced contact ends with exactly one `up` or `cancel`: on unplug, on a read
   error, when the kernel releases the device, when the screen goes silent with fingers
