@@ -1,0 +1,72 @@
+# touch-to-osc configuration
+#
+# Every key below shows its default unless it says otherwise. Unknown keys, wrong types
+# and out-of-range values are refused at start with a message that names the key.
+# Check a file without starting anything: touch-to-osc --check-config=FILE
+
+[osc]
+# Commands and subscriptions arrive here (UDP). Touches and status go out from other ports.
+listen = "0.0.0.0:9480"
+# Every address the daemon sends or answers starts with this.
+prefix = "/touch"
+# Hosts that may subscribe and send commands. Anything else gets an error that says so.
+# An empty list is refused unless open_to_any is set. Add the machine that runs the
+# receiver, for example Bridge Studio's engine.
+allowed_ips = ["127.0.0.1"]
+open_to_any = false
+
+[log]
+# crit, error, warning, notice, info or debug. Nothing is logged per touch below debug.
+level = "info"
+
+# Receivers that always get touches and status, without subscribing. None by default:
+# a receiver normally subscribes (see the README). Copy this block for each one.
+#
+# [[destination]]
+# address = "192.168.1.27:9481"
+# # Each touch as it happens. The alive and the list of active contacts go to every
+# # destination either way, because a receiver needs them to end touches it missed.
+# touches = true
+# # The status, the events and the counters.
+# status = true
+
+# One block per touchscreen. touch-to-osc --list shows every input device with its usb
+# id, serial and port, and which block here would read it.
+[[device]]
+# A short name: a-z, 0-9, _ and -. Touches arrive as <prefix>/<id>/down and so on.
+# Required.
+id = "face"
+# What people call it, used in health messages. Defaults to the id.
+label = "face screen"
+# Which device: usb vendor:product in hex, a serial (as --list prints it), a USB port
+# path such as "3-3" (the kernel's name for the socket it is plugged into), or several
+# of them; every one given must match. Set at least usb or port. With two identical
+# screens, set port (or serial, if theirs differ) for each.
+usb = "0712:0009"
+serial = ""
+port = ""
+# Hold the device exclusively, so nothing else on the machine (the console) acts on
+# the touches.
+grab = true
+# Turns touch positions clockwise by 0, 90, 180 or 270 degrees to match the picture:
+# with 90, a touch at the panel's top left lands at the picture's top right. Then
+# mirror flips the result: "x" left-right, "y" top-bottom, "xy" both. Check with a
+# finger on each corner: touch-to-osc --dump
+rotation = 0
+mirror = ""
+# Width / height of the picture on the screen, sent in the status so receivers can keep
+# circles round. 0 takes it from the device's size (and rotation).
+aspect = 0
+# An optional fine correction applied after rotation and mirror, as six numbers
+# [a, b, c, d, e, f]: x' = a*x + b*y + c, y' = d*x + e*y + f, on 0..1 positions.
+# [] for none.
+calibration = []
+# Cancel the contacts that are down when the device sends nothing for this long, in
+# milliseconds. Screens like this one report every 16-24 ms while a finger is down,
+# even a still one, so silence means the screen or its cable has failed; without this,
+# a held contact would stay down until the kernel notices (3.7 s when a USB extender
+# was pulled). 0 turns it off: needed for a screen that only reports changes, or still
+# fingers are cancelled after this long. Otherwise 50-10000.
+silence_ms = 200
+# false starts with the device turned off (a command can turn it on).
+enabled = true

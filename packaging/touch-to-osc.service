@@ -1,0 +1,32 @@
+[Unit]
+Description=touch-to-osc: touchscreen touches as OSC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/touch-to-osc --config=/etc/touch-to-osc/touch-to-osc.toml
+Restart=always
+RestartSec=1
+RestartPreventExitStatus=2
+WatchdogSec=10
+TimeoutStopSec=5
+DynamicUser=yes
+SupplementaryGroups=input
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
