@@ -40,17 +40,40 @@ also need `python3`.
 
 ## Build and install
 
-    cmake -S . -B build -G Ninja
-    ninja -C build
-    build/tto_tests
+The usual way is the Debian package. Every version is released on GitHub
+(`Fohdeesha/touch-to-osc`, Releases) with its package attached,
+`touch-to-osc_<version>-1_amd64.deb`, built on Debian 11 so that the one file installs on
+Debian 11 to 13 and Ubuntu 22.04 and 24.04. Download it (for example
+`gh release download -R Fohdeesha/touch-to-osc -p '*.deb'` for the newest) and install it
+on each machine:
+
+    sudo apt install ./touch-to-osc_*_amd64.deb
+
+To build the package yourself, do it on the oldest system it is meant for:
+
+    scripts/build-deb.sh
+    sudo apt install ./build-deb/touch-to-osc_*_amd64.deb
+
+`build-deb.sh` builds with warnings as errors, runs the unit tests and writes the package
+to `build-deb/`. The package installs `/usr/bin/touch-to-osc` and its systemd unit, writes
+`/etc/touch-to-osc/touch-to-osc.toml` from the example in `/usr/share/touch-to-osc` if
+there is none yet, checks it, and enables and starts the service. Installing a newer
+package restarts the service if it is running and keeps the config and the saved
+settings. `sudo apt remove touch-to-osc` stops and removes the program and keeps them;
+`sudo apt purge touch-to-osc` removes them too. A copy installed before with
+`scripts/install.sh` is replaced: the package removes that program and its unit.
+
+Without the package, on any Linux with systemd, from the source tree:
+
     sudo scripts/install.sh
     sudo systemctl enable --now touch-to-osc
 
-`install.sh` installs `/usr/local/bin/touch-to-osc`, writes
-`/etc/touch-to-osc/touch-to-osc.toml` from `config.example.toml` if there is none yet,
-checks it, and installs the systemd unit. Settings changed over OSC are saved in
-`/var/lib/touch-to-osc/settings.toml`. `scripts/uninstall.sh` removes the program and the
-unit again (`--purge` also removes the config and the saved settings).
+`install.sh` builds, runs the unit tests and installs under `/usr/local` (the unit in
+`/usr/local/lib/systemd/system`), with the same config handling. `scripts/uninstall.sh`
+removes it again (`--purge` also removes the config and the saved settings). Both refuse
+while the package is installed.
+
+Either way, settings changed over OSC are saved in `/var/lib/touch-to-osc/settings.toml`.
 
 The service runs as root, which it needs to reset a USB bus (see USB recovery below), but
 systemd takes every capability away from it, lets it reach no devices but the input and
@@ -386,7 +409,8 @@ restarted or stopped:
 
     python3 tools/watch.py --target 192.168.1.246:9480 --no-alive
 
-The machine running it must be in `osc.allowed_ips`.
+Where the package is installed it is `/usr/share/touch-to-osc/watch.py`. The machine
+running it must be in `osc.allowed_ips`.
 
 ## Tests
 

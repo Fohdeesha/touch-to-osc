@@ -730,7 +730,7 @@ def status_describes_the_device():
         r.send("/touch/status/send")
         r.wait("/touch/run", since=m)
         log = c.daemons[0].log_text()
-        check("touch-to-osc 0.5.0 (osc_api 5)" in log, "banner")
+        check("touch-to-osc 0.5.1 (osc_api 5)" in log, "banner")
 
 
 @test()

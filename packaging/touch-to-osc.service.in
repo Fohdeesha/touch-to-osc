@@ -7,7 +7,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=/usr/local/bin/touch-to-osc --config=/etc/touch-to-osc/touch-to-osc.toml
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/touch-to-osc --config=/etc/touch-to-osc/touch-to-osc.toml
 Restart=always
 RestartSec=1
 RestartPreventExitStatus=2

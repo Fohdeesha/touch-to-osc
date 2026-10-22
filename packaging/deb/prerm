@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = remove ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl stop touch-to-osc.service || true
+    fi
+    systemctl disable touch-to-osc.service > /dev/null 2>&1 || true
+fi
+
+exit 0

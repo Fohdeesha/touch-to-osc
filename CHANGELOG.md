@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.1 - 2026-10-22
+
+- A Debian package, attached to each version's GitHub release from now on:
+  `scripts/build-deb.sh` builds `touch-to-osc_<version>-1_amd64.deb` (built on Debian 11,
+  it installs on Debian 11 to 13 and Ubuntu 22.04 and 24.04). It
+  installs the program in `/usr/bin` and the systemd unit, writes the config from the
+  example if there is none, and enables and starts the service; a newer package restarts
+  it if it is running; `apt purge` also removes the config and the saved settings. It
+  replaces a copy installed with `scripts/install.sh`.
+- `scripts/install.sh` installs everything under `/usr/local`, the unit in
+  `/usr/local/lib/systemd/system` instead of a copy in `/etc/systemd/system`, and with
+  `scripts/uninstall.sh` refuses while the package is installed.
+- The scripts are executable in a fresh clone.
+
 ## 0.5.0 - 2026-10-22
 
 OSC interface version 5: screens dropping out are easier to monitor.
