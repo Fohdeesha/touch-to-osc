@@ -181,7 +181,8 @@ def main():
             back = connected(1, since=m, timeout=10)
             r.wait("/touch/event", lambda x: x.args[0] == "usb" and "is back after 1 USB reset" in x.args[1], since=m, timeout=3)
             r.wait(base + "usb_port_state", lambda x: x.args == [""], since=m, timeout=3)
-            r.wait("/touch/health", lambda x: x.args == ["ok"], since=m, timeout=3)
+            r.wait("/touch/health", lambda x: x.args == ["warning"] and x.at >= back.at, since=m, timeout=3)
+            r.wait("/touch/reasons", lambda x: any(" was unplugged or dropped off USB " in a for a in x.args), since=m, timeout=3)
             MEASURED.append("dropped screen: lost after %.2f s, reset at %.1f s, back at %.1f s" % (lost.at - t0, reset.at - t0, back.at - t0))
             check(9 <= reset.at - t0 <= 13, "the reset came %.1f s after the drop, not after about 10 s" % (reset.at - t0))
 

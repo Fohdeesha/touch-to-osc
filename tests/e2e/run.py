@@ -9,6 +9,7 @@ more than 10 s. TTO_BUILD picks the build directory.
 """
 
 import os
+import shutil
 import signal
 import sys
 import time
@@ -688,7 +689,7 @@ def status_describes_the_device():
         r = c.receiver()
         connected(r)
         want = {
-            "/touch/osc_api": [4],
+            "/touch/osc_api": [5],
             "/touch/device/t/usb_recovery": [1],
             "/touch/device/t/usb_watched_port": [""],
             "/touch/device/t/usb_port_state": [""],
@@ -729,7 +730,7 @@ def status_describes_the_device():
         r.send("/touch/status/send")
         r.wait("/touch/run", since=m)
         log = c.daemons[0].log_text()
-        check("touch-to-osc 0.4.0 (osc_api 4)" in log, "banner")
+        check("touch-to-osc 0.5.0 (osc_api 5)" in log, "banner")
 
 
 @test()
@@ -1236,7 +1237,7 @@ def restart_starts_again_with_a_new_run():
         s.touch(0, 2, 20, 20)
         s.frame()
         r.wait("/touch/t/down", since=m2)
-        check(d.log_text().count("(osc_api 4), run") == 2, "expected two start banners in the log")
+        check(d.log_text().count("(osc_api 5), run") == 2, "expected two start banners in the log")
 
 
 @test()
@@ -1274,6 +1275,102 @@ def usb_reset_needs_a_screen_on_usb_and_recovery_is_a_saved_setting():
         r.wait("/touch/overrides", lambda x: x.args == ["device/t/usb_recovery"], since=m)
         check(req(r, "/touch/device/t/usb_recovery", 2) == ["refused", "usb_recovery needs 0 or 1"], "bad value")
         r.none("/touch/event", lambda x: x.args[0] == "usb", during=1.5, since=0)
+
+
+@test()
+def a_screen_that_drops_out_is_counted_and_warned_about_for_a_minute():
+    with Ctx("losses") as c:
+        p = test_product()
+        s = c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        counts = r.wait("/touch/device/t/counts", timeout=2.5).args
+        check(len(counts) == 6 and counts[5] == 0, "counts %s" % counts)
+        m = r.mark()
+        s.destroy()
+        lost = r.wait("/touch/event", lambda x: x.args[0] == "device" and " lost: " in x.args[1], since=m)
+        check(lost.args[2:] == ["warning"], "the lost event %s" % lost.args)
+        c.screen(p)
+        back = r.wait("/touch/event", lambda x: x.args[0] == "device" and " connected: " in x.args[1], since=m, timeout=4)
+        check(back.args[2:] == ["notice"], "the connected event %s" % back.args)
+        r.wait("/touch/health", lambda x: x.args == ["warning"], since=m, timeout=3)
+        r.wait("/touch/reasons", lambda x: "t was unplugged or dropped off USB 1 time(s) in the last minute: check its USB cable and its joints" in x.args,
+               since=m, timeout=3)
+        r.wait("/touch/device/t/counts", lambda x: x.args[5] == 1, since=m, timeout=2.5)
+
+
+def fake_usb_tree(name):
+    """A /sys and /dev for TTO_USB_ROOT with port 3-3 on bus 3, whose busnum is a FIFO: a port check reading it waits until
+    the test writes to it, the way a check waits for the hub's lock while the kernel retries a device."""
+    root = os.path.join(RUN_DIR, name)
+    shutil.rmtree(root, ignore_errors=True)
+    devices = os.path.join(root, "sys", "bus", "usb", "devices")
+    hub = os.path.join(root, "sys", "bus", "usb", "drivers", "hub")
+    os.makedirs(os.path.join(devices, "usb3"))
+    os.makedirs(os.path.join(devices, "3-0:1.0", "driver"))
+    os.makedirs(hub)
+    os.makedirs(os.path.join(root, "dev", "bus", "usb", "003"))
+    for f in ("bind", "unbind"):
+        open(os.path.join(hub, f), "w").close()
+    with open(os.path.join(devices, "usb3", "devnum"), "w") as f:
+        f.write("1\n")
+    os.mkfifo(os.path.join(devices, "usb3", "busnum"))
+    return root
+
+
+@test(slow=True)
+def a_port_check_waiting_on_the_kernel_never_holds_up_the_heartbeat():
+    root = fake_usb_tree("usb-root")
+    busnum = os.path.join(root, "sys", "bus", "usb", "devices", "usb3", "busnum")
+    driver = os.path.join(root, "sys", "bus", "usb", "devices", "3-0:1.0", "driver")
+    hub = os.path.join(root, "sys", "bus", "usb", "drivers", "hub")
+
+    def let_one_check_through():
+        with open(busnum, "w") as f:
+            f.write("3\n")
+
+    with Ctx("usbwait") as c:
+        d = c.daemon([device(test_product(), port="3-3")], env={"TTO_USB_ROOT": root})
+        r = c.receiver()
+        r.wait("/touch/device/t/usb_watched_port", lambda x: x.args == ["3-3"])
+        r.wait("/touch/device/t/usb_port_state", lambda x: x.args == ["being set up"], timeout=4)
+        check("TTO_USB_ROOT is set" in d.log_text(), "no warning about TTO_USB_ROOT in the log")
+        m = r.mark()
+        time.sleep(4)
+        alive = r.all(m, "/touch/alive")
+        gaps = [b.at - a.at for a, b in zip(alive, alive[1:])]
+        check(len(alive) >= 3 and max(gaps) < 1.5, "%d alives while a port check waits, gaps %s" % (len(alive), gaps))
+        check(req(r, "/touch/device/t/usb_reset") == ["ok", ""], "usb_reset while a check waits")
+        check(req(r, "/touch/device/t/usb_reset") == ["refused", "a USB reset is already running; try again in a moment"], "a second usb_reset")
+        r.none("/touch/event", lambda x: x.args[0] == "usb" and "resetting" in x.args[1], during=1.0, since=m)
+        m = r.mark()
+        let_one_check_through()
+        unknown = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "cannot tell whether anything is plugged into USB port 3-3" in x.args[1], since=m, timeout=3)
+        check("003/001" in unknown.args[1] and unknown.args[2:] == ["warning"], "event %s" % unknown.args)
+        started = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "t: resetting USB bus 3 as asked by 127.0.0.1" in x.args[1], since=m, timeout=3)
+        check(started.args[2:] == ["warning"], "event %s" % started.args)
+        done = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "t: USB bus 3 reset in " in x.args[1], since=m, timeout=3)
+        check(done.args[2:] == ["notice"], "event %s" % done.args)
+        for f in ("unbind", "bind"):
+            with open(os.path.join(hub, f)) as fh:
+                check(fh.read().startswith("3-0:1.0"), "%s was not written" % f)
+        os.rmdir(driver)
+        r.wait("/touch/device/t/usb_port_state", lambda x: x.args == ["being set up"], since=m, timeout=4)
+        m = r.mark()
+        check(req(r, "/touch/device/t/usb_reset") == ["ok", ""], "usb_reset with a hub that does not bind")
+        let_one_check_through()
+        failed = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "could not be bound again (the kernel did not take it)" in x.args[1], since=m, timeout=4)
+        check(failed.args[2:] == ["error"], "event %s" % failed.args)
+        r.wait("/touch/reasons", lambda x: any("could not be bound again" in a for a in x.args), since=m, timeout=3)
+        r.wait("/touch/device/t/usb_port_state", lambda x: x.args == ["being set up"] and x.at > failed.at, since=m, timeout=4)
+        m = r.mark()
+        t0 = time.time()
+        rc = d.stop()
+        took = time.time() - t0
+        check(rc == 0 and took < 5, "with a port check waiting, the daemon stopped in %.1f s with exit %s" % (took, rc))
+        r.wait("/touch/bye", since=m, timeout=1)
+        check("a USB port check is still waiting in the kernel; stopping without waiting for it" in d.log_text(), "no note about the waiting check")
 
 
 def replay(name, silence_ms=200, after=None):

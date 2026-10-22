@@ -105,6 +105,7 @@ struct DeviceShared {
     std::atomic<uint64_t> send_drops{0};
     std::atomic<uint64_t> cancels{0};
     std::atomic<uint64_t> silences{0};
+    std::atomic<uint64_t> losses{0};
     std::atomic<uint64_t> lost_events{0};
     std::atomic<uint64_t> touched_frames{0};
     std::atomic<int64_t> touched_ns{0};

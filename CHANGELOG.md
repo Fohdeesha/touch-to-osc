@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0 - 2026-10-22
+
+OSC interface version 5: screens dropping out are easier to monitor.
+
+- `/touch/event` carries a third string, its level: `notice`, `warning` or `error`.
+- `/touch/device/<id>/counts` carries a sixth number, `losses`: how many times the screen
+  was unplugged, dropped off USB or could not be read since the start.
+- For a minute after a screen was unplugged or dropped off USB, the health is `warning`
+  with "<label> was unplugged or dropped off USB N time(s) in the last minute", so even a
+  drop of half a second is seen.
+- The USB port check no longer runs on the thread that sends the heartbeat. While the
+  kernel retried a screen it holds the hub, each check waited for it, and the heartbeat,
+  status and commands stopped for 2-3 s at a time (seen on the testing box with a USB
+  extender's joint pulled). A check that has to wait for the kernel now counts as the
+  kernel still trying, so that port reads `being set up` and is not reset; a reset asked
+  for meanwhile runs as soon as the check is done.
+- A USB hub the kernel does not bind again is reported as "the kernel did not take it"
+  instead of an empty pair of brackets.
+
 ## 0.4.0 - 2026-10-22
 
 OSC interface version 4: USB recovery.

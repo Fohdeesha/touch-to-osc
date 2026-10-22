@@ -153,8 +153,8 @@ Status rebind_hub(const std::string& hub_interface, const UsbPaths& paths) {
         if (exists(bound)) return {};
         usleep(100000);
     }
-    return err("the USB hub " + hub_interface + " could not be bound again (" + st.error() + "): every device on it stays off until it is: echo " + hub_interface + " > " +
-               paths.hub_driver + "/bind, or reboot");
+    return err("the USB hub " + hub_interface + " could not be bound again (" + (st ? std::string("the kernel did not take it") : st.error()) +
+               "): every device on it stays off until it is: echo " + hub_interface + " > " + paths.hub_driver + "/bind, or reboot");
 }
 
 Nanos UsbRecovery::wait_for(int attempts) {
@@ -196,39 +196,72 @@ void UsbRecovery::connected() {
     attempts_ = 0;
 }
 
-UsbResetter::~UsbResetter() {
+UsbPaths usb_paths_under(const std::string& root) {
+    UsbPaths p;
+    p.devices = root + "/sys/bus/usb/devices";
+    p.hub_driver = root + "/sys/bus/usb/drivers/hub";
+    p.dev = root + "/dev/bus/usb";
+    return p;
+}
+
+UsbWorker::UsbWorker(UsbPaths paths, PortReader reader) : paths_(std::move(paths)), reader_(std::move(reader)) {}
+
+UsbWorker::~UsbWorker() {
     if (!thread_.joinable()) return;
     if (running()) thread_.detach();
     else thread_.join();
 }
 
-void UsbResetter::begin(std::string hub_interface, UsbPaths paths) {
-    if (thread_.joinable()) thread_.join();
-    auto job = std::make_shared<Job>();
-    job_ = job;
-    thread_ = std::thread([job, hub_interface, paths] {
-        set_thread_name("usb-reset");
-        Nanos t0 = monotonic_ns();
-        try {
-            job->result = rebind_hub(hub_interface, paths);
-        } catch (const std::exception& e) {
-            job->result = err(std::string("internal error: ") + e.what());
+void UsbWorker::check(std::vector<std::pair<size_t, UsbPortRef>> ports, Nanos now) {
+    launch(false, now, [ports = std::move(ports), paths = paths_, reader = reader_](Done& out) {
+        for (const auto& [device, ref] : ports) {
+            UsbReading r;
+            r.device = device;
+            r.port = ref.path;
+            Nanos t0 = monotonic_ns();
+            r.state = reader ? reader(ref, &r.why) : read_port_state(ref, paths, &r.why);
+            // A check that waited for the hub's lock ran while the kernel was busy with the hub (it holds the lock for its
+            // whole series of tries at setting a device up), so the kernel has not given up on the port.
+            if (r.state == PortState::stuck && monotonic_ns() - t0 >= kSlowPortCheck) r.state = PortState::setting_up;
+            out.readings.push_back(std::move(r));
         }
-        job->took = monotonic_ns() - t0;
-        job->done.store(true);
     });
 }
 
-bool UsbResetter::finished(Status& result, Nanos& took) {
+void UsbWorker::reset(std::string hub_interface, Nanos now) {
+    launch(true, now, [hub_interface = std::move(hub_interface), paths = paths_](Done& out) { out.result = rebind_hub(hub_interface, paths); });
+}
+
+void UsbWorker::launch(bool reset, Nanos now, std::function<void(Done&)> work) {
+    if (thread_.joinable()) thread_.join();
+    auto job = std::make_shared<Job>();
+    job->reset = reset;
+    job->started = now;
+    job->out.reset = reset;
+    job_ = job;
+    auto task = [job, work = std::move(work)] {
+        set_thread_name("usb");
+        Nanos t0 = monotonic_ns();
+        try {
+            work(job->out);
+        } catch (const std::exception& e) {
+            job->out.result = err(std::string("internal error: ") + e.what());
+        }
+        job->out.took = monotonic_ns() - t0;
+        job->done.store(true);
+    };
+    thread_ = std::thread(std::move(task));
+}
+
+bool UsbWorker::finished(Done& out) {
     if (!job_ || !job_->done.load()) return false;
     if (thread_.joinable()) thread_.join();
-    result = job_->result;
-    took = job_->took;
+    out = std::move(job_->out);
     job_.reset();
     return true;
 }
 
-bool UsbResetter::wait(Nanos max) {
+bool UsbWorker::wait(Nanos max) {
     Nanos until = monotonic_ns() + max;
     while (running()) {
         if (monotonic_ns() >= until) return false;

@@ -5,10 +5,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace tto {
 
@@ -17,6 +20,8 @@ struct UsbPaths {
     std::string hub_driver = "/sys/bus/usb/drivers/hub";
     std::string dev = "/dev/bus/usb";
 };
+
+UsbPaths usb_paths_under(const std::string& root);
 
 struct UsbPortRef {
     std::string path;
@@ -51,26 +56,52 @@ private:
     int attempts_ = 0;
 };
 
-class UsbResetter {
-public:
-    UsbResetter() = default;
-    ~UsbResetter();
-    UsbResetter(const UsbResetter&) = delete;
-    UsbResetter& operator=(const UsbResetter&) = delete;
+constexpr Nanos kSlowPortCheck = 200 * kMs;
 
-    void begin(std::string hub_interface, UsbPaths paths);
+struct UsbReading {
+    size_t device = 0;
+    std::string port;
+    PortState state = PortState::unknown;
+    std::string why;
+};
+
+using PortReader = std::function<PortState(const UsbPortRef&, std::string*)>;
+
+class UsbWorker {
+public:
+    struct Done {
+        bool reset = false;
+        std::vector<UsbReading> readings;
+        Status result;
+        Nanos took = 0;
+    };
+
+    explicit UsbWorker(UsbPaths paths = UsbPaths(), PortReader reader = nullptr);
+    ~UsbWorker();
+    UsbWorker(const UsbWorker&) = delete;
+    UsbWorker& operator=(const UsbWorker&) = delete;
+
+    const UsbPaths& paths() const { return paths_; }
+    void check(std::vector<std::pair<size_t, UsbPortRef>> ports, Nanos now);
+    void reset(std::string hub_interface, Nanos now);
     bool busy() const { return job_ != nullptr; }
-    bool finished(Status& result, Nanos& took);
+    bool resetting() const { return job_ && job_->reset; }
+    Nanos busy_since() const { return job_ ? job_->started : 0; }
+    bool finished(Done& out);
     bool wait(Nanos max);
 
 private:
     struct Job {
-        Status result;
-        Nanos took = 0;
+        bool reset = false;
+        Nanos started = 0;
+        Done out;
         std::atomic<bool> done{false};
     };
     bool running() const { return job_ && !job_->done.load(); }
+    void launch(bool reset, Nanos now, std::function<void(Done&)> work);
 
+    UsbPaths paths_;
+    PortReader reader_;
     std::shared_ptr<Job> job_;
     std::thread thread_;
 };

@@ -154,7 +154,7 @@ TEST_CASE("rebinding writes unbind then bind, and says so when the hub is not bo
     rmdir((p.devices + "/3-0:1.0/driver").c_str());
     Status st = rebind_hub("3-0:1.0", p);
     REQUIRE_FALSE(st);
-    CHECK(st.error().find("could not be bound again") != std::string::npos);
+    CHECK(st.error().find("could not be bound again (the kernel did not take it)") != std::string::npos);
     CHECK(st.error().find("echo 3-0:1.0 > " + p.hub_driver + "/bind") != std::string::npos);
     int rc = std::system(("rm -rf " + root).c_str());
     (void)rc;
@@ -189,20 +189,47 @@ TEST_CASE("a finished reset counts as busy until its result is collected") {
     touch(p.hub_driver + "/bind");
     mkdir((p.devices + "/3-0:1.0").c_str(), 0755);
     mkdir((p.devices + "/3-0:1.0/driver").c_str(), 0755);
-    UsbResetter r;
-    CHECK_FALSE(r.busy());
-    r.begin("3-0:1.0", p);
-    CHECK(r.wait(2 * kSec));
-    CHECK(r.busy());
-    Status st;
-    Nanos took = -1;
-    REQUIRE(r.finished(st, took));
-    CHECK(st);
-    CHECK(took >= 0);
-    CHECK_FALSE(r.busy());
-    CHECK_FALSE(r.finished(st, took));
+    UsbWorker w(p);
+    CHECK_FALSE(w.busy());
+    w.reset("3-0:1.0", 5);
+    CHECK(w.resetting());
+    CHECK(w.busy_since() == 5);
+    CHECK(w.wait(2 * kSec));
+    CHECK(w.busy());
+    UsbWorker::Done done;
+    done.took = -1;
+    REQUIRE(w.finished(done));
+    CHECK(done.reset);
+    CHECK(done.result);
+    CHECK(done.took >= 0);
+    CHECK_FALSE(w.busy());
+    CHECK_FALSE(w.finished(done));
     int rc = std::system(("rm -rf " + root).c_str());
     (void)rc;
+}
+
+TEST_CASE("a port check that had to wait for the kernel reads as being set up") {
+    auto ref = parse_usb_port("3-3");
+    REQUIRE(ref);
+    auto run = [&](PortState found, Nanos delay) {
+        UsbWorker w(UsbPaths(), [found, delay](const UsbPortRef&, std::string*) {
+            usleep(useconds_t(delay / 1000));
+            return found;
+        });
+        w.check({{size_t(1), *ref}}, 0);
+        REQUIRE(w.wait(3 * kSec));
+        UsbWorker::Done done;
+        REQUIRE(w.finished(done));
+        CHECK_FALSE(done.reset);
+        REQUIRE(done.readings.size() == 1);
+        CHECK(done.readings[0].device == 1);
+        CHECK(done.readings[0].port == "3-3");
+        return done.readings[0].state;
+    };
+    CHECK(run(PortState::stuck, 0) == PortState::stuck);
+    CHECK(run(PortState::stuck, 300 * kMs) == PortState::setting_up);
+    CHECK(run(PortState::empty, 300 * kMs) == PortState::empty);
+    CHECK(run(PortState::enumerated, 300 * kMs) == PortState::enumerated);
 }
 
 TEST_CASE("a reset held up in the kernel does not hold up stopping") {
@@ -217,9 +244,9 @@ TEST_CASE("a reset held up in the kernel does not hold up stopping") {
     std::atomic<bool> waited{true}, gone{false};
     std::thread stopping([&] {
         {
-            UsbResetter r;
-            r.begin("3-0:1.0", p);
-            waited = r.wait(100 * kMs);
+            UsbWorker w(p);
+            w.reset("3-0:1.0", 0);
+            waited = w.wait(100 * kMs);
         }
         gone = true;
     });

@@ -553,6 +553,7 @@ void DeviceReader::session() {
         if (r < 0 && errno != EINTR) {
             int e = errno;
             int n = cancel("device lost");
+            sh_.losses.fetch_add(1, std::memory_order_relaxed);
             event(EventKind::device, log::Level::err, "%s lost: waiting for it failed (%s); %d contact%s cancelled", cfg_.id.c_str(), errno_str(e).c_str(), n, plural(n));
             close_device();
             set_state(DevState::read_error, "waiting for " + node_ + " failed: " + errno_str(e));
@@ -575,6 +576,7 @@ void DeviceReader::session() {
         if (r == 0 || (r > 0 && p[0].revents)) rc = drain();
         if (rc < 0) {
             int n = cancel("device lost");
+            sh_.losses.fetch_add(1, std::memory_order_relaxed);
             if (rc == -ENODEV) {
                 event(EventKind::device, log::Level::warning, "%s lost: unplugged or dropped off USB; %d contact%s cancelled", cfg_.id.c_str(), n, plural(n));
                 close_device();

@@ -138,7 +138,7 @@ def device_block(d):
 
 
 class Daemon:
-    def __init__(self, name, devices, extra="", destinations=(), keep_settings=False, allowed=("127.0.0.1",)):
+    def __init__(self, name, devices, extra="", destinations=(), keep_settings=False, allowed=("127.0.0.1",), env=None):
         os.makedirs(RUN_DIR, exist_ok=True)
         self.name = name
         self.config = os.path.join(RUN_DIR, name + ".toml")
@@ -156,7 +156,8 @@ class Daemon:
         with open(self.config, "w") as f:
             f.write(text)
         self.log = open(self.log_path, "w")
-        self.proc = subprocess.Popen([os.path.join(BUILD, "touch-to-osc"), "--config=" + self.config], stdout=self.log, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen([os.path.join(BUILD, "touch-to-osc"), "--config=" + self.config], stdout=self.log, stderr=subprocess.STDOUT,
+                                     env=dict(os.environ, **env) if env else None)
         deadline = time.time() + 15
         while "OSC on UDP" not in self.log_text():
             if self.proc.poll() is not None:

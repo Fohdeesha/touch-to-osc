@@ -19,7 +19,7 @@
 
 namespace tto {
 
-constexpr int32_t kOscApi = 4;
+constexpr int32_t kOscApi = 5;
 constexpr int kRestartExit = 100;
 
 class Server {
@@ -46,6 +46,12 @@ private:
         uint64_t resyncs;
         uint64_t silences;
         uint64_t drops;
+        uint64_t losses;
+    };
+    struct UsbAsk {
+        size_t device;
+        UsbPortRef ref;
+        std::string by;
     };
     struct DevStats {
         std::deque<std::pair<Nanos, uint32_t>> latency;
@@ -64,6 +70,7 @@ private:
         Nanos last = 0;
         uint64_t suppressed = 0;
         std::string kind;
+        log::Level level = log::Level::notice;
     };
 
     bool open_sockets();
@@ -94,7 +101,7 @@ private:
     void send_target(const Target& t, const std::vector<uint8_t>& bytes);
     void send_status_changes(bool full);
     void send_alive(Nanos now);
-    void send_event(const std::string& kind, const std::string& text);
+    void send_event(const std::string& kind, const std::string& text, log::Level level);
     void emit(const std::string& key, log::Level level, const std::string& kind, const std::string& text);
     void report_suppressed(Nanos now);
     void expire_leases(Nanos now);
@@ -102,8 +109,11 @@ private:
     void send_bundled(const Peer& to, const std::vector<osc::Message>& msgs);
     std::string disabled_reason(size_t index) const;
     std::optional<UsbPortRef> usb_port_of(size_t index) const;
+    bool usb_watchable(size_t index, const DevInfo& info) const;
     void watch_usb(Nanos now);
-    void finish_usb_reset(Nanos now);
+    void note_port(size_t index, const std::string& port, PortState state, const std::string& why, Nanos now);
+    void collect_usb(Nanos now, bool start_next);
+    void finish_usb_reset(Nanos now, const UsbWorker::Done& done);
     void start_usb_reset(size_t index, const UsbPortRef& ref, const std::string& asked_by);
     std::string usb_reason(size_t index) const;
     void send_bye();
@@ -144,8 +154,11 @@ private:
     bool settings_dirty_ = false;
     bool status_dirty_ = true;
     bool restart_requested_ = false;
-    UsbPaths usb_paths_;
-    UsbResetter usb_worker_;
+    std::string usb_root_;
+    UsbWorker usb_worker_;
+    std::vector<size_t> usb_checking_;
+    std::optional<UsbAsk> usb_asked_;
+    std::optional<size_t> usb_due_;
     size_t usb_worker_dev_ = 0;
     bool usb_worker_manual_ = false;
     std::string usb_worker_target_;

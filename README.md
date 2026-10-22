@@ -107,7 +107,10 @@ that screen is gone. When the port reports something plugged in that the kernel 
 up on (the port is connected but switched off, with no device set up on it) for 10 s, it
 resets the USB hub that port belongs to (unbinds and binds the kernel's hub driver), which
 makes the kernel try again. While the kernel is still trying (the port is switched on but
-the device is not set up yet), the daemon waits. For a port on the computer itself that hub
+the device is not set up yet), the daemon waits. The kernel holds the hub while it tries,
+so a check of the port that has to wait for the kernel also means it is still trying; the
+checks run beside the rest of the daemon and never hold up the heartbeat, the status or a
+command. For a port on the computer itself that hub
 is the whole USB bus, so every device on that bus drops for a moment; contacts on other
 screens there are cancelled like any unplug. If the screen does not come back, the next
 reset waits 20 s, then 40, 80, 160 and from then on 300 s; the count starts again when the
@@ -145,7 +148,7 @@ To record a screen for the tests, stop the service and use evemu:
 Exit codes: 0 clean stop, 1 wrong command line, 2 config refused, 3 the listen port cannot
 be bound, 4 internal error.
 
-## OSC interface (osc_api 4)
+## OSC interface (osc_api 5)
 
 All addresses start with the prefix (`/touch` here) and devices appear by their config
 `id` (`face` here). Number arguments in commands may be `i`, `h` or a whole `f`; the
@@ -219,7 +222,7 @@ Sent in full on a new lease, on `status/send` and every 10 s, and each part agai
 as it changes (the health and reasons that look back over the last minute within a
 second). Status messages may arrive one by one or several to a bundle:
 
-    /touch/osc_api                  i 4
+    /touch/osc_api                  i 5
     /touch/version                  s
     /touch/run                      i
     /touch/health                   s ok|warning|fault
@@ -270,24 +273,29 @@ With every alive, to the receivers that get status:
     /touch/device/face/last_event_s f        seconds since the screen's last frame, -1 never
     /touch/device/face/rate_hz      f        frames per second while touched, last measured
     /touch/device/face/latency_us   i p50  i p99   screen frame to sent, last 10 s
-    /touch/device/face/counts       h frames  h touches  h resyncs  h send_drops  h cancels
+    /touch/device/face/counts       h frames  h touches  h resyncs  h send_drops  h cancels  h losses
     /touch/subscribers              s "ip:port seconds_left" ...
     /touch/destinations             s "ip:port ok|failing" ...
 
+The counts run from the start of the run; `losses` is how many times the screen was
+unplugged, dropped off USB or could not be read.
+
 `health` is `fault` when an enabled device is not working (not connected, no permission,
 held by another program, read error, not a touchscreen) or the last USB reset failed, and
-`warning` when a device is
-turned off or restarting after a settings change, when the kernel dropped events, a
-screen went silent or touch messages could not be sent in the last minute, when sending to
-a destination fails, or when the settings file was refused or could not be saved.
+`warning` when a device is turned off or restarting after a settings change, when in the
+last minute a screen was unplugged or dropped off USB, the kernel dropped events, a screen
+went silent or touch messages could not be sent, when sending to a destination fails, or
+when the settings file was refused or could not be saved. So a screen that drops out for
+a moment leaves a warning for a minute after it is back.
 `reasons` says which, in words that say what to do. The heartbeat is the alive's
 `counter`.
 
 ### Events
 
-    /touch/event  s kind  s text
+    /touch/event  s kind  s text  s level
 
-Kinds: `device` (connected, lost, released by the kernel, two screens match, restarting
+`level` is `notice`, `warning` or `error`: a screen lost is a warning, a screen connected a
+notice, a USB reset that failed an error. Kinds: `device` (connected, lost, released by the kernel, two screens match, restarting
 after a settings change), `resync`, `silence`, `grab` (another program let go), `enabled`
 (turned off or on), `usb` (a USB reset begun, done or failed, a screen back after resets,
 a port whose state cannot be read), `restart` (asked for, and by whom), `settings` (a
@@ -391,8 +399,9 @@ The end-to-end tests start the daemon against virtual touchscreens made through
 on a real screen (`tests/traces`), unplug screens in the middle of a touch, stop and
 freeze the daemon, make the kernel drop events, and check every command. They need root,
 `/dev/uinput` and `python3`, use UDP ports 19480-19499, and give their virtual screens USB
-vendor id 7470 so a running service never takes them. `--quick` skips the three tests that
-take longer than 10 s.
+vendor id 7470 so a running service never takes them. `--quick` skips the tests that take
+longer than 10 s. For USB recovery they point the daemon at a made-up `/sys` and `/dev`
+with the environment variable `TTO_USB_ROOT`; the daemon warns at start when it is set.
 
 `tests/hw/usb_recovery.py` needs a real USB touchscreen (`--usb vendor:product`). It stops
 the touch-to-osc service while it runs and starts its own daemon, or with `--service <id>`
