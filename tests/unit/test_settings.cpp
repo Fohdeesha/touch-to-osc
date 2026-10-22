@@ -44,6 +44,7 @@ TEST_CASE("every kind of saved setting survives the settings file and comes back
     x.match_usb = "1234:abcd";
     x.match_serial = "SN1";
     x.match_port = "3-3";
+    x.usb_recovery = false;
     std::string text = settings_text(o, "/etc/touch-to-osc/touch-to-osc.toml");
     auto back = parse_settings(text, "s.toml", b);
     INFO(text);
@@ -64,6 +65,7 @@ TEST_CASE("every kind of saved setting survives the settings file and comes back
     CHECK(f.product == 0xabcd);
     CHECK(f.serial == "SN1");
     CHECK(f.port == "3-3");
+    CHECK_FALSE(f.usb_recovery);
     CHECK(eff.log.level == "debug");
     CHECK(eff.osc.allowed_ips == std::vector<std::string>{"127.0.0.1", "10.0.0.5"});
     REQUIRE(eff.destinations.size() == 1);

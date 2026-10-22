@@ -22,6 +22,7 @@ struct DeviceOverrides {
     std::optional<std::string> match_usb;
     std::optional<std::string> match_serial;
     std::optional<std::string> match_port;
+    std::optional<bool> usb_recovery;
 
     bool empty() const;
 };

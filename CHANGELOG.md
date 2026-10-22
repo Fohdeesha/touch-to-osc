@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.0 - 2026-10-22
+
+OSC interface version 4: USB recovery.
+
+- While a screen is gone, the daemon watches the USB port it was last on; when something
+  is plugged in there that the kernel has given up on for 10 s (after failed attempts to
+  set it up), the daemon resets that port's USB hub so the kernel tries again, backing off
+  to every 300 s while it keeps failing. Nothing happens on an empty port or while the
+  kernel is still trying. On by default (`usb_recovery`, settable over OSC);
+  `/touch/device/<id>/usb_reset` resets on command.
+- New status per device: `usb_recovery`, `usb_watched_port`, `usb_port_state`,
+  `usb_resets`; new event kind `usb`; while a screen is stuck its reason says so. A reset
+  that fails is a health fault until the next one works; one that left the hub unbound
+  names the command that binds it again.
+- The service runs as root (a USB reset needs it), with no capabilities, only the input
+  and USB devices, and a read-only file system apart from its settings.
+
+## 0.3.0 - 2026-10-21
+
+OSC interface version 3: a receiver can restart the daemon.
+
+- `/touch/restart`: every contact is cancelled with the new reason `restarting`, pending
+  settings are written, `bye` goes out, and the same process starts again from the config
+  file and the saved settings (a newly installed version takes over; systemd keeps
+  watching the same process). The run number changes. Refused, with the reason, when the
+  config file would be refused at the restart, so a remote restart never leaves the daemon
+  stopped.
+
 ## 0.2.1 - 2026-10-21
 
 Hardening for long, unattended running.

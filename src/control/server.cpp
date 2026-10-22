@@ -34,6 +34,7 @@ constexpr Nanos kHealthWindow = 60 * kSec;
 constexpr Nanos kReportEvery = 10 * kSec;
 constexpr Nanos kSaveSettle = 300 * kMs;
 constexpr Nanos kSaveEvery = kSec;
+constexpr Nanos kUsbStopWait = 2 * kSec;
 constexpr double kEventBurst = 10;
 constexpr double kEventsPerSecond = 1;
 constexpr double kRefusalBurst = 20;
@@ -261,6 +262,12 @@ int Server::run() {
         stats_.emplace_back();
         cfg_gen_.push_back(0);
         restart_gen_.push_back(0);
+        usb_rec_.emplace_back();
+        usb_last_port_.emplace_back();
+        usb_state_.push_back(PortState::unknown);
+        usb_watching_.push_back(false);
+        usb_why_.emplace_back();
+        usb_resets_.push_back(0);
     }
     rx_.resize(65536);
     next_second_ = monotonic_ns() + kSec;
@@ -292,25 +299,31 @@ int Server::run() {
             on_tick();
         }
         if (p[0].revents) on_osc();
+        if (restart_requested_) break;
     }
 
-    sd_notify_msg("STOPPING=1");
+    sd_notify_msg(restart_requested_ ? "RELOADING=1" : "STOPPING=1");
     for (auto& sh : shared_) {
+        sh->restarting.store(restart_requested_);
         sh->stop.store(true);
         write_one(sh->wake.get());
     }
     for (auto& r : readers_) r->join();
     drain_reader_events();
+    if (!usb_worker_.wait(kUsbStopWait))
+        TTO_WARN("a USB reset is still waiting in the kernel; %s without waiting for it", restart_requested_ ? "restarting" : "stopping");
+    finish_usb_reset(monotonic_ns());
     if (settings_dirty_) save_settings();
     send_bye();
-    TTO_NOTICE("stopped");
-    return 0;
+    TTO_NOTICE("%s", restart_requested_ ? "restarting" : "stopped");
+    return restart_requested_ ? kRestartExit : 0;
 }
 
 void Server::on_tick() {
     Nanos now = monotonic_ns();
     drain_reader_events();
     drain_latency(now);
+    finish_usb_reset(now);
     if (settings_dirty_ && now - dirty_since_ >= kSaveSettle && now - last_save_ >= kSaveEvery) save_settings();
     if (now >= next_second_) {
         next_second_ = now - next_second_ > 2 * kSec ? now + kSec : next_second_ + kSec;
@@ -324,6 +337,7 @@ void Server::every_second(Nanos now) {
     expire_leases(now);
     prune(now);
     sample(now);
+    watch_usb(now);
     bool full = now - full_at_ >= kFullEvery;
     if (full) full_at_ = now;
     send_status_changes(full);
@@ -577,7 +591,9 @@ Server::Health Server::health(Nanos now) {
             switch (info.state) {
             case DevState::ok: break;
             case DevState::starting: warnings.push_back(d.label + " is starting"); break;
-            default: faults.push_back(d.label + ": " + info.reason); break;
+            default:
+                faults.push_back(d.label + ": " + (!info.connected && usb_watching_[i] && usb_state_[i] == PortState::stuck ? usb_reason(i) : std::string(info.reason)));
+                break;
             }
         }
         const auto& s = stats_[i].samples;
@@ -593,6 +609,7 @@ Server::Health Server::health(Nanos now) {
     for (const auto& [key, h] : dest_health_) {
         if (h.failing) warnings.push_back("sending to " + key + " fails: " + h.error);
     }
+    if (!usb_problem_.empty()) faults.push_back(usb_problem_);
     if (!settings_load_problem_.empty()) warnings.push_back(settings_load_problem_);
     if (!settings_problem_.empty()) warnings.push_back(settings_problem_);
     (void)now;
@@ -601,6 +618,85 @@ Server::Health Server::health(Nanos now) {
     out.reasons = faults;
     out.reasons.insert(out.reasons.end(), warnings.begin(), warnings.end());
     return out;
+}
+
+std::optional<UsbPortRef> Server::usb_port_of(size_t index) const {
+    if (!usb_last_port_[index].empty()) return parse_usb_port(usb_last_port_[index]);
+    return parse_usb_port(cfg_.devices[index].port);
+}
+
+void Server::watch_usb(Nanos now) {
+    for (size_t i = 0; i < shared_.size(); ++i) {
+        const DeviceConfig& d = cfg_.devices[i];
+        const DevInfo& info = shared_[i]->info.latest();
+        if (info.connected) {
+            if (info.usb_port[0]) usb_last_port_[i] = info.usb_port;
+            if (usb_rec_[i].attempts() > 0)
+                emit(d.id + "/usb", log::Level::notice, "usb", d.id + " is back after " + std::to_string(usb_rec_[i].attempts()) + " USB reset(s)");
+            usb_rec_[i].connected();
+            if (usb_watching_[i]) status_dirty_ = true;
+            usb_watching_[i] = false;
+            continue;
+        }
+        auto ref = usb_port_of(i);
+        if (!d.usb_recovery || !ref) {
+            if (usb_watching_[i]) status_dirty_ = true;
+            usb_watching_[i] = false;
+            continue;
+        }
+        std::string why;
+        PortState st = read_port_state(*ref, usb_paths_, &why);
+        if (!usb_watching_[i] || st != usb_state_[i]) status_dirty_ = true;
+        if (st == PortState::unknown && why != usb_why_[i])
+            emit(d.id + "/usb", log::Level::warning, "usb", d.id + ": cannot tell whether anything is plugged into USB port " + ref->path + " (" + why + ")");
+        usb_why_[i] = st == PortState::unknown ? why : std::string();
+        usb_state_[i] = st;
+        usb_watching_[i] = true;
+        if (usb_rec_[i].observe(now, st) && !usb_worker_.busy()) start_usb_reset(i, *ref, std::string());
+    }
+}
+
+void Server::start_usb_reset(size_t index, const UsbPortRef& ref, const std::string& asked_by) {
+    const std::string& id = cfg_.devices[index].id;
+    usb_worker_dev_ = index;
+    usb_worker_manual_ = !asked_by.empty();
+    usb_worker_target_ = ref.hub.rfind("usb", 0) == 0 ? "USB bus " + std::to_string(ref.bus) : "the USB hub " + ref.hub;
+    if (usb_worker_manual_)
+        emit(id + "/usb", log::Level::warning, "usb",
+             id + ": resetting " + usb_worker_target_ + " as asked by " + asked_by + "; every device on it drops for a moment");
+    else
+        emit(id + "/usb", log::Level::warning, "usb",
+             id + ": something is plugged into USB port " + ref.path + " but the kernel has not set it up; resetting " + usb_worker_target_ +
+                 " (attempt " + std::to_string(usb_rec_[index].attempts() + 1) + "); every device on it drops for a moment");
+    usb_worker_.begin(ref.hub_interface, usb_paths_);
+    status_dirty_ = true;
+}
+
+void Server::finish_usb_reset(Nanos now) {
+    Status st;
+    Nanos took = 0;
+    if (!usb_worker_.finished(st, took)) return;
+    size_t i = usb_worker_dev_;
+    const std::string& id = cfg_.devices[i].id;
+    ++usb_resets_[i];
+    if (!usb_worker_manual_) usb_rec_[i].reset_done(now);
+    if (st) {
+        usb_problem_.clear();
+        emit(id + "/usb", log::Level::notice, "usb",
+             id + ": " + usb_worker_target_ + " reset in " + std::to_string(took / kMs) + " ms; waiting for the touchscreen to come back");
+    } else {
+        usb_problem_ = st.error();
+        emit(id + "/usb", log::Level::err, "usb", id + ": " + st.error());
+    }
+    status_dirty_ = true;
+}
+
+std::string Server::usb_reason(size_t index) const {
+    auto ref = usb_port_of(index);
+    std::string port = ref ? ref->path : std::string("?");
+    std::string tries = std::to_string(usb_resets_[index]) + " reset(s) so far";
+    return "plugged into USB port " + port + " but the kernel has not set it up; touch-to-osc resets the USB connection by itself (" + tries +
+           "). If this keeps happening, check the cable and its joints";
 }
 
 std::string Server::disabled_reason(size_t index) const {
@@ -644,8 +740,17 @@ std::vector<osc::Message> Server::status_messages() {
         add(b + "label", {d.label});
         add(b + "enabled", {int32_t(info.enabled ? 1 : 0)});
         add(b + "connected", {int32_t(info.connected ? 1 : 0)});
+        bool stuck = !info.connected && usb_watching_[i] && usb_state_[i] == PortState::stuck;
         add(b + "state", {std::string(restarting ? "restarting" : state_name(info.state))});
-        add(b + "reason", {restarting ? std::string("restarting after a settings change") : !info.enabled ? disabled_reason(i) : std::string(info.reason)});
+        add(b + "reason", {restarting ? std::string("restarting after a settings change")
+                           : !info.enabled ? disabled_reason(i)
+                           : stuck         ? usb_reason(i)
+                                           : std::string(info.reason)});
+        auto usb_ref = usb_port_of(i);
+        add(b + "usb_recovery", {int32_t(d.usb_recovery ? 1 : 0)});
+        add(b + "usb_watched_port", {usb_ref ? usb_ref->path : std::string()});
+        add(b + "usb_port_state", {std::string(usb_watching_[i] ? port_state_text(usb_state_[i]) : "")});
+        add(b + "usb_resets", {int32_t(std::min<uint64_t>(usb_resets_[i], INT32_MAX))});
         add(b + "match_usb", {d.usb_setting()});
         add(b + "match_serial", {d.serial});
         add(b + "match_port", {d.port});
@@ -809,12 +914,31 @@ Status Server::apply(const osc::Message& m, const Peer& peer) {
         send_bundled(reply_peer(), msgs);
         return {};
     }
+    if (parts.size() == 1 && parts[0] == "restart") {
+        if (!m.args.empty()) return err("restart takes no arguments");
+        auto fresh = load_config(config_path_);
+        if (!fresh) return err("touch-to-osc keeps running: at a restart its config file would be refused (" + fresh.error() + ")");
+        restart_requested_ = true;
+        emit("restart", log::Level::notice, "restart",
+             "restarting, as asked by " + peer.ip + ": every contact is cancelled, then touch-to-osc starts again from " + config_path_ + " and its saved settings");
+        return {};
+    }
     if (parts.size() == 1 && parts[0] == "subscribe") return subscribe(m, peer);
     if (parts.size() == 1 && parts[0] == "unsubscribe") return unsubscribe(m, peer);
     if (parts.size() == 3 && parts[0] == "device") {
         auto it = std::find_if(cfg_.devices.begin(), cfg_.devices.end(), [&](const DeviceConfig& d) { return d.id == parts[1]; });
         if (it == cfg_.devices.end()) return err("no device " + parts[1]);
-        return set_device(size_t(it - cfg_.devices.begin()), parts[2], m.args, peer);
+        size_t index = size_t(it - cfg_.devices.begin());
+        if (parts[2] == "usb_reset") {
+            if (!m.args.empty()) return err("usb_reset takes no arguments");
+            auto ref = usb_port_of(index);
+            if (!ref) return err(it->id + " has not been seen on a USB port since touch-to-osc started and no port is set for it, so there is nothing to reset: plug the screen in again, or set match_port (port in the config file) to the USB port it is plugged into, such as 3-3");
+            finish_usb_reset(monotonic_ns());
+            if (usb_worker_.busy()) return err("a USB reset is already running; try again in a moment");
+            start_usb_reset(index, *ref, peer.ip);
+            return {};
+        }
+        return set_device(index, parts[2], m.args, peer);
     }
     return set_global(parts, m.args, peer);
 }
@@ -903,6 +1027,10 @@ Status Server::set_device(size_t index, const std::string& key, const std::vecto
         if (Status st = text(64, s); !st) return st;
         x.match_port = s;
         what += quoted(cur.port) + " -> " + quoted(s);
+    } else if (key == "usb_recovery") {
+        if (Status st = flag(b); !st) return st;
+        x.usb_recovery = b;
+        what += std::string(cur.usb_recovery ? "1" : "0") + " -> " + (b ? "1" : "0");
     } else {
         return err("unknown address");
     }
@@ -1020,6 +1148,11 @@ void Server::apply_effects(const Config& old) {
             wake = true;
         }
         bool reopen = reopens(a, b);
+        if (reopen && (a.has_usb != b.has_usb || a.vendor != b.vendor || a.product != b.product || a.serial != b.serial || a.port != b.port)) {
+            usb_last_port_[i].clear();
+            usb_rec_[i].connected();
+            usb_watching_[i] = false;
+        }
         if (reopen || remaps(a, b)) {
             std::lock_guard<std::mutex> lock(sh.cfg_mutex);
             sh.next_cfg = b;

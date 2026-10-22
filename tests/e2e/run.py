@@ -688,7 +688,11 @@ def status_describes_the_device():
         r = c.receiver()
         connected(r)
         want = {
-            "/touch/osc_api": [2],
+            "/touch/osc_api": [4],
+            "/touch/device/t/usb_recovery": [1],
+            "/touch/device/t/usb_watched_port": [""],
+            "/touch/device/t/usb_port_state": [""],
+            "/touch/device/t/usb_resets": [0],
             "/touch/config": [c.daemons[0].config],
             "/touch/settings_file": [""],
             "/touch/log_level": ["info"],
@@ -725,7 +729,7 @@ def status_describes_the_device():
         r.send("/touch/status/send")
         r.wait("/touch/run", since=m)
         log = c.daemons[0].log_text()
-        check("touch-to-osc 0.2.1 (osc_api 2)" in log, "banner")
+        check("touch-to-osc 0.4.0 (osc_api 4)" in log, "banner")
 
 
 @test()
@@ -1200,6 +1204,76 @@ def refusals_to_many_outside_hosts_are_capped():
                 s2.close()
         MEASURED.append("100 outside hosts at once: %d refusals answered" % answered)
         check(0 < answered <= 25, "%d of 100 outside hosts were answered" % answered)
+
+
+@test()
+def restart_starts_again_with_a_new_run():
+    with Ctx("restart") as c:
+        p = test_product()
+        s = c.screen(p)
+        d = c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        run1 = r.wait("/touch/alive", timeout=2.5).args[1]
+        s.touch(0, 1, 10, 10)
+        s.frame()
+        c1 = r.wait("/touch/t/down").args[0]
+        m = r.mark()
+        check(req(r, "/touch/restart") == ["ok", ""], "restart refused")
+        cancel = r.wait("/touch/t/cancel", since=m)
+        check(cancel.args[:2] == [c1, "restarting"], "cancel %s" % cancel.args)
+        bye = r.wait("/touch/bye", since=m)
+        check(bye.args == [run1], "bye %s for run %s" % (bye.args, run1))
+        r.wait("/touch/alive", lambda x: x.args[1] != run1, since=m, timeout=6)
+        check(d.proc.poll() is None, "the daemon process ended instead of starting again")
+        connected(r, since=m)
+        m2 = r.mark()
+        s.touch(0, 1, 30, 30)
+        s.frame()
+        r.none("/touch/t/down", during=0.3, since=m2)
+        s.lift(0)
+        s.frame()
+        s.touch(0, 2, 20, 20)
+        s.frame()
+        r.wait("/touch/t/down", since=m2)
+        check(d.log_text().count("(osc_api 4), run") == 2, "expected two start banners in the log")
+
+
+@test()
+def restart_is_refused_when_the_config_would_be():
+    with Ctx("restartbad") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        with open(d.config, "a") as f:
+            f.write("\nbogus = 1\n")
+        got = req(r, "/touch/restart")
+        check(got[0] == "refused" and "keeps running" in got[1] and "bogus: unknown key" in got[1], "got %s" % got)
+        time.sleep(0.5)
+        check(d.proc.poll() is None, "the daemon stopped")
+        r.none("/touch/bye", during=0.2, since=0)
+
+
+@test()
+def usb_reset_needs_a_screen_on_usb_and_recovery_is_a_saved_setting():
+    with Ctx("usbcmd") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        got = req(r, "/touch/device/t/usb_reset")
+        check(got == ["refused", "t has not been seen on a USB port since touch-to-osc started and no port is set for it, so there is nothing to reset: plug the screen"
+                      " in again, or set match_port (port in the config file) to the USB port it is plugged into, such as 3-3"], "got %s" % got)
+        check(req(r, "/touch/device/t/usb_reset", 1) == ["refused", "usb_reset takes no arguments"], "arguments")
+        m = r.mark()
+        check(req(r, "/touch/device/t/usb_recovery", 0) == ["ok", ""], "off")
+        r.wait("/touch/device/t/usb_recovery", lambda x: x.args == [0], since=m)
+        r.wait("/touch/overrides", lambda x: x.args == ["device/t/usb_recovery"], since=m)
+        check(req(r, "/touch/device/t/usb_recovery", 2) == ["refused", "usb_recovery needs 0 or 1"], "bad value")
+        r.none("/touch/event", lambda x: x.args[0] == "usb", during=1.5, since=0)
 
 
 def replay(name, silence_ms=200, after=None):

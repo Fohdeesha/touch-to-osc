@@ -12,8 +12,8 @@ where a picture shown on the screen sits.
 
 - Every contact it announces ends with exactly one `up` or `cancel`, which it sends itself.
   A contact never outlives its device, its run or the process: unplugging the screen, the
-  screen going silent, a disable command, the kernel dropping events and stopping the
-  daemon all cancel the contacts that were down.
+  screen going silent, a disable command, the kernel dropping events, a USB reset and
+  stopping or restarting the daemon all cancel the contacts that were down.
 - Every second it sends the list of contacts still down on each device, so a receiver that
   lost an `up` (UDP can lose datagrams) ends that contact within about a second.
 - A finger that was already on the screen when reading started (at start, after a
@@ -52,10 +52,12 @@ checks it, and installs the systemd unit. Settings changed over OSC are saved in
 `/var/lib/touch-to-osc/settings.toml`. `scripts/uninstall.sh` removes the program and the
 unit again (`--purge` also removes the config and the saved settings).
 
-The service runs as an unprivileged user in the `input` group, restarts after a failure
-(every second, without giving up), stays stopped when the config is refused (fix it, then
-`systemctl restart touch-to-osc`), and reports its version, run and settings in the
-journal when it starts:
+The service runs as root, which it needs to reset a USB bus (see USB recovery below), but
+systemd takes every capability away from it, lets it reach no devices but the input and
+USB ones, and keeps the file system read-only apart from its settings. It restarts after
+a failure (every second, without giving up), stays stopped when the config is refused (fix
+it, then `systemctl restart touch-to-osc`), and reports its version, run and settings in
+the journal when it starts:
 
     journalctl -u touch-to-osc
 
@@ -70,8 +72,10 @@ journal when it starts:
   subscribing.
 - `[[device]]`, one per screen: an `id` that becomes part of the addresses, which device
   it is (`usb` vendor:product, `serial`, `port`), how its touch panel lines up with the
-  screen's display (`rotation`, `mirror`, `calibration`), and the display's `aspect`. `silence_ms` cancels held
-  contacts when the screen stops reporting; see the example config before changing it.
+  screen's display (`rotation`, `mirror`, `calibration`), and the display's `aspect`.
+  `silence_ms` cancels held contacts when the screen stops reporting; see the example
+  config before changing it. `usb_recovery` resets a USB connection the kernel gave up on
+  (below).
 
 Unknown keys, wrong types and out-of-range values are refused with a message that names
 the key. `touch-to-osc --check-config=FILE` checks a file without opening anything.
@@ -92,6 +96,26 @@ Text settings (labels, serials, ports) may only use printable ASCII.
 With `grab = false` and `silence_ms = 0`, the daemon cannot notice another program taking
 the screen exclusively while a finger is down; with `silence_ms` on it cancels that
 contact and reports the screen as held by another program.
+
+### USB recovery
+
+A USB connection that falters (a loose joint, a marginal extender) can leave a screen
+plugged in that the kernel tried to set up, failed, and then gave up on: it does not try
+again until the plug is pulled and pushed back. With `usb_recovery = true` (the default),
+the daemon watches the USB port it last read a screen on, or the configured `port`, while
+that screen is gone. When the port reports something plugged in that the kernel has given
+up on (the port is connected but switched off, with no device set up on it) for 10 s, it
+resets the USB hub that port belongs to (unbinds and binds the kernel's hub driver), which
+makes the kernel try again. While the kernel is still trying (the port is switched on but
+the device is not set up yet), the daemon waits. For a port on the computer itself that hub
+is the whole USB bus, so every device on that bus drops for a moment; contacts on other
+screens there are cancelled like any unplug. If the screen does not come back, the next
+reset waits 20 s, then 40, 80, 160 and from then on 300 s; the count starts again when the
+screen is back or the port has been empty for 5 s. Nothing is reset while the port is
+empty (the screen unplugged on purpose). Each reset is an event and a journal line, and
+`/touch/device/<id>/usb_reset` resets on command. A port whose state cannot be read (no
+`/dev/bus/usb`, or the daemon run by hand as a user other than root) is reported once and
+left alone.
 
 Several screens work side by side. Two identical screens are told apart by `port` (the
 USB socket they are plugged into, as `--list` shows it) or by `serial` when theirs
@@ -121,7 +145,7 @@ To record a screen for the tests, stop the service and use evemu:
 Exit codes: 0 clean stop, 1 wrong command line, 2 config refused, 3 the listen port cannot
 be bound, 4 internal error.
 
-## OSC interface (osc_api 2)
+## OSC interface (osc_api 4)
 
 All addresses start with the prefix (`/touch` here) and devices appear by their config
 `id` (`face` here). Number arguments in commands may be `i`, `h` or a whole `f`; the
@@ -158,7 +182,7 @@ holds one message per contact that changed:
   down), `device disabled` (a command), `resync` (the kernel dropped events because they
   were not read in time; the state was read again), `palm` (the screen marked the contact
   as a palm), `reconfigured` (a settings change restarts reading the screen), `stopping`
-  (the daemon is stopping).
+  (the daemon is stopping), `restarting` (the daemon is restarting on a command).
 
 ### Liveness
 
@@ -195,7 +219,7 @@ Sent in full on a new lease, on `status/send` and every 10 s, and each part agai
 as it changes (the health and reasons that look back over the last minute within a
 second). Status messages may arrive one by one or several to a bundle:
 
-    /touch/osc_api                  i 2
+    /touch/osc_api                  i 4
     /touch/version                  s
     /touch/run                      i
     /touch/health                   s ok|warning|fault
@@ -218,6 +242,12 @@ second). Status messages may arrive one by one or several to a bundle:
     /touch/device/face/match_port   s        settable
     /touch/device/face/calibration  f a f b f c f d f e f f   settable; no arguments when none
     /touch/device/face/grab         i 0|1    settable: whether to hold it exclusively
+    /touch/device/face/usb_recovery i 0|1    settable: reset the USB connection when it fails
+    /touch/device/face/usb_watched_port s    the USB port recovery watches ("" when none is known)
+    /touch/device/face/usb_port_state s      while the screen is gone: nothing plugged in|being set
+                                             up|plugged in but not set up|set up|unknown; ""
+                                             otherwise
+    /touch/device/face/usb_resets   i        USB resets done for it since the start
     /touch/device/face/name         s        the kernel's name for the device
     /touch/device/face/usb          s        "vvvv:pppp serial"
     /touch/device/face/port         s        the USB port path
@@ -245,7 +275,8 @@ With every alive, to the receivers that get status:
     /touch/destinations             s "ip:port ok|failing" ...
 
 `health` is `fault` when an enabled device is not working (not connected, no permission,
-held by another program, read error, not a touchscreen) and `warning` when a device is
+held by another program, read error, not a touchscreen) or the last USB reset failed, and
+`warning` when a device is
 turned off or restarting after a settings change, when the kernel dropped events, a
 screen went silent or touch messages could not be sent in the last minute, when sending to
 a destination fails, or when the settings file was refused or could not be saved.
@@ -258,9 +289,11 @@ a destination fails, or when the settings file was refused or could not be saved
 
 Kinds: `device` (connected, lost, released by the kernel, two screens match, restarting
 after a settings change), `resync`, `silence`, `grab` (another program let go), `enabled`
-(turned off or on), `settings` (a setting changed, with the old and new value and who sent
-it, or the settings file could not be saved), `subscriber` (added, ended), `send` (a
-destination failing, at most once per 10 s each, with a count). Each event is also a line
+(turned off or on), `usb` (a USB reset begun, done or failed, a screen back after resets,
+a port whose state cannot be read), `restart` (asked for, and by whom), `settings` (a
+setting changed, with the old and new value and who sent it, or the settings file could
+not be saved), `subscriber` (added, ended), `send` (a destination failing, at most once
+per 10 s each, with a count). Each event is also a line
 in the journal. Events of one kind from one source are passed on up to 10 at once and then
 one a second; the rest are counted and reported in one event ("N more ... came too fast to
 report one by one").
@@ -276,6 +309,17 @@ adds a line for every command and every lease renewal; touches are never logged.
     /touch/ping [i port]                  -> /touch/pong i run
     /touch/status/send [i port]           -> the full status and the counters (at most 5 a second)
     /touch/subscribe, /touch/unsubscribe  as above
+    /touch/restart                        start the daemon again (below)
+    /touch/device/face/usb_reset          reset the USB hub the screen's port belongs to now
+                                             (see USB recovery); refused when no port is known
+                                             or while a reset runs
+
+`restart` answers first, then cancels every contact (`restarting`), writes any pending
+settings, sends `bye` and starts the same process again, which reads the config file and
+the saved settings afresh and runs the program as it is installed now (so it also brings
+in a new version). Leases are not kept: receivers renew as usual and get the full status
+again; the `run` changes. It is refused, and the daemon keeps running, when the config
+file would be refused at the restart.
 
 Settings: each one is changed at the same address the status reports it on, and saved.
 
@@ -290,6 +334,7 @@ Settings: each one is changed at the same address the status reports it on, and 
     /touch/device/face/match_usb     s          "vvvv:pppp", or "" to match by port alone
     /touch/device/face/match_serial  s
     /touch/device/face/match_port    s
+    /touch/device/face/usb_recovery  i 0|1
     /touch/log_level                 s          crit|error|warning|notice|info|debug
     /touch/allowed_ips/add           s ip
     /touch/allowed_ips/remove        s ip
@@ -313,7 +358,7 @@ Settings: each one is changed at the same address the status reports it on, and 
 - A value set back to what the config file says stops being an override, and a command
   that changes nothing is answered `ok` without being saved or reported.
 - `osc.listen`, `osc.prefix`, `open_to_any` and adding or removing devices stay in the
-  config file.
+  config file; after editing it, `/touch/restart` applies it.
 
 - Every command can go inside a request and then gets exactly one reply. Replies are kept
   per (IP, port, seq) for 30 s or 64 newer requests: an exact repeat gets the kept reply
@@ -339,6 +384,7 @@ The machine running it must be in `osc.allowed_ips`.
 
     build/tto_tests                          unit tests
     sudo python3 tests/e2e/run.py [--quick]  end-to-end tests
+    sudo python3 tests/hw/usb_recovery.py    USB recovery on a real screen (below)
 
 The end-to-end tests start the daemon against virtual touchscreens made through
 `/dev/uinput` and a receiver that subscribes like a real one. They replay touches recorded
@@ -347,6 +393,15 @@ freeze the daemon, make the kernel drop events, and check every command. They ne
 `/dev/uinput` and `python3`, use UDP ports 19480-19499, and give their virtual screens USB
 vendor id 7470 so a running service never takes them. `--quick` skips the three tests that
 take longer than 10 s.
+
+`tests/hw/usb_recovery.py` needs a real USB touchscreen (`--usb vendor:product`). It stops
+the touch-to-osc service while it runs and starts its own daemon, or with `--service <id>`
+tests that device of the running service (127.0.0.1 must be in its `allowed_ips`). It makes
+the kernel drop the screen without unplugging it (`/sys/bus/usb/devices/<port>/remove`,
+which leaves the port as a failed enumeration does), and checks a reset on command, the
+automatic reset after 10 s, and that nothing is reset with `usb_recovery` off. Every device
+on the screen's USB bus drops several times; at the end the hub is bound, the screen set
+up and `usb_recovery` on again either way.
 
 Sanitizer builds: `cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug
 -DTTO_SANITIZE=address,undefined` (or `thread` in `build-tsan`), then run the tests with

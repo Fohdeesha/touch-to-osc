@@ -2,11 +2,15 @@
 #include "config/settings.h"
 #include "control/server.h"
 #include "core/log.h"
+#include "core/process.h"
 #include "tools/tools.h"
 
 #include "tto_version.h"
 
+#include <cerrno>
+#include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <map>
 #include <string>
@@ -42,6 +46,7 @@ int main(int argc, char** argv) {
 }
 
 int run_main(int argc, char** argv) {
+    std::string exe = tto::self_exe_path();
     std::map<std::string, std::string> opts;
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
@@ -119,6 +124,17 @@ int run_main(int argc, char** argv) {
         return tto::dump_device(effective, opts["dump"], tto::SysPaths());
     }
     auto settings = tto::load_settings(*cfg, true);
-    tto::Server server(std::move(*cfg), std::move(settings), path);
-    return server.run();
+    int rc = 0;
+    {
+        tto::Server server(std::move(*cfg), std::move(settings), path);
+        rc = server.run();
+    }
+    if (rc != tto::kRestartExit) return rc;
+    // the same process starts again, so systemd keeps watching the same PID; a newly installed binary takes over
+    sigset_t none;
+    sigemptyset(&none);
+    sigprocmask(SIG_SETMASK, &none, nullptr);
+    execv(exe.c_str(), argv);
+    TTO_CRIT("restarting failed: cannot run %s again (%s)", exe.c_str(), std::strerror(errno));
+    return 4;
 }

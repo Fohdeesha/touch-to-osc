@@ -14,7 +14,7 @@ namespace tto {
 
 namespace {
 
-const char* const kDeviceKeys[] = {"label", "enabled", "rotation", "mirror", "calibration", "aspect", "silence_ms", "grab", "match_usb", "match_serial", "match_port"};
+const char* const kDeviceKeys[] = {"label", "enabled", "rotation", "mirror", "calibration", "aspect", "silence_ms", "grab", "match_usb", "match_serial", "match_port", "usb_recovery"};
 
 template <typename T>
 void drop_if(std::optional<T>& v, const T& base) {
@@ -38,12 +38,13 @@ void parse_device(StrictTable& d, DeviceOverrides& x) {
     if (d.str("match_usb", s, 16) && d.check("match_usb", check_usb(s, nullptr, nullptr))) x.match_usb = s;
     if (d.str("match_serial", s, 128)) x.match_serial = s;
     if (d.str("match_port", s, 64)) x.match_port = s;
+    if (d.boolean("usb_recovery", b)) x.usb_recovery = b;
 }
 
 }
 
 bool DeviceOverrides::empty() const {
-    return !label && !enabled && !rotation && !mirror && !calibration && !aspect && !silence_ms && !grab && !match_usb && !match_serial && !match_port;
+    return !label && !enabled && !rotation && !mirror && !calibration && !aspect && !silence_ms && !grab && !match_usb && !match_serial && !match_port && !usb_recovery;
 }
 
 bool Overrides::empty() const { return !log_level && !allowed_ips && !saved_destinations && devices.empty(); }
@@ -79,6 +80,7 @@ Config apply_overrides(const Config& base, const Overrides& o) {
         }
         if (x.match_serial) d.serial = *x.match_serial;
         if (x.match_port) d.port = *x.match_port;
+        if (x.usb_recovery) d.usb_recovery = *x.usb_recovery;
     }
     return c;
 }
@@ -102,6 +104,7 @@ void drop_unchanged(Overrides& o, const Config& base) {
         drop_if(x.match_usb, d.usb_setting());
         drop_if(x.match_serial, d.serial);
         drop_if(x.match_port, d.port);
+        drop_if(x.usb_recovery, d.usb_recovery);
         if (x.empty()) o.devices.erase(it);
     }
 }
@@ -114,7 +117,8 @@ std::vector<std::string> override_names(const Overrides& o) {
     for (const auto& [id, x] : o.devices) {
         std::string b = "device/" + id + "/";
         bool set[] = {bool(x.label), bool(x.enabled), bool(x.rotation), bool(x.mirror), bool(x.calibration), bool(x.aspect),
-                      bool(x.silence_ms), bool(x.grab), bool(x.match_usb), bool(x.match_serial), bool(x.match_port)};
+                      bool(x.silence_ms), bool(x.grab), bool(x.match_usb), bool(x.match_serial), bool(x.match_port), bool(x.usb_recovery)};
+        static_assert(sizeof set / sizeof set[0] == sizeof kDeviceKeys / sizeof kDeviceKeys[0], "one name per device setting");
         for (size_t i = 0; i < sizeof set / sizeof set[0]; ++i) {
             if (set[i]) out.push_back(b + kDeviceKeys[i]);
         }
@@ -150,6 +154,7 @@ bool forget_override(Overrides& o, const std::string& name) {
     else if (key == "match_usb") had = reset(x.match_usb);
     else if (key == "match_serial") had = reset(x.match_serial);
     else if (key == "match_port") had = reset(x.match_port);
+    else if (key == "usb_recovery") had = reset(x.usb_recovery);
     if (x.empty()) o.devices.erase(it);
     return had;
 }
@@ -186,6 +191,7 @@ std::string settings_text(const Overrides& o, const std::string& config_path) {
             if (x.match_usb) d.insert("match_usb", *x.match_usb);
             if (x.match_serial) d.insert("match_serial", *x.match_serial);
             if (x.match_port) d.insert("match_port", *x.match_port);
+            if (x.usb_recovery) d.insert("usb_recovery", *x.usb_recovery);
             devices.insert(id, std::move(d));
         }
         t.insert("device", std::move(devices));

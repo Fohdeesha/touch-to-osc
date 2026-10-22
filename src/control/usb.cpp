@@ -1,0 +1,240 @@
+#include "control/usb.h"
+
+#include "core/fd.h"
+#include "core/process.h"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <fcntl.h>
+#include <fstream>
+#include <linux/usbdevice_fs.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <vector>
+
+namespace tto {
+
+namespace {
+
+constexpr uint16_t kPortConnection = 0x0001;
+constexpr uint16_t kPortEnable = 0x0002;
+constexpr Nanos kEmptyForgets = 5 * kSec;
+
+std::string root_hint(const char* what) {
+    if (geteuid() == 0) return {};
+    return std::string("; touch-to-osc must run as root to ") + what;
+}
+
+bool exists(const std::string& path) {
+    struct stat st {};
+    return stat(path.c_str(), &st) == 0;
+}
+
+bool number(const std::string& s, int max, int& out) {
+    if (s.empty() || s.size() > 3 || s[0] == '0') return false;
+    int v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + (c - '0');
+    }
+    if (v < 1 || v > max) return false;
+    out = v;
+    return true;
+}
+
+int read_int(const std::string& path) {
+    std::ifstream in(path);
+    int v = -1;
+    if (!(in >> v)) return -1;
+    return v;
+}
+
+Status write_text(const std::string& file, const std::string& text) {
+    UniqueFd fd(open(file.c_str(), O_WRONLY | O_CLOEXEC));
+    if (!fd) return err("cannot open " + file + ": " + errno_str());
+    ssize_t n = write(fd.get(), text.data(), text.size());
+    if (n != ssize_t(text.size())) return err("writing " + text + " to " + file + " failed: " + (n < 0 ? errno_str() : std::string("short write")));
+    return {};
+}
+
+}
+
+std::optional<UsbPortRef> parse_usb_port(const std::string& path) {
+    size_t dash = path.find('-');
+    if (dash == std::string::npos) return std::nullopt;
+    UsbPortRef r;
+    if (!number(path.substr(0, dash), 999, r.bus)) return std::nullopt;
+    std::vector<int> chain;
+    size_t pos = dash + 1;
+    while (true) {
+        size_t dot = path.find('.', pos);
+        int p = 0;
+        if (!number(path.substr(pos, dot == std::string::npos ? std::string::npos : dot - pos), 255, p)) return std::nullopt;
+        chain.push_back(p);
+        if (dot == std::string::npos) break;
+        pos = dot + 1;
+    }
+    if (chain.size() > 7) return std::nullopt;
+    std::string bus = std::to_string(r.bus);
+    r.path = path;
+    r.port = chain.back();
+    if (chain.size() == 1) {
+        r.hub = "usb" + bus;
+        r.hub_interface = bus + "-0:1.0";
+    } else {
+        r.hub = bus + "-" + std::to_string(chain[0]);
+        for (size_t i = 1; i + 1 < chain.size(); ++i) r.hub += "." + std::to_string(chain[i]);
+        r.hub_interface = r.hub + ":1.0";
+    }
+    return r;
+}
+
+const char* port_state_text(PortState s) {
+    switch (s) {
+    case PortState::unknown: return "unknown";
+    case PortState::empty: return "nothing plugged in";
+    case PortState::setting_up: return "being set up";
+    case PortState::enumerated: return "set up";
+    case PortState::stuck: return "plugged in but not set up";
+    }
+    return "?";
+}
+
+PortState port_state_from(uint16_t port_status, bool device_present) {
+    if (device_present) return PortState::enumerated;
+    if (!(port_status & kPortConnection)) return PortState::empty;
+    // The kernel keeps the port enabled while it sets a device up (holding the hub's lock, so an unbind
+    // would wait for it) and disables the port when it gives up.
+    return (port_status & kPortEnable) ? PortState::setting_up : PortState::stuck;
+}
+
+PortState read_port_state(const UsbPortRef& ref, const UsbPaths& paths, std::string* why) {
+    if (exists(paths.devices + "/" + ref.path)) return PortState::enumerated;
+    std::string hub = paths.devices + "/" + ref.hub;
+    int busnum = read_int(hub + "/busnum"), devnum = read_int(hub + "/devnum");
+    if (busnum <= 0 || devnum <= 0) {
+        if (why) *why = "the USB hub " + ref.hub + " holding port " + ref.path + " is not there";
+        return PortState::unknown;
+    }
+    char node[256];
+    std::snprintf(node, sizeof node, "%s/%03d/%03d", paths.dev.c_str(), busnum, devnum);
+    UniqueFd fd(open(node, O_RDWR | O_CLOEXEC));
+    if (!fd) {
+        if (why) *why = std::string("cannot open ") + node + ": " + errno_str() + root_hint("watch USB ports (its service does), or usb_recovery must be turned off for this screen");
+        return PortState::unknown;
+    }
+    uint8_t buf[4] = {};
+    usbdevfs_ctrltransfer c{};
+    c.bRequestType = 0xA3;
+    c.bRequest = 0;
+    c.wValue = 0;
+    c.wIndex = uint16_t(ref.port);
+    c.wLength = sizeof buf;
+    c.timeout = 500;
+    c.data = buf;
+    int n = ioctl(fd.get(), USBDEVFS_CONTROL, &c);
+    if (n != int(sizeof buf)) {
+        if (why) *why = "reading the status of USB port " + ref.path + " failed: " + (n < 0 ? errno_str() : std::string("short answer"));
+        return PortState::unknown;
+    }
+    uint16_t status = uint16_t(buf[0] | (buf[1] << 8));
+    return port_state_from(status, exists(paths.devices + "/" + ref.path));
+}
+
+Status rebind_hub(const std::string& hub_interface, const UsbPaths& paths) {
+    std::string bound = paths.devices + "/" + hub_interface + "/driver";
+    Status un = write_text(paths.hub_driver + "/unbind", hub_interface);
+    if (!un && exists(bound)) return err("the USB hub " + hub_interface + " could not be reset (" + un.error() + ")" + root_hint("reset USB ports (its service does)"));
+    Status st;
+    for (int i = 0; i < 5; ++i) {
+        st = write_text(paths.hub_driver + "/bind", hub_interface);
+        if (exists(bound)) return {};
+        usleep(100000);
+    }
+    return err("the USB hub " + hub_interface + " could not be bound again (" + st.error() + "): every device on it stays off until it is: echo " + hub_interface + " > " +
+               paths.hub_driver + "/bind, or reboot");
+}
+
+Nanos UsbRecovery::wait_for(int attempts) {
+    static const int steps[] = {10, 20, 40, 80, 160};
+    if (attempts >= 0 && attempts < 5) return Nanos(steps[attempts]) * kSec;
+    return 300 * kSec;
+}
+
+bool UsbRecovery::observe(Nanos now, PortState state) {
+    if (state == PortState::empty) {
+        if (!empty_) {
+            empty_ = true;
+            empty_since_ = now;
+        }
+        if (now - empty_since_ >= kEmptyForgets) attempts_ = 0;
+    } else {
+        empty_ = false;
+    }
+    if (state != PortState::stuck) {
+        stuck_ = false;
+        return false;
+    }
+    if (!stuck_) {
+        stuck_ = true;
+        stuck_since_ = now;
+    }
+    return now - stuck_since_ >= wait_for(attempts_);
+}
+
+void UsbRecovery::reset_done(Nanos now) {
+    if (attempts_ < 1000) ++attempts_;
+    stuck_ = true;
+    stuck_since_ = now;
+}
+
+void UsbRecovery::connected() {
+    stuck_ = false;
+    empty_ = false;
+    attempts_ = 0;
+}
+
+UsbResetter::~UsbResetter() {
+    if (!thread_.joinable()) return;
+    if (running()) thread_.detach();
+    else thread_.join();
+}
+
+void UsbResetter::begin(std::string hub_interface, UsbPaths paths) {
+    if (thread_.joinable()) thread_.join();
+    auto job = std::make_shared<Job>();
+    job_ = job;
+    thread_ = std::thread([job, hub_interface, paths] {
+        set_thread_name("usb-reset");
+        Nanos t0 = monotonic_ns();
+        try {
+            job->result = rebind_hub(hub_interface, paths);
+        } catch (const std::exception& e) {
+            job->result = err(std::string("internal error: ") + e.what());
+        }
+        job->took = monotonic_ns() - t0;
+        job->done.store(true);
+    });
+}
+
+bool UsbResetter::finished(Status& result, Nanos& took) {
+    if (!job_ || !job_->done.load()) return false;
+    if (thread_.joinable()) thread_.join();
+    result = job_->result;
+    took = job_->took;
+    job_.reset();
+    return true;
+}
+
+bool UsbResetter::wait(Nanos max) {
+    Nanos until = monotonic_ns() + max;
+    while (running()) {
+        if (monotonic_ns() >= until) return false;
+        usleep(10000);
+    }
+    return true;
+}
+
+}

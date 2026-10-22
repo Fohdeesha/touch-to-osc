@@ -38,6 +38,10 @@ TEST_CASE("the minimal config loads with the documented defaults") {
     CHECK(d.grab);
     CHECK(d.silence_ms == 200);
     CHECK(d.enabled);
+    CHECK(d.usb_recovery);
+    auto off = parse_config(std::string(kBase) + "usb_recovery = false\n", "t.toml");
+    REQUIRE(off);
+    CHECK_FALSE(off->devices[0].usb_recovery);
 }
 
 TEST_CASE("config.example.toml is valid") {

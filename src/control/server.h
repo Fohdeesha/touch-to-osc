@@ -4,6 +4,7 @@
 #include "config/settings.h"
 #include "control/requests.h"
 #include "control/shared.h"
+#include "control/usb.h"
 #include "core/fd.h"
 #include "core/log.h"
 #include "input/probe.h"
@@ -18,7 +19,8 @@
 
 namespace tto {
 
-constexpr int32_t kOscApi = 2;
+constexpr int32_t kOscApi = 4;
+constexpr int kRestartExit = 100;
 
 class Server {
 public:
@@ -99,6 +101,11 @@ private:
     void prune(Nanos now);
     void send_bundled(const Peer& to, const std::vector<osc::Message>& msgs);
     std::string disabled_reason(size_t index) const;
+    std::optional<UsbPortRef> usb_port_of(size_t index) const;
+    void watch_usb(Nanos now);
+    void finish_usb_reset(Nanos now);
+    void start_usb_reset(size_t index, const UsbPortRef& ref, const std::string& asked_by);
+    std::string usb_reason(size_t index) const;
     void send_bye();
     void report_destinations(Nanos now);
 
@@ -136,6 +143,19 @@ private:
     Nanos dirty_since_ = 0;
     bool settings_dirty_ = false;
     bool status_dirty_ = true;
+    bool restart_requested_ = false;
+    UsbPaths usb_paths_;
+    UsbResetter usb_worker_;
+    size_t usb_worker_dev_ = 0;
+    bool usb_worker_manual_ = false;
+    std::string usb_worker_target_;
+    std::string usb_problem_;
+    std::vector<UsbRecovery> usb_rec_;
+    std::vector<std::string> usb_last_port_;
+    std::vector<PortState> usb_state_;
+    std::vector<bool> usb_watching_;
+    std::vector<std::string> usb_why_;
+    std::vector<uint64_t> usb_resets_;
     UniqueFd osc_fd_;
     UniqueFd send_fd_;
     UniqueFd notify_fd_;

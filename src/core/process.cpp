@@ -1,6 +1,7 @@
 #include "core/process.h"
 
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +42,14 @@ void sd_notify_msg(const char* msg) {
 bool sd_watchdog_enabled() {
     const char* usec = std::getenv("WATCHDOG_USEC");
     return usec && std::atoll(usec) > 0;
+}
+
+std::string self_exe_path() {
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n <= 0) return {};
+    buf[n] = '\0';
+    return buf;
 }
 
 }

@@ -116,6 +116,7 @@ void device_table(StrictTable& o, DeviceConfig& d) {
     long long silence = 0;
     if (o.integer("silence_ms", silence, -100000, 100000) && o.check("silence_ms", check_silence(silence))) d.silence_ms = int(silence);
     o.boolean("enabled", d.enabled);
+    o.boolean("usb_recovery", d.usb_recovery);
     if (o.ok() && d.label.empty()) d.label = d.id;
 }
 

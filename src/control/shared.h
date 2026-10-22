@@ -53,6 +53,7 @@ struct DevInfo {
     char name[128] = {};
     char usb[192] = {};
     char port[64] = {};
+    char usb_port[64] = {};
     char reason[320] = {};
 };
 
@@ -91,6 +92,7 @@ struct DeviceShared {
     std::atomic<bool> want_enabled{true};
     std::atomic<int32_t> silence_ms{0};
     std::atomic<bool> stop{false};
+    std::atomic<bool> restarting{false};
     std::mutex cfg_mutex;
     DeviceConfig next_cfg;
     std::atomic<uint32_t> cfg_gen{0};

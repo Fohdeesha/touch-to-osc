@@ -80,3 +80,8 @@ calibration = []
 silence_ms = 200
 # false starts with the device turned off (a command can turn it on).
 enabled = true
+# While this screen is gone, watch the USB port it was last on (or port, above): when
+# something is plugged in there that the kernel has given up on for 10 s, reset the USB hub
+# of that port so the kernel tries again. On a port of the computer itself that drops every
+# device on that USB bus for a moment. See "USB recovery" in the README.
+usb_recovery = true

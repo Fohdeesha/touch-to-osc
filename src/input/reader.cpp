@@ -277,6 +277,7 @@ bool DeviceReader::open_device() {
     copy_text(info_.name, sizeof info_.name, printable(pick->name));
     copy_text(info_.usb, sizeof info_.usb, usb_identity(*pick));
     copy_text(info_.port, sizeof info_.port, pick->usb_port.empty() ? printable(pick->phys) : pick->usb_port);
+    copy_text(info_.usb_port, sizeof info_.usb_port, pick->usb_port);
     return true;
 }
 
@@ -561,8 +562,9 @@ void DeviceReader::session() {
         if (r > 0 && p[1].revents) {
             drain_fd(p[1].fd);
             if (sh_.stop.load()) {
-                int n = cancel("stopping");
-                if (n) event(EventKind::device, log::Level::notice, "%s: stopping; %d contact%s cancelled", cfg_.id.c_str(), n, plural(n));
+                const char* why = sh_.restarting.load() ? "restarting" : "stopping";
+                int n = cancel(why);
+                if (n) event(EventKind::device, log::Level::notice, "%s: %s; %d contact%s cancelled", cfg_.id.c_str(), why, n, plural(n));
                 close_device();
                 return;
             }

@@ -41,6 +41,7 @@ struct DeviceConfig {
     std::vector<double> calibration;
     int silence_ms = 200;
     bool enabled = true;
+    bool usb_recovery = true;
 
     std::string match_text() const;
     std::string mirror_text() const;
