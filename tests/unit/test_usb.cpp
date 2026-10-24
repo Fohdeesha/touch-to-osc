@@ -15,12 +15,19 @@ using namespace tto;
 
 namespace {
 
-std::string temp_dir() {
-    char tmpl[] = "/tmp/tto-usb-XXXXXX";
-    char* d = mkdtemp(tmpl);
-    REQUIRE(d);
-    return d;
-}
+struct TempDir {
+    std::string path;
+    TempDir() {
+        char tmpl[] = "/tmp/tto-usb-XXXXXX";
+        char* d = mkdtemp(tmpl);
+        REQUIRE(d);
+        path = d;
+    }
+    ~TempDir() {
+        int rc = std::system(("rm -rf " + path).c_str());
+        (void)rc;
+    }
+};
 
 void touch(const std::string& path) { std::ofstream(path).put('\0'); }
 
@@ -122,7 +129,8 @@ TEST_CASE("the port status bits: a port the kernel is still setting up is not st
 }
 
 TEST_CASE("port state from sysfs: a set-up device, and a hub that is not there") {
-    std::string root = temp_dir();
+    TempDir dir;
+    const std::string& root = dir.path;
     UsbPaths p;
     p.devices = root;
     p.dev = root + "/dev";
@@ -133,12 +141,11 @@ TEST_CASE("port state from sysfs: a set-up device, and a hub that is not there")
     CHECK(why.find("usb3") != std::string::npos);
     mkdir((root + "/3-3").c_str(), 0755);
     CHECK(read_port_state(*ref, p, &why) == PortState::enumerated);
-    int rc = std::system(("rm -rf " + root).c_str());
-    (void)rc;
 }
 
 TEST_CASE("rebinding writes unbind then bind, and says so when the hub is not bound again") {
-    std::string root = temp_dir();
+    TempDir dir;
+    const std::string& root = dir.path;
     UsbPaths p;
     p.devices = root + "/devices";
     p.hub_driver = root + "/hub";
@@ -156,12 +163,11 @@ TEST_CASE("rebinding writes unbind then bind, and says so when the hub is not bo
     REQUIRE_FALSE(st);
     CHECK(st.error().find("could not be bound again (the kernel did not take it)") != std::string::npos);
     CHECK(st.error().find("echo 3-0:1.0 > " + p.hub_driver + "/bind") != std::string::npos);
-    int rc = std::system(("rm -rf " + root).c_str());
-    (void)rc;
 }
 
 TEST_CASE("an unbind that fails while the hub stays bound is an error and nothing is bound") {
-    std::string root = temp_dir();
+    TempDir dir;
+    const std::string& root = dir.path;
     UsbPaths p;
     p.devices = root + "/devices";
     p.hub_driver = root + "/hub";
@@ -174,12 +180,11 @@ TEST_CASE("an unbind that fails while the hub stays bound is an error and nothin
     REQUIRE_FALSE(st);
     CHECK_MESSAGE(st.error().find("the USB hub 3-0:1.0 could not be reset (cannot open " + p.hub_driver + "/unbind") == 0, st.error());
     CHECK(slurp(p.hub_driver + "/bind").find("3-0:1.0") == std::string::npos);
-    int rc = std::system(("rm -rf " + root).c_str());
-    (void)rc;
 }
 
 TEST_CASE("a finished reset counts as busy until its result is collected") {
-    std::string root = temp_dir();
+    TempDir dir;
+    const std::string& root = dir.path;
     UsbPaths p;
     p.devices = root + "/devices";
     p.hub_driver = root + "/hub";
@@ -204,8 +209,6 @@ TEST_CASE("a finished reset counts as busy until its result is collected") {
     CHECK(done.took >= 0);
     CHECK_FALSE(w.busy());
     CHECK_FALSE(w.finished(done));
-    int rc = std::system(("rm -rf " + root).c_str());
-    (void)rc;
 }
 
 TEST_CASE("a port check that had to wait for the kernel reads as being set up") {
@@ -233,7 +236,8 @@ TEST_CASE("a port check that had to wait for the kernel reads as being set up") 
 }
 
 TEST_CASE("a reset held up in the kernel does not hold up stopping") {
-    std::string root = temp_dir();
+    TempDir dir;
+    const std::string& root = dir.path;
     UsbPaths p;
     p.devices = root + "/devices";
     p.hub_driver = root + "/hub";
@@ -257,6 +261,4 @@ TEST_CASE("a reset held up in the kernel does not hold up stopping") {
     stopping.join();
     usleep(800000);
     if (fd >= 0) close(fd);
-    int rc = std::system(("rm -rf " + root).c_str());
-    (void)rc;
 }
