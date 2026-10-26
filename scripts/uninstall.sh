@@ -11,7 +11,7 @@ if dpkg-query -W -f='${Status}' touch-to-osc 2> /dev/null | grep -q "ok installe
 fi
 
 systemctl disable --now touch-to-osc 2> /dev/null || true
-rm -f /usr/local/lib/systemd/system/touch-to-osc.service /usr/local/bin/touch-to-osc
+rm -f /usr/local/lib/systemd/system/touch-to-osc.service /usr/local/bin/touch-to-osc /usr/local/bin/touch-to-osc-watch
 rm -rf /usr/local/share/touch-to-osc /usr/local/share/doc/touch-to-osc
 old=/etc/systemd/system/touch-to-osc.service
 if [ -f "$old" ] && grep -q '^ExecStart=/usr/local/bin/touch-to-osc ' "$old"; then

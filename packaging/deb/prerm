@@ -2,6 +2,11 @@
 set -e
 
 if [ "$1" = remove ]; then
+    # remembered so that installing it again enables it again; purge removes the folder
+    if systemctl is-enabled --quiet touch-to-osc.service > /dev/null 2>&1; then
+        install -d -m 0755 /var/lib/touch-to-osc
+        touch /var/lib/touch-to-osc/enabled-before-remove
+    fi
     if [ -d /run/systemd/system ]; then
         systemctl stop touch-to-osc.service || true
     fi

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "config/config.h"
+#include "config/file_writer.h"
 #include "config/settings.h"
+#include "config/state.h"
 #include "control/requests.h"
 #include "control/shared.h"
 #include "control/usb.h"
@@ -21,10 +23,20 @@ namespace tto {
 
 constexpr int32_t kOscApi = 5;
 constexpr int kRestartExit = 100;
+constexpr int kCheckSettingsRefused = 5;
+constexpr const char* kRestartedBy = "TTO_RESTARTED_BY";
+constexpr const char* kKeptLeases = "TTO_LEASES";
+
+struct Launch {
+    std::string config_path;
+    std::string config_text;
+    std::string config_problem;
+    std::string exe;
+};
 
 class Server {
 public:
-    Server(Config base, SettingsLoad settings, std::string config_path, SysPaths paths = SysPaths());
+    Server(Config base, SettingsLoad settings, Launch launch, SysPaths paths = SysPaths());
     ~Server();
     int run();
 
@@ -52,6 +64,11 @@ private:
         size_t device;
         UsbPortRef ref;
         std::string by;
+    };
+    struct Asked {
+        Peer peer;
+        int32_t seq = 0;
+        std::vector<uint8_t> command;
     };
     struct DevStats {
         std::deque<std::pair<Nanos, uint32_t>> latency;
@@ -92,6 +109,14 @@ private:
     Status commit(Overrides next, const Peer& peer, const std::string& what);
     void apply_effects(const Config& old);
     void save_settings();
+    void save_state();
+    void collect_writes(Nanos now);
+    void remember_port(size_t index);
+    void repair_usb_hub();
+    void keep_restart_reply();
+    void restore_leases();
+    bool wait_usb_worker(Nanos max, bool stopping);
+    Status restart_check();
     void refuse(const Peer& peer, const std::string& address, const std::string& why, bool limited);
 
     std::vector<Target> targets() const;
@@ -126,12 +151,20 @@ private:
 
     Config base_;
     Overrides over_;
+    Overrides over_values_;
     Config cfg_;
     std::vector<std::string> settings_notes_;
     std::string settings_load_problem_;
     std::string settings_problem_;
     std::string settings_file_;
     std::string config_path_;
+    std::string config_text_;
+    std::string config_problem_;
+    std::string exe_;
+    std::string state_path_;
+    State state_;
+    std::string state_problem_;
+    FileWriter writer_;
     SysPaths paths_;
     std::string prefix_;
     std::string host_;
@@ -162,6 +195,10 @@ private:
     size_t usb_worker_dev_ = 0;
     bool usb_worker_manual_ = false;
     std::string usb_worker_target_;
+    std::string usb_worker_hub_;
+    std::optional<Asked> asking_;
+    std::optional<Asked> restart_asked_;
+    std::vector<std::pair<Peer, int>> carried_leases_;
     std::string usb_problem_;
     std::vector<UsbRecovery> usb_rec_;
     std::vector<std::string> usb_last_port_;

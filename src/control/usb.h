@@ -38,7 +38,11 @@ enum class PortState { unknown, empty, setting_up, enumerated, stuck };
 const char* port_state_text(PortState s);
 PortState port_state_from(uint16_t port_status, bool device_present);
 PortState read_port_state(const UsbPortRef& ref, const UsbPaths& paths, std::string* why);
-Status rebind_hub(const std::string& hub_interface, const UsbPaths& paths);
+Status rebind_hub(const std::string& hub_interface, const UsbPaths& paths, const std::string& marker = std::string());
+Status bind_hub_left_unbound(const std::string& marker, const UsbPaths& paths, std::string* done);
+std::vector<std::string> usb_neighbours(const UsbPortRef& ref, const UsbPaths& paths);
+std::string usb_target_text(const UsbPortRef& ref);
+std::string usb_reset_reach(const UsbPortRef& ref, const UsbPaths& paths);
 
 class UsbRecovery {
 public:
@@ -56,6 +60,10 @@ private:
     int attempts_ = 0;
 };
 
+// a reset of a hub resets every port on it: each screen watched there (hub interface in `watched`, "" for none) waits as
+// if it had asked
+void reset_done_on_hub(std::vector<UsbRecovery>& recs, const std::vector<std::string>& watched, size_t asked, const std::string& hub, Nanos now);
+
 constexpr Nanos kSlowPortCheck = 200 * kMs;
 
 struct UsbReading {
@@ -72,6 +80,7 @@ public:
     struct Done {
         bool reset = false;
         std::vector<UsbReading> readings;
+        std::vector<std::string> dropped;
         Status result;
         Nanos took = 0;
     };
@@ -82,8 +91,9 @@ public:
     UsbWorker& operator=(const UsbWorker&) = delete;
 
     const UsbPaths& paths() const { return paths_; }
+    void set_marker(std::string marker) { marker_ = std::move(marker); }
     void check(std::vector<std::pair<size_t, UsbPortRef>> ports, Nanos now);
-    void reset(std::string hub_interface, Nanos now);
+    void reset(const UsbPortRef& ref, Nanos now);
     bool busy() const { return job_ != nullptr; }
     bool resetting() const { return job_ && job_->reset; }
     Nanos busy_since() const { return job_ ? job_->started : 0; }
@@ -102,6 +112,7 @@ private:
 
     UsbPaths paths_;
     PortReader reader_;
+    std::string marker_;
     std::shared_ptr<Job> job_;
     std::thread thread_;
 };

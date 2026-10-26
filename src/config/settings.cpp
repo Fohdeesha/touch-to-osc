@@ -4,22 +4,69 @@
 #include "config/strict_toml.h"
 #include "core/process.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace tto {
 
 namespace {
 
-const char* const kDeviceKeys[] = {"label", "enabled", "rotation", "mirror", "calibration", "aspect", "silence_ms", "grab", "match_usb", "match_serial", "match_port", "usb_recovery"};
-
-template <typename T>
-void drop_if(std::optional<T>& v, const T& base) {
-    if (v && *v == base) v.reset();
+template <typename F, typename... X>
+void each(F&& f, X&... x) {
+    f("label", x.label...);
+    f("enabled", x.enabled...);
+    f("rotation", x.rotation...);
+    f("mirror", x.mirror...);
+    f("calibration", x.calibration...);
+    f("aspect", x.aspect...);
+    f("silence_ms", x.silence_ms...);
+    f("grab", x.grab...);
+    f("match_usb", x.match_usb...);
+    f("match_serial", x.match_serial...);
+    f("match_port", x.match_port...);
+    f("usb_recovery", x.usb_recovery...);
 }
+
+void put(toml::table& t, const char* k, const std::string& v) { t.insert(k, v); }
+void put(toml::table& t, const char* k, bool v) { t.insert(k, v); }
+void put(toml::table& t, const char* k, int v) { t.insert(k, int64_t(v)); }
+void put(toml::table& t, const char* k, double v) { t.insert(k, v); }
+void put(toml::table& t, const char* k, const std::vector<double>& v) {
+    toml::array a;
+    for (double x : v) a.push_back(x);
+    t.insert(k, std::move(a));
+}
+
+std::string value_text(const std::string& v) { return "\"" + v + "\""; }
+std::string value_text(bool v) { return v ? "true" : "false"; }
+std::string value_text(int v) { return std::to_string(v); }
+std::string value_text(double v) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%g", v);
+    return b;
+}
+std::string value_text(const std::vector<double>& v) {
+    std::string s = "[";
+    for (double x : v) s += (s.size() > 1 ? ", " : "") + value_text(x);
+    return s + "]";
+}
+
+toml::table device_table(const DeviceOverrides& x) {
+    toml::table d;
+    each(
+        [&](const char* k, const auto& v) {
+            if (v) put(d, k, *v);
+        },
+        x);
+    return d;
+}
+
+bool has(const std::vector<std::string>& v, const std::string& s) { return std::find(v.begin(), v.end(), s) != v.end(); }
 
 void parse_device(StrictTable& d, DeviceOverrides& x) {
     std::string s;
@@ -41,13 +88,77 @@ void parse_device(StrictTable& d, DeviceOverrides& x) {
     if (d.boolean("usb_recovery", b)) x.usb_recovery = b;
 }
 
+bool parse_destinations(StrictTable& root, const char* key, std::vector<DestinationConfig>& out) {
+    const toml::node* v = root.take(key);
+    if (!v) return false;
+    if (!v->is_array()) return root.fail(key, "must be a list of tables");
+    if (v->as_array()->size() > kMaxDestinations) return root.fail(key, "at most " + std::to_string(kMaxDestinations) + " allowed");
+    std::vector<DestinationConfig> list;
+    std::set<std::string> seen;
+    size_t index = 0;
+    for (auto&& e : *v->as_array()) {
+        ++index;
+        StrictTable d(&e, std::string(key) + "[" + std::to_string(index) + "]");
+        DestinationConfig dc;
+        std::string address;
+        if (d.str("address", address, 64, false)) d.check("address", check_destination(address, dc.address));
+        if (d.ok() && address.empty()) d.fail("address", "is missing");
+        d.boolean("touches", dc.touches);
+        d.boolean("status", dc.status);
+        if (d.ok() && !dc.touches && !dc.status) d.fail("", "sends nothing");
+        if (d.ok() && !seen.insert(dc.address.text()).second) d.fail("address", dc.address.text() + " is listed twice");
+        d.finish();
+        if (!d.ok()) {
+            root.adopt(d.error());
+            return false;
+        }
+        list.push_back(dc);
+    }
+    out = std::move(list);
+    return root.ok();
+}
+
+bool parse_ips(StrictTable& root, const char* key, std::vector<std::string>& out) {
+    std::vector<std::string> ips;
+    if (!root.strings(key, ips, kMaxAllowedIps, 64)) return false;
+    for (const auto& ip : ips) {
+        if (!root.check(key, check_ipv4(ip))) return false;
+    }
+    out = std::move(ips);
+    return true;
+}
+
+void parse_config_values(const toml::node* v, Overrides& out) {
+    Overrides vals;
+    StrictTable t(v, "config_values");
+    std::string level;
+    if (t.str("log_level", level, 16, false) && t.check("log_level", check_log_level(level))) vals.log_level = level;
+    if (const toml::node* devs = t.take("device"); devs && devs->is_table()) {
+        for (auto&& [k, node] : *devs->as_table()) {
+            std::string id(k.str());
+            StrictTable d(&node, "config_values.device." + id);
+            DeviceOverrides x;
+            if (d.ok()) parse_device(d, x);
+            d.finish();
+            if (d.ok() && !x.empty()) vals.devices[id] = x;
+        }
+    }
+    t.finish();
+    if (t.ok()) out = std::move(vals);
+}
+
 }
 
 bool DeviceOverrides::empty() const {
-    return !label && !enabled && !rotation && !mirror && !calibration && !aspect && !silence_ms && !grab && !match_usb && !match_serial && !match_port && !usb_recovery;
+    bool any = false;
+    each([&](const char*, const auto& v) { any = any || v.has_value(); }, *this);
+    return !any;
 }
 
-bool Overrides::empty() const { return !log_level && !allowed_ips && !saved_destinations && devices.empty(); }
+bool Overrides::empty() const {
+    return !log_level && allowed_added.empty() && allowed_removed.empty() && destinations_added.empty() && destinations_removed.empty() && devices.empty() &&
+           unused_devices.empty();
+}
 
 std::string destination_text(const DestinationConfig& d) {
     std::string s = d.address.text();
@@ -56,11 +167,43 @@ std::string destination_text(const DestinationConfig& d) {
     return s;
 }
 
+DeviceOverrides device_values(const DeviceConfig& d) {
+    DeviceOverrides v;
+    v.label = d.label;
+    v.enabled = d.enabled;
+    v.rotation = d.rotation;
+    v.mirror = d.mirror_text();
+    v.calibration = d.calibration;
+    v.aspect = d.aspect;
+    v.silence_ms = d.silence_ms;
+    v.grab = d.grab;
+    v.match_usb = d.usb_setting();
+    v.match_serial = d.serial;
+    v.match_port = d.port;
+    v.usb_recovery = d.usb_recovery;
+    return v;
+}
+
 Config apply_overrides(const Config& base, const Overrides& o) {
     Config c = base;
     if (o.log_level) c.log.level = *o.log_level;
-    if (o.allowed_ips) c.osc.allowed_ips = *o.allowed_ips;
-    if (o.saved_destinations) c.destinations = *o.saved_destinations;
+    std::vector<std::string> ips;
+    for (const auto& ip : base.osc.allowed_ips) {
+        if (!has(o.allowed_removed, ip)) ips.push_back(ip);
+    }
+    for (const auto& ip : o.allowed_added) {
+        if (!has(ips, ip) && ips.size() < kMaxAllowedIps) ips.push_back(ip);
+    }
+    c.osc.allowed_ips = ips;
+    std::vector<DestinationConfig> dests;
+    for (const auto& d : base.destinations) {
+        if (!has(o.destinations_removed, d.address.text())) dests.push_back(d);
+    }
+    for (const auto& d : o.destinations_added) {
+        bool listed = std::any_of(dests.begin(), dests.end(), [&](const DestinationConfig& x) { return x.address.text() == d.address.text(); });
+        if (!listed && dests.size() < kMaxDestinations) dests.push_back(d);
+    }
+    c.destinations = dests;
     for (auto& d : c.devices) {
         auto it = o.devices.find(d.id);
         if (it == o.devices.end()) continue;
@@ -86,25 +229,42 @@ Config apply_overrides(const Config& base, const Overrides& o) {
 }
 
 void drop_unchanged(Overrides& o, const Config& base) {
-    drop_if(o.log_level, base.log.level);
-    drop_if(o.allowed_ips, base.osc.allowed_ips);
-    drop_if(o.saved_destinations, base.destinations);
+    if (o.log_level && *o.log_level == base.log.level) o.log_level.reset();
+    const auto& allowed = base.osc.allowed_ips;
+    std::vector<std::string> added;
+    for (const auto& ip : o.allowed_added) {
+        if (!has(allowed, ip) && !has(added, ip)) added.push_back(ip);
+    }
+    o.allowed_added = added;
+    o.allowed_removed.erase(std::remove_if(o.allowed_removed.begin(), o.allowed_removed.end(), [&](const std::string& ip) { return !has(allowed, ip); }),
+                            o.allowed_removed.end());
+    std::vector<DestinationConfig> dests;
+    for (const auto& d : o.destinations_added) {
+        auto same = std::find(base.destinations.begin(), base.destinations.end(), d);
+        if (same != base.destinations.end()) {
+            o.destinations_removed.erase(std::remove(o.destinations_removed.begin(), o.destinations_removed.end(), d.address.text()), o.destinations_removed.end());
+            continue;
+        }
+        dests.push_back(d);
+    }
+    o.destinations_added = dests;
+    o.destinations_removed.erase(std::remove_if(o.destinations_removed.begin(), o.destinations_removed.end(),
+                                                [&](const std::string& a) {
+                                                    return std::none_of(base.destinations.begin(), base.destinations.end(),
+                                                                        [&](const DestinationConfig& d) { return d.address.text() == a; });
+                                                }),
+                                 o.destinations_removed.end());
     for (const auto& d : base.devices) {
         auto it = o.devices.find(d.id);
         if (it == o.devices.end()) continue;
         DeviceOverrides& x = it->second;
+        DeviceOverrides now = device_values(d);
         if (x.label && (x.label->empty() ? d.id : *x.label) == d.label) x.label.reset();
-        drop_if(x.enabled, d.enabled);
-        drop_if(x.rotation, d.rotation);
-        drop_if(x.mirror, d.mirror_text());
-        drop_if(x.calibration, d.calibration);
-        drop_if(x.aspect, d.aspect);
-        drop_if(x.silence_ms, d.silence_ms);
-        drop_if(x.grab, d.grab);
-        drop_if(x.match_usb, d.usb_setting());
-        drop_if(x.match_serial, d.serial);
-        drop_if(x.match_port, d.port);
-        drop_if(x.usb_recovery, d.usb_recovery);
+        each(
+            [](const char* k, auto& over, const auto& cur) {
+                if (std::string(k) != "label" && over && cur && *over == *cur) over.reset();
+            },
+            x, now);
         if (x.empty()) o.devices.erase(it);
     }
 }
@@ -112,16 +272,15 @@ void drop_unchanged(Overrides& o, const Config& base) {
 std::vector<std::string> override_names(const Overrides& o) {
     std::vector<std::string> out;
     if (o.log_level) out.push_back("log_level");
-    if (o.allowed_ips) out.push_back("allowed_ips");
-    if (o.saved_destinations) out.push_back("saved_destinations");
+    if (!o.allowed_added.empty() || !o.allowed_removed.empty()) out.push_back("allowed_ips");
+    if (!o.destinations_added.empty() || !o.destinations_removed.empty()) out.push_back("saved_destinations");
     for (const auto& [id, x] : o.devices) {
         std::string b = "device/" + id + "/";
-        bool set[] = {bool(x.label), bool(x.enabled), bool(x.rotation), bool(x.mirror), bool(x.calibration), bool(x.aspect),
-                      bool(x.silence_ms), bool(x.grab), bool(x.match_usb), bool(x.match_serial), bool(x.match_port), bool(x.usb_recovery)};
-        static_assert(sizeof set / sizeof set[0] == sizeof kDeviceKeys / sizeof kDeviceKeys[0], "one name per device setting");
-        for (size_t i = 0; i < sizeof set / sizeof set[0]; ++i) {
-            if (set[i]) out.push_back(b + kDeviceKeys[i]);
-        }
+        each(
+            [&](const char* k, const auto& v) {
+                if (v) out.push_back(b + k);
+            },
+            x);
     }
     return out;
 }
@@ -133,72 +292,95 @@ bool forget_override(Overrides& o, const std::string& name) {
         return had;
     };
     if (name == "log_level") return reset(o.log_level);
-    if (name == "allowed_ips") return reset(o.allowed_ips);
-    if (name == "saved_destinations") return reset(o.saved_destinations);
+    if (name == "allowed_ips") {
+        bool had = !o.allowed_added.empty() || !o.allowed_removed.empty();
+        o.allowed_added.clear();
+        o.allowed_removed.clear();
+        return had;
+    }
+    if (name == "saved_destinations") {
+        bool had = !o.destinations_added.empty() || !o.destinations_removed.empty();
+        o.destinations_added.clear();
+        o.destinations_removed.clear();
+        return had;
+    }
     if (name.rfind("device/", 0) != 0) return false;
     size_t slash = name.find('/', 7);
-    if (slash == std::string::npos) return false;
-    auto it = o.devices.find(name.substr(7, slash - 7));
+    std::string id = name.substr(7, slash == std::string::npos ? std::string::npos : slash - 7);
+    if (slash == std::string::npos) return o.devices.erase(id) + o.unused_devices.erase(id) > 0;
+    auto it = o.devices.find(id);
     if (it == o.devices.end()) return false;
     std::string key = name.substr(slash + 1);
-    DeviceOverrides& x = it->second;
     bool had = false;
-    if (key == "label") had = reset(x.label);
-    else if (key == "enabled") had = reset(x.enabled);
-    else if (key == "rotation") had = reset(x.rotation);
-    else if (key == "mirror") had = reset(x.mirror);
-    else if (key == "calibration") had = reset(x.calibration);
-    else if (key == "aspect") had = reset(x.aspect);
-    else if (key == "silence_ms") had = reset(x.silence_ms);
-    else if (key == "grab") had = reset(x.grab);
-    else if (key == "match_usb") had = reset(x.match_usb);
-    else if (key == "match_serial") had = reset(x.match_serial);
-    else if (key == "match_port") had = reset(x.match_port);
-    else if (key == "usb_recovery") had = reset(x.usb_recovery);
-    if (x.empty()) o.devices.erase(it);
+    each(
+        [&](const char* k, auto& v) {
+            if (key == k) had = reset(v);
+        },
+        it->second);
+    if (it->second.empty()) o.devices.erase(it);
     return had;
 }
 
-std::string settings_text(const Overrides& o, const std::string& config_path) {
+void note_config_values(const Overrides& before, const Overrides& after, const Config& file, Overrides& values) {
+    if (!after.log_level) values.log_level.reset();
+    else if (after.log_level != before.log_level) values.log_level = file.log.level;
+    for (auto it = values.devices.begin(); it != values.devices.end();) {
+        if (!after.devices.count(it->first) && !after.unused_devices.count(it->first)) it = values.devices.erase(it);
+        else ++it;
+    }
+    for (const auto& [id, x] : after.devices) {
+        auto f = std::find_if(file.devices.begin(), file.devices.end(), [&](const DeviceConfig& d) { return d.id == id; });
+        DeviceOverrides now = f == file.devices.end() ? DeviceOverrides() : device_values(*f);
+        auto b = before.devices.find(id);
+        DeviceOverrides was = b == before.devices.end() ? DeviceOverrides() : b->second;
+        DeviceOverrides& v = values.devices[id];
+        each(
+            [](const char*, const auto& over, const auto& old, const auto& file_now, auto& slot) {
+                if (!over) slot.reset();
+                else if (over != old) slot = file_now;
+            },
+            x, was, now, v);
+        if (v.empty()) values.devices.erase(id);
+    }
+}
+
+std::string settings_text(const Overrides& o, const Overrides& values, const std::string& config_path) {
     toml::table t;
     if (o.log_level) t.insert("log_level", *o.log_level);
-    if (o.allowed_ips) {
+    auto strings = [](const std::vector<std::string>& v) {
         toml::array a;
-        for (const auto& ip : *o.allowed_ips) a.push_back(ip);
-        t.insert("allowed_ips", std::move(a));
-    }
-    if (o.saved_destinations) {
+        for (const auto& s : v) a.push_back(s);
+        return a;
+    };
+    if (!o.allowed_added.empty()) t.insert("allowed_ips_added", strings(o.allowed_added));
+    if (!o.allowed_removed.empty()) t.insert("allowed_ips_removed", strings(o.allowed_removed));
+    if (!o.destinations_added.empty()) {
         toml::array a;
-        for (const auto& d : *o.saved_destinations) a.push_back(toml::table{{"address", d.address.text()}, {"touches", d.touches}, {"status", d.status}});
-        t.insert("saved_destinations", std::move(a));
+        for (const auto& d : o.destinations_added) a.push_back(toml::table{{"address", d.address.text()}, {"touches", d.touches}, {"status", d.status}});
+        t.insert("saved_destinations_added", std::move(a));
     }
-    if (!o.devices.empty()) {
+    if (!o.destinations_removed.empty()) t.insert("saved_destinations_removed", strings(o.destinations_removed));
+    if (!o.devices.empty() || !o.unused_devices.empty()) {
         toml::table devices;
-        for (const auto& [id, x] : o.devices) {
-            toml::table d;
-            if (x.label) d.insert("label", *x.label);
-            if (x.enabled) d.insert("enabled", *x.enabled);
-            if (x.rotation) d.insert("rotation", int64_t(*x.rotation));
-            if (x.mirror) d.insert("mirror", *x.mirror);
-            if (x.calibration) {
-                toml::array a;
-                for (double v : *x.calibration) a.push_back(v);
-                d.insert("calibration", std::move(a));
-            }
-            if (x.aspect) d.insert("aspect", *x.aspect);
-            if (x.silence_ms) d.insert("silence_ms", int64_t(*x.silence_ms));
-            if (x.grab) d.insert("grab", *x.grab);
-            if (x.match_usb) d.insert("match_usb", *x.match_usb);
-            if (x.match_serial) d.insert("match_serial", *x.match_serial);
-            if (x.match_port) d.insert("match_port", *x.match_port);
-            if (x.usb_recovery) d.insert("usb_recovery", *x.usb_recovery);
-            devices.insert(id, std::move(d));
-        }
+        for (const auto& [id, x] : o.devices) devices.insert(id, device_table(x));
+        for (const auto& [id, x] : o.unused_devices) devices.insert(id, device_table(x));
         t.insert("device", std::move(devices));
+    }
+    if (values.log_level || !values.devices.empty()) {
+        toml::table v;
+        if (values.log_level) v.insert("log_level", *values.log_level);
+        if (!values.devices.empty()) {
+            toml::table devices;
+            for (const auto& [id, x] : values.devices) devices.insert(id, device_table(x));
+            v.insert("device", std::move(devices));
+        }
+        t.insert("config_values", std::move(v));
     }
     std::ostringstream os;
     os << "# Written by touch-to-osc: the settings changed over OSC, on top of " << config_path << ".\n"
-       << "# They win over that file. Send <prefix>/settings/forget to drop them (or delete this file and restart).\n\n"
+       << "# They win over that file, unless the file's own value was changed after the setting was saved here\n"
+       << "# (config_values says what the file said then). Send <prefix>/settings/forget to drop them,\n"
+       << "# or delete this file and restart.\n\n"
        << t << "\n";
     return os.str();
 }
@@ -217,43 +399,40 @@ Result<SettingsLoad> parse_settings(const std::string& text, const std::string& 
     StrictTable root(&tbl, "");
     std::string level;
     if (root.str("log_level", level, 16, false) && root.check("log_level", check_log_level(level))) o.log_level = level;
-    std::vector<std::string> ips;
-    if (root.strings("allowed_ips", ips, kMaxAllowedIps, 64)) {
-        for (const auto& ip : ips) {
-            if (root.ok()) root.check("allowed_ips", check_ipv4(ip));
-        }
-        if (root.ok() && ips.empty() && !base.osc.open_to_any) root.fail("allowed_ips", "is empty, which would lock out every host");
-        if (root.ok()) o.allowed_ips = ips;
-    }
-    if (const toml::node* v = root.take("saved_destinations")) {
-        if (!v->is_array()) {
-            root.fail("saved_destinations", "must be a list of tables");
-        } else if (v->as_array()->size() > kMaxDestinations) {
-            root.fail("saved_destinations", "at most " + std::to_string(kMaxDestinations) + " allowed");
+    parse_ips(root, "allowed_ips_added", o.allowed_added);
+    parse_ips(root, "allowed_ips_removed", o.allowed_removed);
+    std::vector<std::string> whole;
+    if (parse_ips(root, "allowed_ips", whole)) {
+        if (whole.empty() && !base.osc.open_to_any) {
+            root.fail("allowed_ips", "is empty, which would lock out every host");
         } else {
-            std::vector<DestinationConfig> list;
-            std::set<std::string> seen;
-            size_t index = 0;
-            for (auto&& e : *v->as_array()) {
-                ++index;
-                StrictTable d(&e, "saved_destinations[" + std::to_string(index) + "]");
-                DestinationConfig dc;
-                std::string address;
-                if (d.str("address", address, 64, false)) d.check("address", check_destination(address, dc.address));
-                if (d.ok() && address.empty()) d.fail("address", "is missing");
-                d.boolean("touches", dc.touches);
-                d.boolean("status", dc.status);
-                if (d.ok() && !dc.touches && !dc.status) d.fail("", "sends nothing");
-                if (d.ok() && !seen.insert(dc.address.text()).second) d.fail("address", dc.address.text() + " is listed twice");
-                d.finish();
-                if (!d.ok()) {
-                    root.adopt(d.error());
-                    break;
-                }
-                list.push_back(dc);
+            for (const auto& ip : whole) {
+                if (!has(base.osc.allowed_ips, ip)) o.allowed_added.push_back(ip);
             }
-            if (root.ok()) o.saved_destinations = list;
+            for (const auto& ip : base.osc.allowed_ips) {
+                if (!has(whole, ip)) o.allowed_removed.push_back(ip);
+            }
+            out.rewrite = true;
         }
+    }
+    parse_destinations(root, "saved_destinations_added", o.destinations_added);
+    std::vector<std::string> gone;
+    if (root.strings("saved_destinations_removed", gone, kMaxDestinations, 64)) {
+        for (const auto& a : gone) {
+            HostPort hp;
+            if (!root.check("saved_destinations_removed", check_destination(a, hp))) break;
+            o.destinations_removed.push_back(hp.text());
+        }
+    }
+    std::vector<DestinationConfig> list;
+    if (parse_destinations(root, "saved_destinations", list)) {
+        for (const auto& d : list) {
+            if (std::find(base.destinations.begin(), base.destinations.end(), d) == base.destinations.end()) o.destinations_added.push_back(d);
+        }
+        for (const auto& d : base.destinations) {
+            if (std::find(list.begin(), list.end(), d) == list.end()) o.destinations_removed.push_back(d.address.text());
+        }
+        out.rewrite = true;
     }
     if (const toml::node* v = root.take("device")) {
         if (!v->is_table()) {
@@ -261,12 +440,7 @@ Result<SettingsLoad> parse_settings(const std::string& text, const std::string& 
         } else {
             for (auto&& [k, node] : *v->as_table()) {
                 std::string id(k.str());
-                bool known = false;
-                for (const auto& d : base.devices) known = known || d.id == id;
-                if (!known) {
-                    out.notes.push_back("saved settings for device \"" + id + "\" were dropped: it is no longer in the config");
-                    continue;
-                }
+                bool known = std::any_of(base.devices.begin(), base.devices.end(), [&](const DeviceConfig& d) { return d.id == id; });
                 StrictTable d(&node, "device." + id);
                 DeviceOverrides x;
                 if (d.ok()) parse_device(d, x);
@@ -275,17 +449,48 @@ Result<SettingsLoad> parse_settings(const std::string& text, const std::string& 
                     root.adopt(d.error());
                     break;
                 }
-                if (!x.empty()) o.devices[id] = x;
+                if (x.empty()) continue;
+                if (known) {
+                    o.devices[id] = x;
+                } else {
+                    o.unused_devices[id] = x;
+                    out.notes.push_back("saved settings for device \"" + id + "\" are kept but not used: no [[device]] in the config has that id now; put the id back, or send settings/forget device/" + id + " to drop them");
+                }
             }
         }
     }
+    if (const toml::node* v = root.take("config_values")) parse_config_values(v, out.config_values);
     root.finish();
     if (!root.ok()) return err(source + ": " + root.error());
     Config eff = apply_overrides(base, o);
     for (const auto& d : eff.devices) {
         if (!d.has_usb && d.port.empty()) return err(source + ": device." + d.id + " would match nothing: it has neither usb nor port");
     }
+    if (!eff.osc.open_to_any && eff.osc.allowed_ips.empty()) return err(source + ": with these settings no host would be allowed, which would lock out every host");
+    if (o.log_level && out.config_values.log_level && base.log.level != *out.config_values.log_level) {
+        out.notes.push_back("log_level: the config file changed from " + value_text(*out.config_values.log_level) + " to " + value_text(base.log.level) + " after " +
+                            value_text(*o.log_level) + " was saved over OSC, so the config file's " + value_text(base.log.level) + " applies now");
+        o.log_level.reset();
+        out.config_values.log_level.reset();
+        out.rewrite = true;
+    }
+    for (const auto& d : base.devices) {
+        auto it = o.devices.find(d.id);
+        auto vit = out.config_values.devices.find(d.id);
+        if (it == o.devices.end() || vit == out.config_values.devices.end()) continue;
+        DeviceOverrides now = device_values(d);
+        each(
+            [&](const char* k, auto& over, const auto& was, const auto& file_now) {
+                if (!over || !was || !file_now || *was == *file_now) return;
+                out.notes.push_back("device/" + d.id + "/" + k + ": the config file changed from " + value_text(*was) + " to " + value_text(*file_now) + " after " +
+                                    value_text(*over) + " was saved over OSC, so the config file's " + value_text(*file_now) + " applies now");
+                over.reset();
+                out.rewrite = true;
+            },
+            it->second, vit->second, now);
+    }
     drop_unchanged(o, base);
+    note_config_values(o, o, base, out.config_values);
     return out;
 }
 
@@ -321,6 +526,11 @@ SettingsLoad load_settings(const Config& base, bool set_aside_refused) {
     struct stat st {};
     if (path.empty() || stat(path.c_str(), &st) != 0) return none;
     none.file_exists = true;
+    if (access(path.c_str(), R_OK) != 0 && (errno == EACCES || errno == EPERM)) {
+        none.no_permission = true;
+        none.problem = "the saved settings in " + path + " cannot be read (permission denied): touch-to-osc runs without them; run it as root, as its service does";
+        return none;
+    }
     auto text = read_file(path, 1 << 20);
     Result<SettingsLoad> parsed = text ? parse_settings(*text, path, base) : Result<SettingsLoad>(err(text.error()));
     if (parsed) {
@@ -335,7 +545,8 @@ SettingsLoad load_settings(const Config& base, bool set_aside_refused) {
     if (set_aside_refused) {
         std::string aside = path + ".refused";
         if (std::rename(path.c_str(), aside.c_str()) == 0) {
-            none.problem += "; it was set aside as " + aside + " and touch-to-osc runs on the config file";
+            none.problem += "; it was set aside as " + aside + " and touch-to-osc runs on the config file: set those settings again, or fix " + aside +
+                            ", rename it back to " + path + " and restart touch-to-osc";
             none.file_exists = false;
         } else {
             none.problem += "; setting it aside failed (" + errno_str() + ") and touch-to-osc runs on the config file";

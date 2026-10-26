@@ -46,6 +46,7 @@ struct DevInfo {
     bool grabbed = false;
     bool enabled = true;
     int32_t slots = 0;
+    int32_t matching = 0;
     float w_mm = 0;
     float h_mm = 0;
     float aspect = 0;

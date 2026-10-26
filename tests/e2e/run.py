@@ -11,6 +11,7 @@ more than 10 s. TTO_BUILD picks the build directory.
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -58,8 +59,8 @@ class Ctx:
         self.daemons.append(d)
         return d
 
-    def receiver(self, subscribe=True, lease=10):
-        r = Receiver(self.next_port)
+    def receiver(self, subscribe=True, lease=10, host="127.0.0.1"):
+        r = Receiver(self.next_port, host=host)
         self.next_port += 1
         self.receivers.append(r)
         if subscribe:
@@ -384,7 +385,7 @@ def requests_answer_once():
         check(r.wait("/touch/reply", since=m).args == [1, "ok", ""], "repeat reply")
         r.none("/touch/pong", during=0.4, since=m)
         r.send("/touch/request", 1, "/touch/status/send")
-        check(r.wait("/touch/reply", since=m, count=2)[1].args == [1, "refused", "seq used for another command"], "reused seq")
+        check(r.wait("/touch/reply", since=m, count=2)[1].args == [1, "refused", "seq 1 was used for another command in the last 30 s: use a new seq for each command"], "reused seq")
         r.send("/touch/request", 2, "/touch/nope")
         check(r.wait("/touch/reply", lambda x: x.args[0] == 2).args == [2, "refused", "unknown address"], "unknown address")
         r.send("/touch/request", 3, "/touch/request", 4, "/touch/ping")
@@ -392,7 +393,7 @@ def requests_answer_once():
         r.send("/touch/nope", 1)
         check(r.wait("/touch/error").args == ["/touch/nope", "unknown address"], "bare refusal")
         r.send("/touch/request", 5, "/touch/device/zz/enabled", 0)
-        check(r.wait("/touch/reply", lambda x: x.args[0] == 5).args == [5, "refused", "no device zz"], "unknown device")
+        check(r.wait("/touch/reply", lambda x: x.args[0] == 5).args == [5, "refused", "no device zz (devices: t)"], "unknown device")
         r.send("/touch/request", 6, "/touch/device/t/enabled", 2)
         check(r.wait("/touch/reply", lambda x: x.args[0] == 6).args == [6, "refused", "enabled needs 0 or 1"], "bad value")
 
@@ -650,6 +651,66 @@ def foreign_grab_is_a_fault_with_the_reason():
 
 
 @test()
+def a_screen_let_go_by_another_program_is_read_afresh():
+    import fcntl
+    from uinput import EVIOCGRAB
+    with Ctx("letgo") as c:
+        p = test_product()
+        s = c.screen(p)
+        fd = os.open(s.node, os.O_RDONLY | os.O_NONBLOCK)
+        fcntl.ioctl(fd, EVIOCGRAB, 1)
+        try:
+            c.daemon([device(p)])
+            r = c.receiver()
+            r.wait("/touch/device/t/state", lambda m: m.args == ["grab refused"], timeout=4)
+        finally:
+            os.close(fd)
+        m = r.mark()
+        s.touch(0, 1, 100, 100)
+        s.frame()
+        time.sleep(3)
+        s.lift(0)
+        s.frame()
+        r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], timeout=4, since=m)
+        time.sleep(0.5)
+        contact_story(r.all(m))
+        downs = r.all(m, "/touch/t/down")
+        check(not downs, "a finger put down as the other program let go was announced from the state read before: %s" % downs)
+        s.touch(0, 2, 200, 200)
+        s.frame()
+        s.lift(0)
+        s.frame()
+        r.wait("/touch/t/up", since=m)
+        contact_story(r.all(m))
+
+
+@test()
+def a_second_copy_on_the_same_port_is_refused():
+    with Ctx("twice") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        log = os.path.join(RUN_DIR, "twice-second.log")
+        with open(log, "w") as out:
+            proc = subprocess.Popen([os.path.join(BUILD, "touch-to-osc"), "--config=" + d.config], stdout=out, stderr=subprocess.STDOUT)
+            try:
+                rc = proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise Failure("a second copy started on the port the first one listens on")
+        with open(log) as f:
+            text = f.read()
+        check(rc == 3, "the second copy exited with %s, not 3: %s" % (rc, text[-600:]))
+        check("cannot listen" in text and "systemctl stop touch-to-osc" in text, "message: %s" % text[-600:])
+        m = r.mark()
+        check(req(r, "/touch/ping") == ["ok", ""], "the first copy still answers")
+        r.wait("/touch/pong", since=m)
+
+
+@test()
 def two_identical_screens_told_apart_by_port():
     with Ctx("two") as c:
         p = test_product()
@@ -666,6 +727,47 @@ def two_identical_screens_told_apart_by_port():
         r.wait("/touch/a/down")
         r.wait("/touch/b/down")
         check(r.wait("/touch/alive", lambda m: m.args[4] == 2 and m.args[6] == 2, timeout=2.5).args[5] == 2, "alive counts")
+
+
+@test()
+def identical_screens_are_shared_out_in_port_order_at_every_start():
+    pid = os.getpid()
+    for first_made in ("b", "a"):
+        with Ctx("portorder-" + first_made) as c:
+            p = test_product()
+            for k in (first_made, "a" if first_made == "b" else "b"):
+                c.screen(p, phys="tto-order-%s-%d" % (k, pid))
+            c.daemon([device(p, id="one"), device(p, id="two")])
+            r = c.receiver()
+            connected(r, "one")
+            connected(r, "two")
+            r.wait("/touch/device/one/port", lambda x: x.args == ["tto-order-a-%d" % pid])
+            r.wait("/touch/device/two/port", lambda x: x.args == ["tto-order-b-%d" % pid])
+            reasons = r.wait("/touch/reasons", lambda x: any("matches 2 touchscreens" in a for a in x.args)).args
+            check(any("which can change at a restart: set match_port" in a for a in reasons), "reasons %s" % reasons)
+
+
+@test()
+def a_device_naming_a_port_gets_its_screen_before_one_matching_by_usb_id():
+    pid = os.getpid()
+    with Ctx("portfirst") as c:
+        p = test_product()
+        c.screen(p, phys="tto-first-a-%d" % pid)
+        c.screen(p, phys="tto-first-b-%d" % pid)
+        c.daemon([device(p, id="any"), device(p, id="front", port="tto-first-a-%d" % pid)])
+        r = c.receiver()
+        connected(r, "any")
+        connected(r, "front")
+        r.wait("/touch/device/front/port", lambda x: x.args == ["tto-first-a-%d" % pid])
+        r.wait("/touch/device/any/port", lambda x: x.args == ["tto-first-b-%d" % pid])
+    with Ctx("moved") as c:
+        p = test_product()
+        c.screen(p, phys="tto-moved-%d" % pid)
+        c.daemon([device(p, port="tto-nowhere")])
+        r = c.receiver()
+        reason = r.wait("/touch/device/t/reason", lambda x: "plugged into port" in x.args[0], timeout=3).args[0]
+        check(reason == "a 7470:%04x touchscreen is plugged into port tto-moved-%d, not tto-nowhere: plug it into tto-nowhere, or set match_port to tto-moved-%d"
+              % (p, pid, pid), "reason %r" % reason)
 
 
 @test()
@@ -730,7 +832,9 @@ def status_describes_the_device():
         r.send("/touch/status/send")
         r.wait("/touch/run", since=m)
         log = c.daemons[0].log_text()
-        check("touch-to-osc 0.5.1 (osc_api 5)" in log, "banner")
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "CMakeLists.txt")) as f:
+            version = f.read().split("project(touch-to-osc VERSION ", 1)[1].split()[0]
+        check("touch-to-osc %s (osc_api 5)" % version in log, "banner for %s" % version)
 
 
 @test()
@@ -746,7 +850,7 @@ def no_permission_says_what_to_do():
         d.config = "/tmp/tto-e2e/noperm.toml"
         d.log_path = "/tmp/tto-e2e/noperm.log"
         with open(d.config, "w") as f:
-            f.write('[osc]\nlisten = "127.0.0.1:%d"\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = ""\n[[device]]\nid = "t"\nusb = "%04x:%04x"\n' % (DAEMON_PORT, TEST_VENDOR, p))
+            f.write('[osc]\nlisten = "127.0.0.1:%d"\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = ""\nstate = ""\n[[device]]\nid = "t"\nusb = "%04x:%04x"\n' % (DAEMON_PORT, TEST_VENDOR, p))
         os.chmod(d.config, 0o644)
         d.log = open(d.log_path, "w")
         binary = os.path.join(os.environ.get("TTO_BUILD", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "build")), "touch-to-osc")
@@ -834,11 +938,17 @@ def bad_settings_are_refused_in_the_configs_words():
             (("/touch/device/t/rotation", 45), "rotation must be 0, 90, 180 or 270"),
             (("/touch/device/t/mirror", "z"), 'mirror must be "", "x", "y" or "xy"'),
             (("/touch/device/t/silence_ms", 10), "silence_ms must be 0 (off) or between 50 and 10000"),
-            (("/touch/device/t/calibration", 1.0, 2.0, 3.0), "calibration must be six numbers (an affine map, each at most 100), or none"),
+            (("/touch/device/t/calibration", 1.0, 2.0, 3.0), "calibration must be six numbers [a, b, c, d, e, f] as in config.example.toml, each between -100 and 100, or none"),
             (("/touch/device/t/match_usb", "zz"), 'match_usb must be vendor:product in hex, like "0712:0009" (touch-to-osc --list shows it)'),
             (("/touch/device/t/aspect", 50.0), "aspect must be 0 (taken from the device) or between 0.1 and 10"),
             (("/touch/log_level", "loud"), "log_level must be crit, error, warning, notice, info or debug"),
-            (("/touch/device/t/connected", 1), "unknown address"),
+            (("/touch/device/t/connected", 1), "connected is reported by touch-to-osc and cannot be set"),
+            (("/touch/device/t/port", "3-3"), "port is reported by touch-to-osc and cannot be set: it is the screen read now; to choose which screen is read, set match_usb, match_serial or match_port"),
+            (("/touch/device/t/rotate", 90), "unknown address (did you mean /touch/device/t/rotation?)"),
+            (("/touch/restrat",), "unknown address (did you mean /touch/restart?)"),
+            (("/touch/health", "ok"), "health is reported by touch-to-osc and cannot be set"),
+            (("/touch/allowed_ips", "10.0.0.1"), "allowed_ips is changed with /touch/allowed_ips/add and /touch/allowed_ips/remove"),
+            (("/touch2/ping",), "unknown address: every address here starts with /touch/"),
             (("/touch/allowed_ips/add", "nowhere"), "'nowhere' is not an IPv4 address"),
             (("/touch/saved_destinations/add", "1.2.3.4"), 'the destination must be an IPv4 address and a port, like "192.168.1.27:9481"'),
             (("/touch/settings/forget", "device/t/rotation"), "nothing is saved for device/t/rotation"),
@@ -1003,9 +1113,9 @@ def a_refused_settings_file_is_set_aside():
             f.write("[device.t]\nrotation = 45\n")
         cfg = os.path.join(RUN_DIR, "setrefused-check.toml")
         with open(cfg, "w") as f:
-            f.write('[osc]\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = "%s"\n[[device]]\nid = "t"\nusb = "%04x:%04x"\n' % (path, TEST_VENDOR, p))
+            f.write('[osc]\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = "%s"\nstate = ""\n[[device]]\nid = "t"\nusb = "%04x:%04x"\n' % (path, TEST_VENDOR, p))
         chk = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--check-config=" + cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-        check(chk.returncode == 2 and "device.t.rotation: must be 0, 90, 180 or 270" in chk.stdout, "--check-config said %d: %s" % (chk.returncode, chk.stdout))
+        check(chk.returncode == 5 and "device.t.rotation: must be 0, 90, 180 or 270" in chk.stdout, "--check-config said %d: %s" % (chk.returncode, chk.stdout))
         c.daemon([device(p)], name="setrefused", keep_settings=True)
         r = c.receiver()
         connected(r)
@@ -1059,6 +1169,16 @@ def an_unchanged_setting_is_neither_saved_nor_reported():
         check(req(r, "/touch/settings/forget") == ["ok", ""], "forget nothing")
         r.none("/touch/event", lambda x: x.args[0] == "settings", during=1.5, since=m)
         check(not os.path.exists(d.settings), "an unchanged value was saved")
+        m = r.mark()
+        check(req(r, "/touch/device/t/rotation", 90) == ["ok", ""], "rotation 90")
+        r.wait("/touch/overrides", lambda x: x.args == ["device/t/rotation"], since=m)
+        m = r.mark()
+        check(req(r, "/touch/device/t/rotation", 0) == ["ok", ""], "back to the config file's 0")
+        r.wait("/touch/overrides", lambda x: x.args == [], since=m)
+        deadline = time.time() + 3
+        while os.path.exists(d.settings) and time.time() < deadline:
+            time.sleep(0.05)
+        check(not os.path.exists(d.settings), "the settings file stayed after the only saved setting went back to the config file's value")
 
 
 @test()
@@ -1127,6 +1247,7 @@ def the_disabled_reason_says_where_it_came_from():
         c.daemon([device(p, enabled=False)])
         r = c.receiver()
         r.wait("/touch/device/t/reason", lambda x: "in the config file (enabled = false)" in x.args[0], timeout=3)
+        r.wait("/touch/health", lambda x: x.args == ["ok"], timeout=3)
         m = r.mark()
         check(req(r, "/touch/device/t/enabled", 1) == ["ok", ""], "on")
         r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m)
@@ -1258,6 +1379,581 @@ def restart_is_refused_when_the_config_would_be():
 
 
 @test()
+def a_repeated_restart_request_is_answered_without_restarting_again():
+    with Ctx("restartonce") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        run1 = r.wait("/touch/alive", timeout=2.5).args[1]
+        _seq[0] += 1
+        s = _seq[0]
+        m = r.mark()
+        r.send("/touch/request", s, "/touch/restart")
+        check(r.wait("/touch/reply", lambda x: x.args[0] == s, since=m).args[1:] == ["ok", ""], "restart")
+        run2 = r.wait("/touch/alive", lambda x: x.args[1] != run1, since=m, timeout=6).args[1]
+        m = r.mark()
+        r.send("/touch/request", s, "/touch/restart")
+        check(r.wait("/touch/reply", lambda x: x.args[0] == s, since=m).args[1:] == ["ok", ""], "the repeated request's reply")
+        r.none("/touch/bye", during=2.0, since=m)
+        check(r.wait("/touch/alive", since=m).args[1] == run2, "the run changed again")
+        check(d.log_text().count("(osc_api ") == 2, "expected two start banners in the log")
+
+
+@test()
+def restart_is_refused_when_the_new_listen_port_cannot_be_used():
+    import socket
+    with Ctx("restartport") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        taken = DAEMON_PORT + 19
+        busy = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        busy.bind(("127.0.0.1", taken))
+        try:
+            with open(d.config) as f:
+                text = f.read()
+            with open(d.config, "w") as f:
+                f.write(text.replace("127.0.0.1:%d" % DAEMON_PORT, "127.0.0.1:%d" % taken))
+            got = req(r, "/touch/restart")
+            check(got[0] == "refused" and "would listen on UDP 127.0.0.1:%d, which cannot be used" % taken in got[1], "got %s" % got)
+            time.sleep(0.5)
+            check(d.proc.poll() is None, "the daemon stopped")
+        finally:
+            busy.close()
+
+
+@test()
+def restart_is_refused_when_the_installed_program_would_not_start():
+    with Ctx("restartnew") as c:
+        p = test_product()
+        c.screen(p)
+        bindir = os.path.join(RUN_DIR, "restartnew-bin")
+        shutil.rmtree(bindir, ignore_errors=True)
+        os.makedirs(bindir)
+        exe = os.path.join(bindir, "touch-to-osc")
+        shutil.copy2(os.path.join(BUILD, "touch-to-osc"), exe)
+        d = c.daemon([device(p)], binary=exe)
+        r = c.receiver()
+        connected(r)
+        newer = exe + ".new"
+        with open(newer, "w") as f:
+            f.write("#!/bin/sh\necho \"this version refuses the config: osc.newkey is missing\"\nexit 2\n")
+        os.chmod(newer, 0o755)
+        os.rename(newer, exe)
+        got = req(r, "/touch/restart")
+        check(got[0] == "refused" and "would not start" in got[1] and "osc.newkey is missing" in got[1], "got %s" % got)
+        time.sleep(0.5)
+        check(d.proc.poll() is None, "the daemon stopped")
+        shutil.rmtree(bindir, ignore_errors=True)
+
+
+@test()
+def a_usb_reset_keeps_a_marker_and_holds_off_a_restart():
+    root = fake_usb_tree("usb-marker")
+    devices = os.path.join(root, "sys", "bus", "usb", "devices")
+    unbind = os.path.join(root, "sys", "bus", "usb", "drivers", "hub", "unbind")
+    os.remove(os.path.join(devices, "usb3", "busnum"))
+    with open(os.path.join(devices, "usb3", "busnum"), "w") as f:
+        f.write("3\n")
+    os.remove(unbind)
+    os.mkfifo(unbind)
+    for name, product in (("3-1", "Test Keyboard\n"), ("3-1:1.0", None), ("3-4.1", ""), ("4-1", "Elsewhere\n"), ("3-3.1", "Behind the screen\n")):
+        os.makedirs(os.path.join(devices, name))
+        if product is not None:
+            with open(os.path.join(devices, name, "product"), "w") as f:
+                f.write(product)
+    with Ctx("usbmarker") as c:
+        d = c.daemon([device(test_product(), port="3-3")], env={"TTO_USB_ROOT": root})
+        r = c.receiver()
+        r.wait("/touch/device/t/usb_watched_port", lambda x: x.args == ["3-3"])
+        m = r.mark()
+        check(req(r, "/touch/device/t/usb_reset") == ["ok", ""], "usb_reset")
+        r.wait("/touch/event", lambda x: x.args[0] == "usb" and "resetting USB bus 3" in x.args[1], since=m, timeout=3)
+        marker = d.state + ".usb-reset"
+        deadline = time.time() + 3
+        while not os.path.exists(marker) and time.time() < deadline:
+            time.sleep(0.05)
+        check(os.path.exists(marker), "no marker while the reset runs")
+        with open(marker) as f:
+            check(f.read() == "3-0:1.0\n", "the marker does not name the hub")
+        got = req(r, "/touch/restart")
+        check(got[0] == "refused" and "a USB reset is running" in got[1], "a restart during a reset: %s" % got)
+        with open(unbind) as f:
+            f.read()
+        done = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "USB bus 3 reset in" in x.args[1], since=m, timeout=3)
+        check("(it also dropped Test Keyboard (3-1), a USB device (3-4.1))" in done.args[1], "what the reset dropped: %s" % done.args[1])
+        check(not os.path.exists(marker), "the marker stayed after the hub was bound again")
+
+
+@test(slow=True)
+def a_stop_waits_for_a_usb_reset_in_flight_and_binds_the_hub():
+    root = fake_usb_tree("usb-stopwait")
+    devices = os.path.join(root, "sys", "bus", "usb", "devices")
+    hub = os.path.join(root, "sys", "bus", "usb", "drivers", "hub")
+    os.remove(os.path.join(devices, "usb3", "busnum"))
+    with open(os.path.join(devices, "usb3", "busnum"), "w") as f:
+        f.write("3\n")
+    unbind = os.path.join(hub, "unbind")
+    os.remove(unbind)
+    os.mkfifo(unbind)
+    with Ctx("usbstopwait") as c:
+        d = c.daemon([device(test_product(), port="3-3")], env={"TTO_USB_ROOT": root})
+        r = c.receiver()
+        r.wait("/touch/device/t/usb_watched_port", lambda x: x.args == ["3-3"])
+        m = r.mark()
+        check(req(r, "/touch/device/t/usb_reset") == ["ok", ""], "usb_reset")
+        r.wait("/touch/event", lambda x: x.args[0] == "usb" and "resetting USB bus 3" in x.args[1], since=m, timeout=3)
+        d.proc.send_signal(signal.SIGTERM)
+        time.sleep(3)
+        check(d.proc.poll() is None, "the daemon stopped while a USB reset was between its unbind and its bind")
+        with open(unbind) as f:
+            f.read()
+        d.proc.wait(10)
+        check(d.proc.returncode == 0, "exit %s" % d.proc.returncode)
+        with open(os.path.join(hub, "bind")) as f:
+            check(f.read().startswith("3-0:1.0"), "the hub was not bound again before the stop")
+        check(not os.path.exists(d.state + ".usb-reset"), "the marker stayed")
+
+
+@test(slow=True)
+def a_restart_waits_for_a_usb_port_check_in_flight():
+    root = fake_usb_tree("usb-restartwait")
+    busnum = os.path.join(root, "sys", "bus", "usb", "devices", "usb3", "busnum")
+    with Ctx("usbrestartwait") as c:
+        d = c.daemon([device(test_product(), port="3-3")], env={"TTO_USB_ROOT": root})
+        r = c.receiver()
+        run1 = r.wait("/touch/alive", timeout=2.5).args[1]
+        time.sleep(1.5)
+        m = r.mark()
+        check(req(r, "/touch/restart") == ["ok", ""], "restart refused")
+        r.wait("/touch/bye", since=m)
+        r.none("/touch/alive", lambda x: x.args[1] != run1, during=2.5, since=m)
+        check("a USB port check is still waiting" not in d.log_text(), "it went on without waiting: %s" % d.log_text()[-800:])
+        with open(busnum, "w") as f:
+            f.write("3\n")
+        r.wait("/touch/alive", lambda x: x.args[1] != run1, since=m, timeout=5)
+
+
+@test()
+def a_hub_left_unbound_by_a_cut_short_reset_is_bound_at_start():
+    import threading
+    root = fake_usb_tree("usb-cutshort")
+    devices = os.path.join(root, "sys", "bus", "usb", "devices")
+    driver = os.path.join(devices, "3-0:1.0", "driver")
+    bind = os.path.join(root, "sys", "bus", "usb", "drivers", "hub", "bind")
+    os.rmdir(driver)
+    os.remove(bind)
+    os.mkfifo(bind)
+    written = []
+    done = threading.Event()
+
+    def kernel():
+        while not done.is_set():
+            with open(bind) as f:
+                data = f.read()
+            if done.is_set():
+                return
+            written.append(data)
+            os.makedirs(driver, exist_ok=True)
+
+    t = threading.Thread(target=kernel, daemon=True)
+    t.start()
+    for f in ("usbcutshort-settings.toml", "usbcutshort-state.toml"):
+        if os.path.exists(os.path.join(RUN_DIR, f)):
+            os.remove(os.path.join(RUN_DIR, f))
+    marker = os.path.join(RUN_DIR, "usbcutshort-state.toml.usb-reset")
+    with open(marker, "w") as f:
+        f.write("3-0:1.0\n")
+    try:
+        with Ctx("usbcutshort") as c:
+            d = c.daemon([device(test_product(), port="3-3")], name="usbcutshort", keep_settings=True, env={"TTO_USB_ROOT": root})
+            deadline = time.time() + 3
+            note = "was left unbound by a reset cut short when touch-to-osc last stopped; it is bound again"
+            while note not in d.log_text() and time.time() < deadline:
+                time.sleep(0.05)
+            check(note in d.log_text(), "no note in the log")
+            check(written and written[0].startswith("3-0:1.0"), "the hub was not bound at start: %s" % written)
+            check(not os.path.exists(marker), "the marker stayed")
+            r = c.receiver()
+            r.wait("/touch/reasons", lambda x: not any("left unbound" in a for a in x.args))
+    finally:
+        done.set()
+        try:
+            os.close(os.open(bind, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+
+
+@test()
+def a_screen_is_watched_on_the_port_it_was_last_read_on_after_a_restart():
+    root = fake_usb_tree("usb-remember")
+    busnum = os.path.join(root, "sys", "bus", "usb", "devices", "usb3", "busnum")
+    os.remove(busnum)
+    with open(busnum, "w") as f:
+        f.write("3\n")
+    for f in ("usbremember-settings.toml",):
+        if os.path.exists(os.path.join(RUN_DIR, f)):
+            os.remove(os.path.join(RUN_DIR, f))
+    with open(os.path.join(RUN_DIR, "usbremember-state.toml"), "w") as f:
+        f.write('[usb_ports]\nt = "3-3"\n')
+    with Ctx("usbremember") as c:
+        c.daemon([device(test_product())], name="usbremember", keep_settings=True, env={"TTO_USB_ROOT": root})
+        r = c.receiver()
+        r.wait("/touch/device/t/usb_watched_port", lambda x: x.args == ["3-3"], timeout=3)
+
+
+@test()
+def a_settings_write_stuck_on_the_disk_never_holds_up_the_heartbeat():
+    with Ctx("stuckdisk") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        tmp = "%s.tmp.%d" % (d.settings, d.proc.pid)
+        os.mkfifo(tmp)
+        try:
+            m = r.mark()
+            check(req(r, "/touch/device/t/label", "stuck") == ["ok", ""], "label")
+            time.sleep(4)
+            alive = r.all(m, "/touch/alive")
+            gaps = [b.at - a.at for a, b in zip(alive, alive[1:])]
+            check(len(alive) >= 3 and max(gaps) < 1.5, "%d alives while a settings write is stuck, gaps %s" % (len(alive), gaps))
+            r.wait("/touch/device/t/label", lambda x: x.args == ["stuck"], since=m)
+        finally:
+            fd = os.open(tmp, os.O_RDONLY | os.O_NONBLOCK)
+            time.sleep(0.5)
+            os.close(fd)
+
+
+@test()
+def a_refused_config_runs_on_the_copy_that_last_worked():
+    with Ctx("lastgood") as c:
+        p = test_product()
+        s = c.screen(p)
+        d = c.daemon([device(p)], name="lastgood")
+        r = c.receiver()
+        connected(r)
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if os.path.exists(d.state) and "config_that_worked" in open(d.state).read():
+                break
+            time.sleep(0.05)
+        check(d.stop() == 0, "the first daemon's exit code")
+        r.close()
+        d2 = c.daemon([device(p)], name="lastgood", keep_settings=True, extra="bogus = 1")
+        r2 = c.receiver()
+        connected(r2)
+        r2.wait("/touch/health", lambda x: x.args == ["warning"])
+        reasons = r2.wait("/touch/reasons", lambda x: any("the config file is refused" in a for a in x.args)).args
+        check(any("osc.bogus: unknown key" in a and "copy of it that last worked" in a for a in reasons), "reasons %s" % reasons)
+        m = r2.mark()
+        s.touch(0, 1, 100, 100)
+        s.frame()
+        r2.wait("/touch/t/down", since=m)
+        s.lift(0)
+        s.frame()
+        chk = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--check-config=" + d2.config], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             universal_newlines=True)
+        check(chk.returncode == 2 and "osc.bogus: unknown key" in chk.stdout and "copy of it that last worked" in chk.stdout,
+              "--check-config said %d: %s" % (chk.returncode, chk.stdout))
+    cfg = os.path.join(RUN_DIR, "nocopy.toml")
+    with open(cfg, "w") as f:
+        f.write('[osc]\nlisten = "127.0.0.1:%d"\nallowed_ips = ["127.0.0.1"]\nbogus = 1\n[paths]\nsettings = ""\nstate = ""\n[[device]]\nid = "t"\nusb = "7470:0001"\n'
+                % DAEMON_PORT)
+    run = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--config=" + cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                         timeout=10)
+    check(run.returncode == 2 and "config refused" in run.stdout, "without a copy that worked: %d: %s" % (run.returncode, run.stdout))
+
+
+@test()
+def text_from_outside_is_never_echoed_unprintable():
+    with Ctx("echo") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        got = req(r, "/touch/devéice/t/label", "x")
+        check(got == ["refused", "a request's address must be an OSC address: a slash, then printable characters"], "address %s" % got)
+        got = req(r, "/touch/allowed_ips/add", "10.0.0.é")
+        check(got == ["refused", "that is not an IPv4 address"], "allowed_ips %s" % got)
+        got = req(r, "/touch/settings/forget", "devé")
+        check(got == ["refused", "nothing is saved under that name"], "forget %s" % got)
+
+
+@test()
+def a_config_edit_made_after_a_setting_was_saved_over_osc_wins_at_the_next_start():
+    with Ctx("newer") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)], name="newer")
+        r = c.receiver()
+        connected(r)
+        check(req(r, "/touch/device/t/rotation", 90) == ["ok", ""], "rotation")
+        check(req(r, "/touch/allowed_ips/add", "10.0.0.5") == ["ok", ""], "allowed host")
+        check(d.stop() == 0, "the first daemon's exit code")
+        r.close()
+        d2 = c.daemon([device(p, rotation=180)], name="newer", keep_settings=True, allowed=("127.0.0.1", "10.0.0.9"))
+        r2 = c.receiver()
+        connected(r2)
+        r2.wait("/touch/device/t/rotation", lambda x: x.args == [180])
+        r2.wait("/touch/allowed_ips", lambda x: x.args == ["127.0.0.1", "10.0.0.9", "10.0.0.5"])
+        r2.wait("/touch/overrides", lambda x: x.args == ["allowed_ips"])
+        check("device/t/rotation: the config file changed from 0 to 180 after 90 was saved over OSC, so the config file's 180 applies now" in d2.log_text(),
+              "no note in the log")
+        check("10.0.0.9, 10.0.0.5" in d2.log_text(), "the start banner does not list the allowed hosts")
+
+
+@test()
+def outsiders_are_told_where_the_allowed_hosts_come_from():
+    with Ctx("whyrefused") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)], allowed=("127.0.0.1", "127.0.0.2"))
+        r = c.receiver()
+        connected(r)
+        check(req(r, "/touch/allowed_ips/remove", "127.0.0.2") == ["ok", ""], "remove")
+        import socket
+        import watch
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.2", 0))
+        s.settimeout(3)
+        try:
+            s.sendto(watch.encode("/touch/ping"), ("127.0.0.1", DAEMON_PORT))
+            data, _ = s.recvfrom(65536)
+        finally:
+            s.close()
+        _, msgs = watch.decode_packet(data)
+        address, args = msgs[0]
+        check(address == "/touch/error" and "taken off the allowed hosts over OSC" in args[1] and "/touch/allowed_ips/add 127.0.0.2" in args[1],
+              "refusal %s %s" % (address, args))
+
+
+@test()
+def a_finger_reported_again_after_a_silence_cancel_gets_a_hint_once():
+    with Ctx("quiethint") as c:
+        p = test_product()
+        s = c.screen(p)
+        c.daemon([device(p, silence_ms=200)])
+        r = c.receiver()
+        connected(r)
+        hint = lambda x: x.args[0] == "silence" and "reported the same finger again" in x.args[1]
+        m = r.mark()
+        s.touch(0, 1, 100, 100)
+        s.frame()
+        c1 = r.wait("/touch/t/down", since=m).args[0]
+        r.wait("/touch/t/cancel", lambda x: x.args[:2] == [c1, "device silent"], since=m, timeout=2)
+        r.none("/touch/event", hint, during=0.2, since=m)
+        s.touch(0, 1, 140, 100)
+        s.frame()
+        got = r.wait("/touch/event", hint, since=m, timeout=2)
+        check("set silence_ms = 0 for it" in got.args[1] and "check its USB cable" in got.args[1] and got.args[2] == "warning", "hint %s" % got.args)
+        s.lift(0)
+        s.frame()
+        m2 = r.mark()
+        s.touch(0, 2, 100, 100)
+        s.frame()
+        c2 = r.wait("/touch/t/down", since=m2).args[0]
+        r.wait("/touch/t/cancel", lambda x: x.args[:2] == [c2, "device silent"], since=m2, timeout=2)
+        s.touch(0, 2, 150, 100)
+        s.frame()
+        r.none("/touch/event", hint, during=0.5, since=m2)
+    with Ctx("quietlift") as c:
+        p = test_product()
+        s = c.screen(p)
+        c.daemon([device(p, silence_ms=200)])
+        r = c.receiver()
+        connected(r)
+        m = r.mark()
+        s.touch(0, 1, 100, 100)
+        s.frame()
+        c1 = r.wait("/touch/t/down", since=m).args[0]
+        r.wait("/touch/t/cancel", lambda x: x.args[:2] == [c1, "device silent"], since=m, timeout=2)
+        s.lift(0)
+        s.frame()
+        s.touch(0, 2, 140, 100)
+        s.frame()
+        r.wait("/touch/t/down", since=m)
+        r.none("/touch/event", lambda x: "reported the same finger again" in x.args[1], during=0.5, since=m)
+
+
+@test()
+def a_screen_that_reports_no_size_says_its_aspect_is_a_guess():
+    with Ctx("aspect") as c:
+        p = test_product()
+        c.daemon([device(p)])
+        r = c.receiver()
+        r.wait("/touch/device/t/connected", lambda x: x.args == [0], timeout=3)
+        c.screen(p, resolution=0)
+        connected(r)
+        got = r.wait("/touch/event", lambda x: "reports no physical size" in x.args[1], timeout=2)
+        check("its aspect 1.78" in got.args[1] and "set aspect for it" in got.args[1] and got.args[2] == "notice", "event %s" % got.args)
+    with Ctx("aspectsized") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        r.none("/touch/event", lambda x: "reports no physical size" in x.args[1], during=0.5, since=0)
+
+
+@test()
+def health_and_its_reasons_always_come_in_one_bundle():
+    with Ctx("healthpair") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        r.wait("/touch/health", lambda x: x.args == ["ok"], timeout=3)
+        m = r.mark()
+        check(req(r, "/touch/device/t/enabled", 0) == ["ok", ""], "off")
+        h = r.wait("/touch/health", lambda x: x.args == ["warning"], since=m)
+        check(r.all(m, "/touch/reasons", lambda x: x.bundle == h.bundle), "the health came without its reasons")
+        m = r.mark()
+        check(req(r, "/touch/device/t/label", "the other name") == ["ok", ""], "label")
+        reasons = r.wait("/touch/reasons", lambda x: any("the other name is turned off" in a for a in x.args), since=m)
+        check(r.all(m, "/touch/health", lambda x: x.bundle == reasons.bundle and x.args == ["warning"]), "reasons that changed came without the health")
+
+
+@test()
+def subscribers_are_kept_over_a_restart_and_hear_the_new_run_at_once():
+    with Ctx("keeplease") as c:
+        p = test_product()
+        s = c.screen(p)
+        d = c.daemon([device(p)], allowed=("127.0.0.1", "127.0.0.2"))
+        r = c.receiver(subscribe=False)
+        r.subscribe(30)
+        gone = c.receiver(subscribe=False, host="127.0.0.2")
+        gone.subscribe(30)
+        connected(r)
+        run1 = r.wait("/touch/alive", timeout=2.5).args[1]
+        gone.wait("/touch/alive", timeout=2.5)
+        with open(d.config) as f:
+            text = f.read()
+        with open(d.config, "w") as f:
+            f.write(text.replace('allowed_ips = ["127.0.0.1", "127.0.0.2"]', 'allowed_ips = ["127.0.0.1"]'))
+        m = r.mark()
+        mg = gone.mark()
+        check(req(r, "/touch/restart") == ["ok", ""], "restart refused")
+        bye = r.wait("/touch/bye", since=m)
+        alive = r.wait("/touch/alive", lambda x: x.args[1] != run1, since=m, timeout=3)
+        MEASURED.append("restart: the new run's first alive %.0f ms after the bye, to a subscriber kept over it" % ((alive.at - bye.at) * 1000))
+        check(alive.at - bye.at < 0.8, "the new run's first alive came %.2f s after the bye" % (alive.at - bye.at))
+        r.wait("/touch/run", lambda x: x.args[0] != run1, since=m, timeout=1)
+        connected(r, since=m)
+        m2 = r.mark()
+        s.touch(0, 1, 20, 20)
+        s.frame()
+        r.wait("/touch/t/down", since=m2)
+        gone.none("/touch/alive", lambda x: x.args[1] != run1, during=1.5, since=mg)
+        text = d.log_text()
+        check("subscriber 127.0.0.1:%d kept over the restart" % r.port in text, "log: %s" % text[-1500:])
+        check("subscriber 127.0.0.2:%d was not kept over the restart: it is no longer in osc.allowed_ips" % gone.port in text, "log: %s" % text[-1500:])
+
+
+@test()
+def list_names_the_device_reading_each_screen_and_a_block_for_the_rest():
+    with Ctx("list") as c:
+        p = test_product()
+        pid = os.getpid()
+        c.screen(p, phys="tto-la-%d" % pid)
+        c.screen(p, phys="tto-lb-%d" % pid)
+        cfg = os.path.join(RUN_DIR, "list.toml")
+        with open(cfg, "w") as f:
+            f.write('[osc]\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = ""\nstate = ""\n[[device]]\nid = "face"\nusb = "%04x:%04x"\n' % (TEST_VENDOR, p))
+        time.sleep(0.3)
+        out = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--list", "--config=" + cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             universal_newlines=True, timeout=20).stdout
+        blocks = out.split("\n\n")
+        a = [b for b in blocks if "tto-la-%d" % pid in b]
+        b = [b for b in blocks if "tto-lb-%d" % pid in b and "id %04x" % TEST_VENDOR in b]
+        check(len(a) == 1 and 'read as device "face" in the config' in a[0], "screen a: %s" % out)
+        check(len(b) == 1 and "not read by the config; to read it, add this to the config:" in b[0] and 'match_usb = "%04x:%04x"' % (TEST_VENDOR, p) in b[0] and
+              'match_port = "tto-lb-%d"' % pid in b[0] and 'id = "screen2"' in b[0], "screen b: %s" % out)
+        check("touch-to-osc --list --all shows them" in out and "not a touchscreen" not in out, "others: %s" % out)
+        everything = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--list", "--all", "--config=" + cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    universal_newlines=True, timeout=20).stdout
+        check("not a touchscreen" in everything and "--list --all shows them" not in everything, "--all: %s" % everything)
+        dump = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--dump=nope", "--config=" + cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=20)
+        check(dump.returncode == 2 and 'no device "nope" in the config (its devices: face)' in dump.stdout, "--dump=nope: %d %s" % (dump.returncode, dump.stdout))
+
+
+@test()
+def status_and_send_work_from_the_command_line():
+    def cli(config, *args):
+        return subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--config=" + config] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=20)
+
+    with Ctx("cli") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p, label="the screen")])
+        r = c.receiver()
+        connected(r)
+        st = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--config", d.config, "--status"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            universal_newlines=True, timeout=20)
+        check(st.returncode == 0 and "health: ok" in st.stdout and "t (the screen): ok" in st.stdout and "reading tto-test-" in st.stdout, st.stdout)
+        sent = cli(d.config, "--send", "device/t/rotation", "90")
+        check(sent.returncode == 0 and sent.stdout == "ok\n", "rotation: %d %s" % (sent.returncode, sent.stdout))
+        r.wait("/touch/device/t/rotation", lambda x: x.args == [90], timeout=3)
+        bad = cli(d.config, "--send", "device/t/rotation", "45")
+        check(bad.returncode == 6 and "refused: rotation must be 0, 90, 180 or 270" in bad.stdout, "45: %d %s" % (bad.returncode, bad.stdout))
+        check(cli(d.config, "--send", "device/t/label", "s:42").returncode == 0, "label as text")
+        r.wait("/touch/device/t/label", lambda x: x.args == ["42"], timeout=3)
+        cal = cli(d.config, "--send", "/touch/device/t/calibration", "1", "0", "-0.02", "0", "1", "0")
+        check(cal.returncode == 0, "calibration: %s" % cal.stdout)
+        r.wait("/touch/device/t/calibration", lambda x: len(x.args) == 6 and abs(x.args[2] + 0.02) < 1e-6, timeout=3)
+        st = cli(d.config, "--status")
+        saved = [line for line in st.stdout.splitlines() if line.startswith("saved over OSC (these win over the config file): ")]
+        check(len(saved) == 1 and all(n in saved[0] for n in ("device/t/label", "device/t/rotation", "device/t/calibration")), st.stdout)
+        empty = cli(d.config, "--send")
+        check(empty.returncode == 1 and "--send needs an address" in empty.stdout, "no address: %d %s" % (empty.returncode, empty.stdout))
+    cfg = os.path.join(RUN_DIR, "cli-nobody.toml")
+    with open(cfg, "w") as f:
+        f.write('[osc]\nlisten = "127.0.0.1:%d"\nallowed_ips = ["127.0.0.1"]\n[[device]]\nid = "t"\nusb = "7470:0001"\n' % DAEMON_PORT)
+    st = cli(cfg, "--status")
+    check(st.returncode == 6 and "no answer from touch-to-osc on 127.0.0.1:%d" % DAEMON_PORT in st.stdout, "nobody: %d %s" % (st.returncode, st.stdout))
+
+
+@test()
+def a_journal_stream_variable_alone_does_not_change_how_it_logs():
+    with Ctx("journalvar") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)], env={"JOURNAL_STREAM": "1:1"})
+        r = c.receiver()
+        connected(r)
+        text = d.log_text()
+        check("NOTICE touch-to-osc" in text and not any(line.startswith("<") for line in text.splitlines()), "log %s" % text[:400])
+
+
+@test()
+def check_config_without_root_says_to_use_sudo():
+    os.makedirs("/tmp/tto-e2e", exist_ok=True)
+    os.chmod("/tmp/tto-e2e", 0o755)
+    settings = "/tmp/tto-e2e/sudo-settings.toml"
+    with open(settings, "w") as f:
+        f.write('[device.t]\nlabel = "x"\n')
+    os.chmod(settings, 0o640)
+    cfg = "/tmp/tto-e2e/sudo.toml"
+    with open(cfg, "w") as f:
+        f.write('[osc]\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = "%s"\nstate = ""\n[[device]]\nid = "t"\nusb = "7470:0001"\n' % settings)
+    os.chmod(cfg, 0o644)
+    chk = subprocess.run(["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", os.path.join(BUILD, "touch-to-osc"), "--check-config", cfg],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    check(chk.returncode == 0 and "can only be read by root: run it with sudo" in chk.stdout, "--check-config said %d: %s" % (chk.returncode, chk.stdout))
+    chk = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--check-config", cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    check(chk.returncode == 0 and "wins over the config for: device/t/label" in chk.stdout, "as root: %d: %s" % (chk.returncode, chk.stdout))
+
+
+@test()
 def usb_reset_needs_a_screen_on_usb_and_recovery_is_a_saved_setting():
     with Ctx("usbcmd") as c:
         p = test_product()
@@ -1267,7 +1963,7 @@ def usb_reset_needs_a_screen_on_usb_and_recovery_is_a_saved_setting():
         connected(r)
         got = req(r, "/touch/device/t/usb_reset")
         check(got == ["refused", "t has not been seen on a USB port since touch-to-osc started and no port is set for it, so there is nothing to reset: plug the screen"
-                      " in again, or set match_port (port in the config file) to the USB port it is plugged into, such as 3-3"], "got %s" % got)
+                      " in again, or set match_port to the USB port it is plugged into, such as 3-3"], "got %s" % got)
         check(req(r, "/touch/device/t/usb_reset", 1) == ["refused", "usb_reset takes no arguments"], "arguments")
         m = r.mark()
         check(req(r, "/touch/device/t/usb_recovery", 0) == ["ok", ""], "off")
@@ -1278,7 +1974,7 @@ def usb_reset_needs_a_screen_on_usb_and_recovery_is_a_saved_setting():
 
 
 @test()
-def a_screen_that_drops_out_is_counted_and_warned_about_for_a_minute():
+def a_screen_that_drops_out_is_counted_and_health_is_ok_again_once_it_reads():
     with Ctx("losses") as c:
         p = test_product()
         s = c.screen(p)
@@ -1294,10 +1990,15 @@ def a_screen_that_drops_out_is_counted_and_warned_about_for_a_minute():
         c.screen(p)
         back = r.wait("/touch/event", lambda x: x.args[0] == "device" and " connected: " in x.args[1], since=m, timeout=4)
         check(back.args[2:] == ["notice"], "the connected event %s" % back.args)
-        r.wait("/touch/health", lambda x: x.args == ["warning"], since=m, timeout=3)
-        r.wait("/touch/reasons", lambda x: "t was unplugged or dropped off USB 1 time(s) in the last minute: check its USB cable and its joints" in x.args,
-               since=m, timeout=3)
+        r.wait("/touch/health", lambda x: x.args == ["fault"], since=m, timeout=3)
+        r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m, timeout=3)
+        m2 = r.mark()
         r.wait("/touch/device/t/counts", lambda x: x.args[5] == 1, since=m, timeout=2.5)
+        time.sleep(2.5)
+        health = r.all(m, "/touch/health")
+        check(health and health[-1].args == ["ok"], "health after the screen came back: %s" % health[-3:])
+        r.none("/touch/health", lambda x: x.args != ["ok"], during=0.1, since=m2)
+        r.none("/touch/reasons", lambda x: x.args != [], during=0.1, since=m2)
 
 
 def fake_usb_tree(name):

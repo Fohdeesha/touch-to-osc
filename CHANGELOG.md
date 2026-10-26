@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.6.0 - 2026-10-25
+
+From a full review of the daemon. The OSC interface stays at version 5: no address or
+argument changed; some texts and when health warns did.
+
+Fixes:
+
+- A screen held by another program was read again, as soon as that program let go, from
+  the touch state the daemon had missed meanwhile (a lift could land on the wrong finger),
+  and a contact announced before could end without an `up` or `cancel`. The screen is now
+  opened afresh when the other program lets go, and its contacts are cancelled first.
+- A second copy started by hand could share the service's UDP port and take its commands.
+  It now exits 3, saying the service most likely runs already.
+- A stop or restart while a USB reset waited in the kernel could leave the USB hub unbound,
+  with every device on it off until a reboot. A stop or restart now waits for the reset
+  (telling systemd it is still alive), a restart is refused while one runs, and a reset cut
+  short anyway is finished at the next start.
+- `restart` is refused when the installed program would not start with the config (it
+  checked with the running version before), when a changed `osc.listen` cannot be used,
+  and while a USB reset runs. A repeated restart request whose reply was lost no longer
+  restarts twice.
+- USB recovery remembers the port each screen was last read on across restarts, so a
+  screen that is stuck at boot is still watched, and a reset advances the wait of every
+  screen on that hub, not only the one that asked.
+- Saving the settings no longer runs on the thread that sends the heartbeat; a slow disk
+  cannot hold up the alive or the watchdog.
+- An axis range near the 32-bit limits (a broken device) is mapped without overflowing.
+- Text from outside (an address in a request, a name to forget, a host) is never echoed
+  unprintable into replies, the status or the journal.
+- Run by hand from a terminal that has `JOURNAL_STREAM` set, the daemon no longer makes
+  that terminal non-blocking; a line cut short in the journal is ended before the next.
+- `apt remove` followed by a new install left the service disabled and stopped; it is
+  enabled and started again if it was before. An upgrade whose new version refuses the
+  config no longer restarts the service into a stop: the old version keeps running, and
+  the install says so.
+
+Changed behaviour:
+
+- `health` says what is true now. A screen that drops out is a `fault` while it is gone and
+  `ok` again as soon as it reads (before, a `warning` stayed for a minute); the drop stays
+  in its event and in `losses`. Silences no longer leave a warning either. A device turned
+  off in the config file is no longer a warning. `health` and `reasons` always come
+  together in one bundle.
+- A config edit made after a setting was changed over OSC wins at the next start: the
+  settings file now records what the config file said when each setting was saved, and a
+  config value changed since then applies, with a journal line. Allowed hosts and saved
+  destinations changed over OSC are kept as changes on top of the config file's lists, so a
+  host added to the config file later is not hidden. Older settings files are read as
+  before and rewritten in the new form; 0.5.1 and older refuse the new form.
+- Saved settings for a device the config no longer has are kept, unused, instead of being
+  dropped at the next save; `settings/forget device/<id>` forgets all of one device's.
+- When the config file is refused at a start, the daemon runs on its copy of the last
+  config that started, with a health warning saying why, instead of staying stopped.
+- Leases are kept over `restart`: each subscriber still allowed gets the full status and an
+  alive with the new run right after it, so nothing touched in those first seconds is
+  lost.
+- Identical screens matched by usb id alone are shared out in USB port order, and a block
+  that names a port, a serial or a usb id chooses before one that says less, so the same
+  cabling gives each device the same screen at every start. `--check-config` and the
+  journal warn about blocks that cannot be told apart, and the health warns while one
+  matches several screens.
+- `match_usb`, `match_serial` and `match_port` are the config file's names too, as over
+  OSC; `usb`, `serial` and `port` still work (giving both is refused). 0.5.1 and older
+  refuse the new names.
+- New `[paths] state` (`/var/lib/touch-to-osc/state.toml`): what the daemon keeps between
+  runs. 0.5.1 and older refuse the key.
+- Device ids `device`, `devices`, `status`, `settings`, `describe`, `allowed_ips` and
+  `saved_destinations` are refused: touches to them would mix with the daemon's own
+  addresses.
+
+New:
+
+- `touch-to-osc --status` shows the running service's health, screens and settings, and
+  `touch-to-osc --send ADDRESS [VALUE...]` sends it one command and prints the answer.
+- `--list` shows the touchscreens first, which device reads each (the way the daemon
+  shares them out), what a USB reset for each would reset, and a `[[device]]` block to
+  paste for a screen no block reads; `--all` lists the other input devices too.
+- `touch-to-osc-watch` (watch.py) in `/usr/bin`; it defaults to this machine, has
+  `--device`, says when nothing answers, and `--no-alive` really leaves out the counters.
+- Messages that say more: an unknown key or address names the closest known one, a value
+  only reported by the status says it cannot be set, config errors name the device
+  (`device "face" (the 1st [[device]])`), the refusal to an outside host says where the
+  allowed hosts come from, the start lines list the allowed hosts, a screen on another
+  port than `match_port` says where it is, a finished USB reset names what else it
+  dropped, a screen that reports no size says its aspect is a guess, and a screen that
+  goes quiet and then reports the same finger again gets a hint about `silence_ms`.
+- `--config FILE` works with a space, `-h` and `--help` print the usage with the exit
+  codes, `--check-config` without root says to use sudo instead of calling the settings
+  refused, and exits 5 when only the saved settings are refused.
+- README: a quick start, several screens, lining up the touch panel step by step,
+  troubleshooting, where answers go and what a firewall must let in.
+
 ## 0.5.1 - 2026-10-22
 
 - A Debian package, attached to each version's GitHub release from now on:

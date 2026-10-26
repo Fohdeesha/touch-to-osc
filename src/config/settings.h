@@ -29,25 +29,33 @@ struct DeviceOverrides {
 
 struct Overrides {
     std::optional<std::string> log_level;
-    std::optional<std::vector<std::string>> allowed_ips;
-    std::optional<std::vector<DestinationConfig>> saved_destinations;
+    std::vector<std::string> allowed_added;
+    std::vector<std::string> allowed_removed;
+    std::vector<DestinationConfig> destinations_added;
+    std::vector<std::string> destinations_removed;
     std::map<std::string, DeviceOverrides> devices;
+    std::map<std::string, DeviceOverrides> unused_devices;
 
     bool empty() const;
 };
 
 struct SettingsLoad {
     Overrides overrides;
+    Overrides config_values;
     std::vector<std::string> notes;
     std::string problem;
     bool file_exists = false;
+    bool no_permission = false;
+    bool rewrite = false;
 };
 
 Config apply_overrides(const Config& base, const Overrides& o);
 void drop_unchanged(Overrides& o, const Config& base);
 std::vector<std::string> override_names(const Overrides& o);
 bool forget_override(Overrides& o, const std::string& name);
-std::string settings_text(const Overrides& o, const std::string& config_path);
+DeviceOverrides device_values(const DeviceConfig& d);
+void note_config_values(const Overrides& before, const Overrides& after, const Config& file, Overrides& config_values);
+std::string settings_text(const Overrides& o, const Overrides& config_values, const std::string& config_path);
 Result<SettingsLoad> parse_settings(const std::string& text, const std::string& source, const Config& base);
 SettingsLoad load_settings(const Config& base, bool set_aside_refused);
 std::string destination_text(const DestinationConfig& d);

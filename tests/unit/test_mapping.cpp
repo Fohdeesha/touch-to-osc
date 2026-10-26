@@ -29,6 +29,22 @@ DeviceConfig dev(int rotation, const char* mirror = "") {
 const Axis kX{0, 1920, 4};
 const Axis kY{0, 1080, 4};
 
+}
+
+TEST_CASE("an axis spanning the whole int32 range maps without overflowing") {
+    const Axis wide{INT32_MIN, INT32_MAX, 0};
+    Mapping m(dev(0), wide, wide);
+    Pt mid = at(m, 0, 0);
+    CHECK(mid.x == doctest::Approx(0.5).epsilon(1e-6));
+    CHECK(mid.y == doctest::Approx(0.5).epsilon(1e-6));
+    Pt hi = at(m, INT32_MAX, INT32_MIN);
+    CHECK(hi.x == doctest::Approx(1.0));
+    CHECK(hi.y == doctest::Approx(0.0));
+    CHECK(m.aspect() == doctest::Approx(1.0));
+}
+
+namespace {
+
 void corner(const Mapping& m, int rx, int ry, float ex, float ey) {
     Pt p = at(m, rx, ry);
     CHECK(p.x == doctest::Approx(ex));

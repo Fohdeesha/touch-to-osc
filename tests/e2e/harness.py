@@ -42,12 +42,12 @@ class Msg:
 
 
 class Receiver:
-    def __init__(self, port, prefix="/touch", target=("127.0.0.1", DAEMON_PORT)):
+    def __init__(self, port, prefix="/touch", target=("127.0.0.1", DAEMON_PORT), host="127.0.0.1"):
         self.port = port
         self.prefix = prefix
         self.target = target
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(("127.0.0.1", port))
+        self.sock.bind((host, port))
         self.sock.settimeout(0.1)
         self.items = []
         self.lock = threading.Lock()
@@ -138,25 +138,26 @@ def device_block(d):
 
 
 class Daemon:
-    def __init__(self, name, devices, extra="", destinations=(), keep_settings=False, allowed=("127.0.0.1",), env=None):
+    def __init__(self, name, devices, extra="", destinations=(), keep_settings=False, allowed=("127.0.0.1",), env=None, binary=None):
         os.makedirs(RUN_DIR, exist_ok=True)
         self.name = name
         self.config = os.path.join(RUN_DIR, name + ".toml")
         self.log_path = os.path.join(RUN_DIR, name + ".log")
         self.settings = os.path.join(RUN_DIR, name + "-settings.toml")
+        self.state = os.path.join(RUN_DIR, name + "-state.toml")
         if not keep_settings:
-            for f in (self.settings, self.settings + ".refused"):
+            for f in (self.settings, self.settings + ".refused", self.state, self.state + ".usb-reset"):
                 if os.path.exists(f):
                     os.remove(f)
-        text = '[osc]\nlisten = "127.0.0.1:%d"\nallowed_ips = [%s]\n%s\n[paths]\nsettings = "%s"\n' % (
-            DAEMON_PORT, ", ".join('"%s"' % a for a in allowed), extra, self.settings)
+        text = '[osc]\nlisten = "127.0.0.1:%d"\nallowed_ips = [%s]\n%s\n[paths]\nsettings = "%s"\nstate = "%s"\n' % (
+            DAEMON_PORT, ", ".join('"%s"' % a for a in allowed), extra, self.settings, self.state)
         for dest in destinations:
             text += '[[destination]]\naddress = "%s"\n' % dest
         text += "\n".join(device_block(d) for d in devices) + "\n"
         with open(self.config, "w") as f:
             f.write(text)
         self.log = open(self.log_path, "w")
-        self.proc = subprocess.Popen([os.path.join(BUILD, "touch-to-osc"), "--config=" + self.config], stdout=self.log, stderr=subprocess.STDOUT,
+        self.proc = subprocess.Popen([binary or os.path.join(BUILD, "touch-to-osc"), "--config=" + self.config], stdout=self.log, stderr=subprocess.STDOUT,
                                      env=dict(os.environ, **env) if env else None)
         deadline = time.time() + 15
         while "OSC on UDP" not in self.log_text():

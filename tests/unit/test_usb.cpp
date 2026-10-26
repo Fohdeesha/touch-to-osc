@@ -165,6 +165,59 @@ TEST_CASE("rebinding writes unbind then bind, and says so when the hub is not bo
     CHECK(st.error().find("echo 3-0:1.0 > " + p.hub_driver + "/bind") != std::string::npos);
 }
 
+TEST_CASE("a reset leaves a marker naming the hub only while the hub is not bound again") {
+    TempDir dir;
+    const std::string& root = dir.path;
+    UsbPaths p;
+    p.devices = root + "/devices";
+    p.hub_driver = root + "/hub";
+    mkdir(p.devices.c_str(), 0755);
+    mkdir(p.hub_driver.c_str(), 0755);
+    touch(p.hub_driver + "/unbind");
+    touch(p.hub_driver + "/bind");
+    mkdir((p.devices + "/3-0:1.0").c_str(), 0755);
+    mkdir((p.devices + "/3-0:1.0/driver").c_str(), 0755);
+    std::string marker = root + "/state.toml.usb-reset";
+    CHECK(rebind_hub("3-0:1.0", p, marker));
+    CHECK(access(marker.c_str(), F_OK) != 0);
+    rmdir((p.devices + "/3-0:1.0/driver").c_str());
+    CHECK_FALSE(rebind_hub("3-0:1.0", p, marker));
+    CHECK(slurp(marker) == "3-0:1.0\n");
+}
+
+TEST_CASE("a hub a cut-short reset left unbound is bound at start, and a bound one is left alone") {
+    TempDir dir;
+    const std::string& root = dir.path;
+    UsbPaths p;
+    p.devices = root + "/devices";
+    p.hub_driver = root + "/hub";
+    mkdir(p.devices.c_str(), 0755);
+    mkdir(p.hub_driver.c_str(), 0755);
+    mkdir((p.devices + "/3-0:1.0").c_str(), 0755);
+    std::string marker = root + "/state.toml.usb-reset";
+    std::string done;
+    CHECK(bind_hub_left_unbound(marker, p, &done));
+    CHECK(done.empty());
+    std::ofstream(marker) << "3-0:1.0\n";
+    touch(p.hub_driver + "/bind");
+    Status st = bind_hub_left_unbound(marker, p, &done);
+    REQUIRE_FALSE(st);
+    CHECK(st.error().find("left unbound by a reset cut short") != std::string::npos);
+    CHECK(st.error().find("echo 3-0:1.0 > " + p.hub_driver + "/bind") != std::string::npos);
+    CHECK(slurp(p.hub_driver + "/bind").find("3-0:1.0") == 0);
+    CHECK(access(marker.c_str(), F_OK) == 0);
+    mkdir((p.devices + "/3-0:1.0/driver").c_str(), 0755);
+    std::ofstream(p.hub_driver + "/bind", std::ios::trunc).flush();
+    CHECK(bind_hub_left_unbound(marker, p, &done));
+    CHECK(done.empty());
+    CHECK(slurp(p.hub_driver + "/bind").empty());
+    CHECK(access(marker.c_str(), F_OK) != 0);
+    std::ofstream(marker) << "3-0:1.0 > /etc/x\n";
+    CHECK(bind_hub_left_unbound(marker, p, &done));
+    CHECK(slurp(p.hub_driver + "/bind").empty());
+    CHECK(access(marker.c_str(), F_OK) != 0);
+}
+
 TEST_CASE("an unbind that fails while the hub stays bound is an error and nothing is bound") {
     TempDir dir;
     const std::string& root = dir.path;
@@ -182,6 +235,23 @@ TEST_CASE("an unbind that fails while the hub stays bound is an error and nothin
     CHECK(slurp(p.hub_driver + "/bind").find("3-0:1.0") == std::string::npos);
 }
 
+TEST_CASE("a reset advances the wait of every screen watched on that hub, and only there") {
+    constexpr Nanos s = kSec;
+    std::vector<UsbRecovery> recs(4);
+    std::vector<std::string> watched = {"3-0:1.0", "3-0:1.0", "1-0:1.0", ""};
+    reset_done_on_hub(recs, watched, 0, "3-0:1.0", 10 * s);
+    CHECK(recs[0].attempts() == 1);
+    CHECK(recs[1].attempts() == 1);
+    CHECK(recs[2].attempts() == 0);
+    CHECK(recs[3].attempts() == 0);
+    CHECK_FALSE(recs[1].observe(11 * s, PortState::stuck));
+    CHECK_FALSE(recs[1].observe(29 * s, PortState::stuck));
+    CHECK(recs[1].observe(30 * s, PortState::stuck));
+    reset_done_on_hub(recs, watched, 3, "", 40 * s);
+    CHECK(recs[3].attempts() == 1);
+    CHECK(recs[0].attempts() == 1);
+}
+
 TEST_CASE("a finished reset counts as busy until its result is collected") {
     TempDir dir;
     const std::string& root = dir.path;
@@ -196,7 +266,7 @@ TEST_CASE("a finished reset counts as busy until its result is collected") {
     mkdir((p.devices + "/3-0:1.0/driver").c_str(), 0755);
     UsbWorker w(p);
     CHECK_FALSE(w.busy());
-    w.reset("3-0:1.0", 5);
+    w.reset(*parse_usb_port("3-3"), 5);
     CHECK(w.resetting());
     CHECK(w.busy_since() == 5);
     CHECK(w.wait(2 * kSec));
@@ -249,7 +319,7 @@ TEST_CASE("a reset held up in the kernel does not hold up stopping") {
     std::thread stopping([&] {
         {
             UsbWorker w(p);
-            w.reset("3-0:1.0", 0);
+            w.reset(*parse_usb_port("3-3"), 0);
             waited = w.wait(100 * kMs);
         }
         gone = true;

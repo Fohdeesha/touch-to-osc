@@ -4,10 +4,12 @@
 #include "core/log.h"
 #include "osc/osc.h"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <set>
 #include <sstream>
 
@@ -40,8 +42,24 @@ void section(StrictTable& root, const char* name, F&& fn) {
     if (!o.ok()) root.adopt(o.error());
 }
 
+std::string ordinal(size_t n) {
+    const char* end = (n % 100 >= 11 && n % 100 <= 13) ? "th" : n % 10 == 1 ? "st" : n % 10 == 2 ? "nd" : n % 10 == 3 ? "rd" : "th";
+    return std::to_string(n) + end;
+}
+
+// errors name a table by what it says it is: device "face" (the 2nd [[device]])
+std::string table_label(const toml::node& e, const char* name, const char* named_by, size_t index) {
+    std::string where = "the " + ordinal(index) + " [[" + name + "]]";
+    const toml::table* t = e.as_table();
+    const toml::node* v = t ? t->get(named_by) : nullptr;
+    if (!v || !v->is_string()) return where;
+    std::string s(v->as_string()->get());
+    if (s.empty() || s.size() > 32 || !check_text(s, 32).empty()) return where;
+    return std::string(name) + " \"" + s + "\" (" + where + ")";
+}
+
 template <typename F>
-void table_list(StrictTable& root, const char* name, size_t max_items, F&& fn) {
+void table_list(StrictTable& root, const char* name, const char* named_by, size_t max_items, F&& fn) {
     const toml::node* v = root.take(name);
     if (!v) return;
     if (!v->is_array_of_tables()) {
@@ -56,7 +74,7 @@ void table_list(StrictTable& root, const char* name, size_t max_items, F&& fn) {
     size_t index = 0;
     for (auto&& e : a) {
         ++index;
-        StrictTable o(&e, std::string(name) + "[" + std::to_string(index) + "]");
+        StrictTable o(&e, table_label(e, name, named_by, index));
         if (o.ok()) fn(o);
         o.finish();
         if (!o.ok()) {
@@ -72,6 +90,12 @@ bool valid_id(const std::string& s) {
         if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
     }
     return true;
+}
+
+// touches go to <prefix>/<id>/down: an id that is also the first part of the daemon's own addresses would mix the two
+bool reserved_id(const std::string& s) {
+    static const char* const names[] = {"device", "devices", "status", "settings", "describe", "allowed_ips", "saved_destinations"};
+    return std::find(std::begin(names), std::end(names), s) != std::end(names);
 }
 
 bool parse_usb(const std::string& s, uint16_t& vendor, uint16_t& product) {
@@ -95,15 +119,22 @@ void device_table(StrictTable& o, DeviceConfig& d) {
     o.str("id", d.id, 32, false);
     if (o.ok() && d.id.empty()) o.fail("id", "is missing: give the device a short name such as \"face\"");
     if (o.ok() && !valid_id(d.id)) o.fail("id", "may only use a-z, 0-9, _ and - (it becomes part of OSC addresses)");
+    if (o.ok() && reserved_id(d.id)) o.fail("id", "\"" + d.id + "\" is a name touch-to-osc uses in its own addresses: choose another, such as \"screen1\"");
     o.str("label", d.label, 64);
+    auto named = [&](const char* name, const char* older) -> const char* {
+        bool now = o.table() && o.table()->get(name), before = o.table() && o.table()->get(older);
+        if (now && before) o.fail(older, std::string("is the older name of ") + name + ": give one of them");
+        return before && !now ? older : name;
+    };
+    const char* usb_key = named("match_usb", "usb");
     std::string usb;
-    if (o.str("usb", usb, 16) && !usb.empty()) {
-        if (o.check("usb", check_usb(usb, &d.vendor, &d.product))) d.has_usb = true;
+    if (o.str(usb_key, usb, 16) && !usb.empty()) {
+        if (o.check(usb_key, check_usb(usb, &d.vendor, &d.product))) d.has_usb = true;
     }
-    o.str("serial", d.serial, 128);
-    o.str("port", d.port, 64);
+    o.str(named("match_serial", "serial"), d.serial, 128);
+    o.str(named("match_port", "port"), d.port, 64);
     if (o.ok() && !d.has_usb && d.port.empty())
-        o.fail("", "says nothing about which device to read: set usb (vendor:product) or port (both are shown by touch-to-osc --list)");
+        o.fail("", "says nothing about which device to read: set match_usb (vendor:product) or match_port (both are shown by touch-to-osc --list)");
     o.boolean("grab", d.grab);
     long long rotation = 0;
     if (o.integer("rotation", rotation, -100000, 100000) && o.check("rotation", check_rotation(rotation))) d.rotation = int(rotation);
@@ -161,7 +192,7 @@ std::string check_calibration(const std::vector<double>& v) {
     bool finite = true;
     for (double x : v) finite = finite && std::isfinite(x) && std::abs(x) <= 100.0;
     if (v.empty() || (v.size() == 6 && finite)) return {};
-    return "must be six numbers (an affine map, each at most 100), or none";
+    return "must be six numbers [a, b, c, d, e, f] as in config.example.toml, each between -100 and 100, or none";
 }
 
 std::string check_silence(long long v) {
@@ -188,7 +219,7 @@ std::string check_text(const std::string& v, size_t max_len) {
 std::string check_ipv4(const std::string& v) {
     in_addr a{};
     if (inet_pton(AF_INET, v.c_str(), &a) == 1) return {};
-    return "'" + v + "' is not an IPv4 address";
+    return (check_text(v, 64).empty() ? "'" + v + "'" : std::string("that")) + " is not an IPv4 address";
 }
 
 std::string check_log_level(const std::string& v) {
@@ -253,8 +284,12 @@ Result<Config> parse_config(const std::string& toml_text, const std::string& sou
     section(root, "paths", [&](StrictTable& o) {
         if (o.str("settings", c.paths.settings, 256) && !c.paths.settings.empty() && c.paths.settings.front() != '/')
             o.fail("settings", "must be an absolute path, or \"\" to keep changes made over OSC only until a restart");
+        if (o.str("state", c.paths.state, 256) && !c.paths.state.empty() && c.paths.state.front() != '/')
+            o.fail("state", "must be an absolute path, or \"\" to keep nothing between runs");
     });
-    table_list(root, "destination", kMaxDestinations, [&](StrictTable& o) {
+    if (root.ok() && !c.paths.state.empty() && c.paths.state == c.paths.settings)
+        root.fail("paths", "settings and state must be two different files");
+    table_list(root, "destination", "address", kMaxDestinations, [&](StrictTable& o) {
         DestinationConfig d;
         host_port(o, "address", d.address, false);
         if (o.ok() && d.address.port == 0) o.fail("address", "is missing: give the receiver as \"IP:PORT\"");
@@ -263,7 +298,7 @@ Result<Config> parse_config(const std::string& toml_text, const std::string& sou
         if (o.ok() && !d.touches && !d.status) o.fail("", "sends nothing: set touches or status (or both) to true");
         c.destinations.push_back(d);
     });
-    table_list(root, "device", kMaxDevices, [&](StrictTable& o) {
+    table_list(root, "device", "id", kMaxDevices, [&](StrictTable& o) {
         DeviceConfig d;
         device_table(o, d);
         c.devices.push_back(d);
@@ -282,6 +317,26 @@ Result<Config> parse_config(const std::string& toml_text, const std::string& sou
         if (!dests.insert(d.address.text()).second) return err(source_name + ": destination " + d.address.text() + " is listed twice");
     }
     return c;
+}
+
+std::vector<std::string> overlap_warnings(const Config& c) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < c.devices.size(); ++i) {
+        for (size_t j = i + 1; j < c.devices.size(); ++j) {
+            const DeviceConfig& a = c.devices[i];
+            const DeviceConfig& b = c.devices[j];
+            bool usb = !a.has_usb || !b.has_usb || (a.vendor == b.vendor && a.product == b.product);
+            bool serial = a.serial.empty() || b.serial.empty() || a.serial == b.serial;
+            bool port = a.port.empty() || b.port.empty() || a.port == b.port;
+            if (!usb || !serial || !port) continue;
+            if (!a.port.empty() && a.port == b.port)
+                out.push_back("devices " + a.id + " and " + b.id + " both name port " + a.port + ": only one of them can read the screen there; give each its own port");
+            else if (a.port.empty() && b.port.empty())
+                out.push_back("devices " + a.id + " and " + b.id + " can both read the same touchscreen (" + a.match_text() + " / " + b.match_text() +
+                              "), so which screen each reads depends on the order of the USB ports: set match_port for each; touch-to-osc --list shows the ports");
+        }
+    }
+    return out;
 }
 
 Result<Config> load_config(const std::string& path) {

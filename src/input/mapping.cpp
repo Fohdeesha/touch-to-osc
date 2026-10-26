@@ -8,7 +8,7 @@ namespace {
 
 double unit(int32_t v, const Axis& a) {
     if (a.max <= a.min) return 0.0;
-    return double(v - a.min) / double(a.max - a.min);
+    return (double(v) - double(a.min)) / (double(a.max) - double(a.min));
 }
 
 }
@@ -19,7 +19,7 @@ Mapping::Mapping(const DeviceConfig& cfg, Axis x, Axis y)
         calibrated_ = true;
         std::copy(cfg.calibration.begin(), cfg.calibration.end(), c_);
     }
-    double w = double(x.max - x.min), h = double(y.max - y.min);
+    double w = double(x.max) - double(x.min), h = double(y.max) - double(y.min);
     if (x.resolution > 0 && y.resolution > 0) {
         w_mm_ = float(w / x.resolution);
         h_mm_ = float(h / y.resolution);

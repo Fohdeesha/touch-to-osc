@@ -12,8 +12,9 @@ where a picture shown on the screen sits.
 
 - Every contact it announces ends with exactly one `up` or `cancel`, which it sends itself.
   A contact never outlives its device, its run or the process: unplugging the screen, the
-  screen going silent, a disable command, the kernel dropping events, a USB reset and
-  stopping or restarting the daemon all cancel the contacts that were down.
+  screen going silent, a disable command, the kernel dropping events, a USB reset, another
+  program taking the screen and stopping or restarting the daemon all cancel the contacts
+  that were down.
 - Every second it sends the list of contacts still down on each device, so a receiver that
   lost an `up` (UDP can lose datagrams) ends that contact within about a second.
 - A finger that was already on the screen when reading started (at start, after a
@@ -26,63 +27,81 @@ where a picture shown on the screen sits.
   screen's contacts and reads it again from scratch.
 - Reading a touch never waits on the network, the disk or the status work: each device has
   its own reader thread that sends without blocking (a full socket drops the datagram and
-  counts it).
+  counts it). Files are written on a thread of their own, and USB checks and resets on
+  another, so neither holds up the heartbeat.
 
-## Requirements
+## Quick start
 
-Linux with evdev, libevdev, a C++17 compiler, CMake 3.18 or newer and Ninja. Built and
-tested on Debian 11 (kernel 5.10, g++ 10, libevdev 1.11):
+1. Install the package (see Install, upgrade and remove):
 
-    apt install build-essential cmake ninja-build pkg-config libevdev-dev
+       sudo apt install ./touch-to-osc_*_amd64.deb
 
-`evtest` and `evemu-tools` are useful for looking at a screen and recording it. The tests
-also need `python3`.
+2. Find the screen:
 
-## Build and install
+       sudo touch-to-osc --list
 
-The usual way is the Debian package. Every version is released on GitHub
-(`Fohdeesha/touch-to-osc`, Releases) with its package attached,
-`touch-to-osc_<version>-1_amd64.deb`, built on Debian 11 so that the one file installs on
-Debian 11 to 13 and Ubuntu 22.04 and 24.04. Download it (for example
+   It lists each touchscreen with its USB id, serial and port, which `[[device]]` block
+   of the config reads it, and a block ready to paste for any screen no block reads.
+
+3. In `/etc/touch-to-osc/touch-to-osc.toml`, set `match_usb` in the `[[device]]` block
+   (and `match_port` too when two screens are the same model), and add the IP of each
+   machine that runs a receiver to `osc.allowed_ips`. Then check the file:
+
+       sudo touch-to-osc --check-config
+
+4. Restart the service and look at it:
+
+       sudo systemctl restart touch-to-osc
+       touch-to-osc --status
+
+5. Watch the touches and touch the four corners of the display: top left should read about
+   `0 0`, top right `1 0`, bottom left `0 1`, bottom right `1 1`. If they do not, see
+   Lining up the touch panel.
+
+       touch-to-osc-watch --no-alive
+
+## Install, upgrade and remove
+
+Every version is released on GitHub (`Fohdeesha/touch-to-osc`, Releases) with its Debian
+package attached, `touch-to-osc_<version>-1_amd64.deb`, built on Debian 11 so that the one
+file installs on Debian 11 to 13 and Ubuntu 22.04 and 24.04. Download it (for example
 `gh release download -R Fohdeesha/touch-to-osc -p '*.deb'` for the newest) and install it
 on each machine:
 
     sudo apt install ./touch-to-osc_*_amd64.deb
 
-To build the package yourself, do it on the oldest system it is meant for:
+The package installs `/usr/bin/touch-to-osc`, `/usr/bin/touch-to-osc-watch` and the
+systemd unit, writes `/etc/touch-to-osc/touch-to-osc.toml` from the example in
+`/usr/share/touch-to-osc` if there is none yet, checks it, and enables and starts the
+service.
 
-    scripts/build-deb.sh
-    sudo apt install ./build-deb/touch-to-osc_*_amd64.deb
+- **Upgrading:** installing a newer package keeps the config and the saved settings and
+  restarts the service if it is running, which cancels the contacts that are down and
+  starts a new run: install between shows. When the new version refuses the config, the
+  service is not restarted and keeps running the old version until it stops; the install
+  says so. Fix the file, then `sudo systemctl restart touch-to-osc`.
+- **Removing:** `sudo apt remove touch-to-osc` stops and removes the program and keeps the
+  config and the saved settings; installing it again later enables and starts it again if
+  it was enabled before. `sudo apt purge touch-to-osc` removes the config and the saved
+  settings too.
+- **Going back to 0.5.1 or older:** those versions refuse `match_usb`, `match_serial`,
+  `match_port` and `[paths] state` in the config (use `usb`, `serial` and `port` and drop
+  `state`), and refuse a settings file written by 0.6.0 (they set it aside and run on the
+  config file).
 
-`build-deb.sh` builds with warnings as errors, runs the unit tests and writes the package
-to `build-deb/`. The package installs `/usr/bin/touch-to-osc` and its systemd unit, writes
-`/etc/touch-to-osc/touch-to-osc.toml` from the example in `/usr/share/touch-to-osc` if
-there is none yet, checks it, and enables and starts the service. Installing a newer
-package restarts the service if it is running and keeps the config and the saved
-settings. `sudo apt remove touch-to-osc` stops and removes the program and keeps them;
-`sudo apt purge touch-to-osc` removes them too. A copy installed before with
-`scripts/install.sh` is replaced: the package removes that program and its unit.
-
-Without the package, on any Linux with systemd, from the source tree:
-
-    sudo scripts/install.sh
-    sudo systemctl enable --now touch-to-osc
-
-`install.sh` builds, runs the unit tests and installs under `/usr/local` (the unit in
-`/usr/local/lib/systemd/system`), with the same config handling. `scripts/uninstall.sh`
-removes it again (`--purge` also removes the config and the saved settings). Both refuse
-while the package is installed.
-
-Either way, settings changed over OSC are saved in `/var/lib/touch-to-osc/settings.toml`.
-
-The service runs as root, which it needs to reset a USB bus (see USB recovery below), but
-systemd takes every capability away from it, lets it reach no devices but the input and
-USB ones, and keeps the file system read-only apart from its settings. It restarts after
-a failure (every second, without giving up), stays stopped when the config is refused (fix
-it, then `systemctl restart touch-to-osc`), and reports its version, run and settings in
-the journal when it starts:
+The service runs as root, which it needs to reset a USB bus (see USB recovery), but systemd
+takes every capability away from it, lets it reach no devices but the input and USB ones,
+and keeps the file system read-only apart from `/var/lib/touch-to-osc`. It restarts after
+a failure (every second, without giving up). When the config file is refused at a start,
+it runs on its copy of the last config that started, with a health warning that says why
+the file is refused; with no such copy (a first install) it stays stopped until the file
+is fixed and `sudo systemctl restart touch-to-osc`. It reports its version, run, allowed
+hosts and settings in the journal when it starts:
 
     journalctl -u touch-to-osc
+
+A copy installed before with `scripts/install.sh` is replaced: the package removes that
+program and its unit. To build the package or install from the source tree, see Building.
 
 ## Configuration
 
@@ -93,26 +112,59 @@ the journal when it starts:
   send commands. Add the receiver's machine there.
 - `[[destination]]` (optional, none by default): receivers that get everything without
   subscribing.
-- `[[device]]`, one per screen: an `id` that becomes part of the addresses, which device
-  it is (`usb` vendor:product, `serial`, `port`), how its touch panel lines up with the
-  screen's display (`rotation`, `mirror`, `calibration`), and the display's `aspect`.
-  `silence_ms` cancels held contacts when the screen stops reporting; see the example
-  config before changing it. `usb_recovery` resets a USB connection the kernel gave up on
-  (below).
+- `[[device]]`, one per screen: an `id` that becomes part of the addresses, which screen
+  it reads (`match_usb` vendor:product, `match_serial`, `match_port`), how its touch panel
+  lines up with the screen's display (`rotation`, `mirror`, `calibration`), and the
+  display's `aspect`. `silence_ms` cancels held contacts when the screen stops reporting;
+  see the example config before changing it. `usb_recovery` resets a USB connection the
+  kernel gave up on (see USB recovery).
+- `[paths]`: where settings changed over OSC are saved (`settings`) and what the daemon
+  keeps between runs (`state`), both under `/var/lib/touch-to-osc`.
 
-Unknown keys, wrong types and out-of-range values are refused with a message that names
-the key. `touch-to-osc --check-config=FILE` checks a file without opening anything.
+Unknown keys, wrong types and out-of-range values are refused with a message that names the
+key and the device (`device "face" (the 1st [[device]]): rotation: must be 0, 90, 180 or
+270`), and an unknown key that looks like a known one is named (`rotaton: unknown key (did
+you mean rotation?)`). `sudo touch-to-osc --check-config` checks the file and its saved
+settings without opening anything.
 
-Settings can also be changed over OSC (see Commands below), for example from Bridge
-Studio. Those changes are saved in the daemon's own settings file, `[paths] settings`
-(`/var/lib/touch-to-osc/settings.toml` by default), and win over the config file at every
-start; the config file itself is never written. The status lists which settings come from
-there (`/touch/overrides`), and `/touch/settings/forget` puts one or all of them back to
-the config file's values. Changes are written within about a second; several changes in
-quick succession are written once, and a clean stop writes at once. A settings file the
-daemon refuses or cannot read at start is renamed to `settings.toml.refused` and reported
-in the health until the next restart, and the daemon runs on the config file, except that
-a screen the file had turned off stays off. `--check-config` checks the settings file too.
+The same setting has the same name everywhere, except the config file's older names,
+which still work:
+
+| What | Config file | OSC and the settings file | Status |
+|---|---|---|---|
+| which screen to read | `match_usb`, `match_serial`, `match_port` (or `usb`, `serial`, `port`) | `device/<id>/match_usb` and so on | the same addresses |
+| the screen read now | - | - | `device/<id>/usb`, `port`, `name` (cannot be set) |
+| log level | `[log] level` | `log_level` | `log_level` |
+| hosts allowed | `[osc] allowed_ips` | `allowed_ips/add`, `allowed_ips/remove` | `allowed_ips` |
+| receivers without a lease | `[[destination]]` | `saved_destinations/add`, `/remove` | `saved_destinations` |
+
+### Settings changed over OSC
+
+Settings can also be changed over OSC (see Commands), for example from Bridge Studio. Those
+changes are saved in the daemon's own settings file, `[paths] settings`
+(`/var/lib/touch-to-osc/settings.toml` by default), and win over the config file; the config
+file itself is never written. The settings file also records what the config file said
+when each setting was changed, so an edit made to the config file afterwards is not lost:
+when the config file's value for a saved setting has changed since, the config file's new
+value applies from the next start and the saved one is dropped, with a line in the
+journal saying which. Allowed hosts and saved destinations added or removed over OSC are
+kept as changes on top of the config file's lists, so a host added to the config file
+later is allowed even though the list was changed over OSC.
+
+To see and drop them from a shell:
+
+    sudo touch-to-osc --check-config     which settings are saved, and whether the file is good
+    touch-to-osc --status                the same from the running service
+    touch-to-osc --send settings/forget device/face/rotation    one setting
+    touch-to-osc --send settings/forget device/face             every saved setting of one device
+    touch-to-osc --send settings/forget                         all of them
+
+Changes are written within about a second; several changes in quick succession are written
+once, and a clean stop writes at once. A settings file the daemon refuses or cannot read
+at start is renamed to `settings.toml.refused` and reported in the health until the next
+restart, and the daemon runs on the config file, except that a screen the file had turned
+off stays off. Saved settings for a device the config no longer has (its id renamed, say)
+are kept but not used, and reported at start: put the id back, or forget them.
 
 Text settings (labels, serials, ports) may only use printable ASCII.
 
@@ -120,62 +172,176 @@ With `grab = false` and `silence_ms = 0`, the daemon cannot notice another progr
 the screen exclusively while a finger is down; with `silence_ms` on it cancels that
 contact and reports the screen as held by another program.
 
-### USB recovery
+## Several screens
+
+Give each screen its own `[[device]]` block and id. Two screens of the same model have
+the same `match_usb`, so tell them apart by `match_port`, the USB socket each is plugged
+into as `--list` shows it (or by `match_serial`, if theirs differ). Ports follow the
+socket, not the screen: label the sockets and the cables.
+
+When blocks can still read the same screens, the daemon shares them out the same way at
+every start: blocks that say more (a port, then a serial, then a usb id) choose first, the
+rest in config order, and each takes the first free matching screen in USB port order.
+Moving a cable to another socket can still swap them, so `--check-config` and the journal
+warn about blocks that cannot be told apart, and the health stays at `warning` while one
+of them matches several screens. A block whose port has no screen but whose screen is
+plugged in elsewhere says where it is ("a 0712:0009 touchscreen is plugged into port 3-4,
+not 3-3").
+
+To see which physical screen is which, run `touch-to-osc-watch` and touch each one in
+turn: every touch names its device. `--list` shows the screens no block reads.
+
+## Lining up the touch panel
+
+Touch positions come out as 0..1 of the display, top left `0 0`. To check them, run
+`touch-to-osc-watch --no-alive` (on the screen's machine, or on another with `--target
+IP:9480` if that machine is in `allowed_ips`) and touch each corner of the display.
+
+1. **Rotation and mirror** first. `rotation` turns positions clockwise by 0, 90, 180 or 270
+   degrees, then `mirror` flips them (`x` left-right, `y` top-bottom, `xy` both). Both apply
+   at once over OSC, so try them while watching:
+
+       touch-to-osc --send device/face/rotation 90
+       touch-to-osc --send device/face/mirror x
+
+   Touching the top right corner should read about `1 0`: reading `0 0` means set
+   `mirror = "x"`, `1 1` means `mirror = "y"`, `0 1` means `rotation = 180`. When moving
+   the finger right moves the reading up or down, x and y are swapped: try `rotation`
+   90 or 270, then the mirrors.
+
+2. **Calibration** then corrects a panel that is offset or a little too large or small.
+   Readings are clamped to 0..1, which hides errors at the edges, so measure on targets
+   about 10% in from them. Remove any calibration first, so the readings are the
+   uncorrected ones:
+
+       touch-to-osc --send device/face/calibration
+
+   Show (or mark) two targets at x = 0.1 and x = 0.9 and write down the x each one reads,
+   `u1` and `u2`; do the same for y with targets at y = 0.1 and y = 0.9 (`v1`, `v2`). Then
+
+       a = (0.9 - 0.1) / (u2 - u1)    c = 0.1 - a * u1
+       e = (0.9 - 0.1) / (v2 - v1)    f = 0.1 - e * v1
+
+   and the calibration is `[a, 0, c, 0, e, f]`. For example, x targets reading 0.15 and
+   0.93 give `a = 1.0256`, `c = -0.0538`:
+
+       touch-to-osc --send device/face/calibration 1.0256 0 -0.0538 0 1 0
+
+   The six numbers are `[a, b, c, d, e, f]` with `x' = a*x + b*y + c` and
+   `y' = d*x + e*y + f`; `b` and `d` correct a panel that is twisted, which is rare.
+   Calibration lines the panel up with the display, never with a picture scaled or
+   letterboxed on it: that is the receiver's job.
+
+3. **Aspect**: width / height of the display, sent in the status so receivers can keep
+   circles round. It is worked out from the screen's size; a screen that does not report
+   its size gets a guess from its units, which the journal says. Set `aspect` then (1.778
+   for 16:9).
+
+Settings sent over OSC are saved (see Settings changed over OSC); copy the final values
+into the config file if you want them there too. `--dump` shows the raw device units of
+each touch as well (stop the service first).
+
+## USB recovery
 
 A USB connection that falters (a loose joint, a marginal extender) can leave a screen
 plugged in that the kernel tried to set up, failed, and then gave up on: it does not try
 again until the plug is pulled and pushed back. With `usb_recovery = true` (the default),
-the daemon watches the USB port it last read a screen on, or the configured `port`, while
-that screen is gone. When the port reports something plugged in that the kernel has given
-up on (the port is connected but switched off, with no device set up on it) for 10 s, it
-resets the USB hub that port belongs to (unbinds and binds the kernel's hub driver), which
-makes the kernel try again. While the kernel is still trying (the port is switched on but
-the device is not set up yet), the daemon waits. The kernel holds the hub while it tries,
-so a check of the port that has to wait for the kernel also means it is still trying; the
-checks run beside the rest of the daemon and never hold up the heartbeat, the status or a
-command. For a port on the computer itself that hub
-is the whole USB bus, so every device on that bus drops for a moment; contacts on other
-screens there are cancelled like any unplug. If the screen does not come back, the next
-reset waits 20 s, then 40, 80, 160 and from then on 300 s; the count starts again when the
-screen is back or the port has been empty for 5 s. Nothing is reset while the port is
-empty (the screen unplugged on purpose). Each reset is an event and a journal line, and
-`/touch/device/<id>/usb_reset` resets on command. A port whose state cannot be read (no
-`/dev/bus/usb`, or the daemon run by hand as a user other than root) is reported once and
-left alone.
+the daemon watches the USB port it last read a screen on (remembered across restarts in
+the state file), or the configured `match_port`, while that screen is gone. When the port
+reports something plugged in that the kernel has given up on (the port is connected but
+switched off, with no device set up on it) for 10 s, it resets the USB hub that port
+belongs to (unbinds and binds the kernel's hub driver), which makes the kernel try again.
+While the kernel is still trying (the port is switched on but the device is not set up
+yet), the daemon waits. The kernel holds the hub while it tries, so a check of the port
+that has to wait for the kernel also means it is still trying; the checks and resets run
+beside the rest of the daemon and never hold up the heartbeat, the status or a command.
 
-Several screens work side by side. Two identical screens are told apart by `port` (the
-USB socket they are plugged into, as `--list` shows it) or by `serial` when theirs
-differ.
+For a port on the computer itself that hub is the whole USB bus, so every device on that
+bus drops for a moment; contacts on other screens there are cancelled like any unplug.
+`sudo touch-to-osc --list` says what a reset for each screen resets and what else is on
+it, and the event of a finished reset names what it dropped. If the screen does not come
+back, the next reset waits 20 s, then 40, 80, 160 and from then on 300 s, for every screen
+on that hub; the count starts again when the screen is back or the port has been empty for
+5 s. Nothing is reset while the port is empty (the screen unplugged on purpose). Each reset
+is an event and a journal line, and `/touch/device/<id>/usb_reset` resets on command. A port
+whose state cannot be read (no `/dev/bus/usb`, or the daemon run by hand as a user other
+than root) is reported once and left alone.
+
+A stop or restart waits for a reset in flight (up to 30 s, while telling systemd it is
+still alive), and a reset cut short anyway (a crash, a kill) leaves a note in the state
+file: at the next start the daemon binds that hub again first.
+
+## Troubleshooting
+
+`touch-to-osc --status` shows the health and its reasons, which say what to do; the
+journal (`journalctl -u touch-to-osc`) has the same and more.
+
+| What you see | What to do |
+|---|---|
+| No touches arrive | `touch-to-osc --status`: the device's state and reason; then `sudo touch-to-osc --list` |
+| `may not send commands here` | add the receiver's IP to `osc.allowed_ips`, or `--send allowed_ips/add IP` from an allowed host |
+| An edit to the config does nothing | `touch-to-osc --status` lists the settings saved over OSC that win over it; restart after editing, or forget them |
+| A finger held still ends after 200 ms | the screen reports only while a finger moves: `silence_ms = 0` for it (the journal suggests it when it sees this) |
+| Touches rotated, mirrored or offset | see Lining up the touch panel |
+| Two screens swapped | set `match_port` for each (see Several screens) |
+| `--dump` shows nothing | the service holds the screen: `sudo systemctl stop touch-to-osc` first, and start it after |
+| Other USB devices drop for a moment | a USB recovery reset: the journal names what it dropped; set `usb_recovery = false` or move the screen to its own bus |
+| The health stays at `warning` after a start | the config file is refused and it runs on the last copy that worked, or the saved settings were refused: the reason says which |
+| Nothing answers a tool | answers go to the IP and port a command came from: the tool must send and listen on the same port |
 
 ## Command line
 
-    touch-to-osc [--config=FILE]            run (default /etc/touch-to-osc/touch-to-osc.toml)
-    touch-to-osc --check-config[=FILE]      check a config and its saved settings, exit 0 (good) or 2 (refused)
-    touch-to-osc --list [--config=FILE]     every input device and what the config makes of it
-    touch-to-osc --dump[=ID] [--config=FILE]  one line per touch frame of a configured device
-    touch-to-osc --version
+    touch-to-osc [--config=FILE]               run (default /etc/touch-to-osc/touch-to-osc.toml)
+    touch-to-osc --check-config[=FILE]         check a config and its saved settings, and exit
+    touch-to-osc --list [--all] [--config=FILE]  the touchscreens and what the config makes of them
+    touch-to-osc --dump[=ID] [--config=FILE]   one line per touch frame of a configured device
+    touch-to-osc --status [--config=FILE]      the running service's health, screens and settings
+    touch-to-osc [--config=FILE] --send ADDRESS [VALUE...]   one command to the running service
+    touch-to-osc --version | --help
 
-`--list` is the first thing to run with a new screen: it shows each input device's USB id,
-serial and port, whether it is a touchscreen (contacts, axis ranges, size), and which
-`[[device]]` would read it.
+`--config FILE` (with a space) works too.
+
+`--list` is the first thing to run with a new screen. For each touchscreen it shows its USB
+id, serial and port, its contacts, axis ranges and size, which `[[device]]` reads it (the
+same way the daemon shares screens out) and what a USB reset for it would reset; for a
+screen no block reads, a block to paste. `--all` lists every other input device too
+(keyboards, buttons).
+
+`--status` and `--send` talk to the running service over OSC from this machine, so
+127.0.0.1 must be in `osc.allowed_ips` (it is by default). `--send` takes an address with
+or without the prefix and sends it as a request, so it gets exactly one answer, `ok` or
+the reason it was refused:
+
+    touch-to-osc --send device/face/rotation 90
+    touch-to-osc --send device/face/label "front screen"
+    touch-to-osc --send device/face/label s:2        (s: sends a number as text)
+    touch-to-osc --send restart
 
 `--dump` prints each frame with the kernel time, every contact's raw position and where it
-lands on the display. Touch the four corners to check `rotation` and `mirror`. The service
-holds the screen exclusively, so stop it first (`systemctl stop touch-to-osc`); `--dump`
-says so if it finds the screen held.
+lands on the display. The service holds the screen exclusively, so stop it first
+(`sudo systemctl stop touch-to-osc`); `--dump` says so if it finds the screen held.
 
 To record a screen for the tests, stop the service and use evemu:
 
     evemu-record /dev/input/by-id/usb-QDtech_MPI1168-event-if00 > trace.evemu
 
-Exit codes: 0 clean stop, 1 wrong command line, 2 config refused, 3 the listen port cannot
-be bound, 4 internal error.
+Exit codes: 0 good or a clean stop, 1 wrong command line (for `--dump`: the screen is not
+there or cannot be read), 2 config refused, 3 the listen port cannot be used (most likely
+the service already runs: stop it first), 4 internal error, 5 (`--check-config`) the config
+is good but its saved settings are refused, 6 (`--status`, `--send`) no answer, or the
+command was refused.
 
 ## OSC interface (osc_api 5)
 
 All addresses start with the prefix (`/touch` here) and devices appear by their config
-`id` (`face` here). Number arguments in commands may be `i`, `h` or a whole `f`; the
-daemon always sends the types written below. Strings are ASCII.
+`id` (`face` here). Number arguments in commands may be `i`, `h` or a whole `f`; `T` and `F`
+count as 1 and 0. The daemon always sends the types written below. Strings are ASCII.
+
+Commands and subscriptions go to `osc.listen` (UDP 9480 by default). Everything the daemon
+sends comes from other ports of its machine, so a receiver behind a firewall must let in
+UDP from that machine to the receiver's own port. Replies, errors and `pong` go to the IP
+and port the command came from (or the port given to `ping` and `status/send`): a tool has
+to listen on the port it sends from.
 
 ### Touches
 
@@ -204,11 +370,18 @@ holds one message per contact that changed:
   the whole path.
 - `move` is sent whenever the position changed by at least one device unit.
 - `cancel` reasons: `device lost` (unplugged, a read error, the kernel released the
-  device), `device silent` (the screen sent nothing for `silence_ms` with the contact
-  down), `device disabled` (a command), `resync` (the kernel dropped events because they
-  were not read in time; the state was read again), `palm` (the screen marked the contact
-  as a palm), `reconfigured` (a settings change restarts reading the screen), `stopping`
-  (the daemon is stopping), `restarting` (the daemon is restarting on a command).
+  device, another program had held it), `device silent` (the screen sent nothing for
+  `silence_ms` with the contact down), `device disabled` (a command), `resync` (the kernel
+  dropped events because they were not read in time; the state was read again), `palm`
+  (the screen marked the contact as a palm), `reconfigured` (a settings change restarts
+  reading the screen), `stopping` (the daemon is stopping), `restarting` (the daemon is
+  restarting on a command).
+
+From the kernel's frame to the send, the daemon took about 0.1 ms at the median and 0.2 to
+0.35 ms at the 99th percentile on the testing box (an HP t730, replaying a recorded touch,
+over this version's test runs); the status reports each screen's own figure as
+`latency_us`. The screen's scan and the USB
+polling come before the kernel's frame and are not measured here.
 
 ### Liveness
 
@@ -218,14 +391,15 @@ holds one message per contact that changed:
     /touch/device/face/active  i frame  i contact ...
     /touch/bye          i run
 
-- A lease is kept per (sender IP, port), 1-60 s, 10 by default, at most 8 at once, in
-  memory only. Renew it every few seconds. A renewal answers only `subscribed`; a new
-  lease gets `subscribed`, the full status, then the event "IP:PORT added (lease N s)".
+- A lease is kept per (sender IP, port), 1-60 s, 10 by default, at most 8 at once. Renew
+  it every few seconds. A renewal answers only `subscribed`; a new lease gets
+  `subscribed`, the full status, then the event "IP:PORT added (lease N s)". Leases are
+  kept over a `restart` (below) but not over a stop.
 - `alive` goes out every second to every subscriber and saved destination, in one bundle
   with one `active` message per configured device. `active` lists the contacts down on
   that device as of bundle `frame` (no contacts: just the frame). `run` is a random
   non-zero number chosen at each start. `health` is `ok`, `warning` or `fault`.
-- `bye` goes out once every contact has been cancelled on a clean stop.
+- `bye` goes out once every contact has been cancelled on a clean stop or a restart.
 
 What a receiver does with these:
 
@@ -242,8 +416,8 @@ What a receiver does with these:
 ### Status
 
 Sent in full on a new lease, on `status/send` and every 10 s, and each part again as soon
-as it changes (the health and reasons that look back over the last minute within a
-second). Status messages may arrive one by one or several to a bundle:
+as it changes. Status messages may arrive one by one or several to a bundle; `health` and
+`reasons` always come together, in one bundle, whenever either changes:
 
     /touch/osc_api                  i 5
     /touch/version                  s
@@ -261,7 +435,7 @@ second). Status messages may arrive one by one or several to a bundle:
     /touch/device/face/label        s        settable
     /touch/device/face/enabled      i 0|1    settable; the applied state
     /touch/device/face/connected    i 0|1
-    /touch/device/face/state        s ok|not connected|disabled|no permission|grab refused|read error|not a touchscreen|restarting
+    /touch/device/face/state        s starting|ok|not connected|disabled|no permission|grab refused|read error|not a touchscreen|restarting
     /touch/device/face/reason       s        what to do about the state
     /touch/device/face/match_usb    s        settable: the "vvvv:pppp" it matches, or ""
     /touch/device/face/match_serial s        settable
@@ -285,8 +459,10 @@ second). Status messages may arrive one by one or several to a bundle:
     /touch/device/face/silence_ms   i        settable; 0 when off
     /touch/device/face/grabbed      i 0|1    held exclusively by the daemon now
 
+`starting` lasts from the start until a device's reader has looked for its screen.
 `restarting` lasts from a settings change that reopens the screen (`grab` or a `match_`
-setting) until it has been opened again; then the state is whatever the reopen found.
+setting) until it has been opened again; then the state is whatever the reopen found. A
+screen that is not connected goes on reading `not connected`.
 
 With every alive, to the receivers that get status:
 
@@ -303,31 +479,42 @@ With every alive, to the receivers that get status:
 The counts run from the start of the run; `losses` is how many times the screen was
 unplugged, dropped off USB or could not be read.
 
-`health` is `fault` when an enabled device is not working (not connected, no permission,
-held by another program, read error, not a touchscreen) or the last USB reset failed, and
-`warning` when a device is turned off or restarting after a settings change, when in the
-last minute a screen was unplugged or dropped off USB, the kernel dropped events, a screen
-went silent or touch messages could not be sent, when sending to a destination fails, or
-when the settings file was refused or could not be saved. So a screen that drops out for
-a moment leaves a warning for a minute after it is back.
-`reasons` says which, in words that say what to do. The heartbeat is the alive's
-`counter`.
+`health` says what is true now. It is `fault` when an enabled device is not working (not
+connected, no permission, held by another program, read error, not a touchscreen) or the
+last USB reset failed, and `warning` when a device is turned off by a saved setting or
+restarting after a settings change, when a device matches several screens with no
+`match_port` to choose, when in the last minute the kernel dropped events or touch messages
+could not be sent, when sending to a destination fails, when the config file is refused and
+the daemon runs on the copy that last worked, or when the settings file was refused or
+the settings or the state could not be saved. A device turned off in the config file
+counts as nothing. A screen that drops out is a `fault` while it is gone and `ok` again as
+soon as it reads; the drop stays in its event and in `losses`. `reasons` says which, in
+words that say what to do. The heartbeat is the alive's `counter`.
 
 ### Events
 
     /touch/event  s kind  s text  s level
 
 `level` is `notice`, `warning` or `error`: a screen lost is a warning, a screen connected a
-notice, a USB reset that failed an error. Kinds: `device` (connected, lost, released by the kernel, two screens match, restarting
-after a settings change), `resync`, `silence`, `grab` (another program let go), `enabled`
-(turned off or on), `usb` (a USB reset begun, done or failed, a screen back after resets,
-a port whose state cannot be read), `restart` (asked for, and by whom), `settings` (a
-setting changed, with the old and new value and who sent it, or the settings file could
-not be saved), `subscriber` (added, ended), `send` (a destination failing, at most once
-per 10 s each, with a count). Each event is also a line
-in the journal. Events of one kind from one source are passed on up to 10 at once and then
-one a second; the rest are counted and reported in one event ("N more ... came too fast to
-report one by one").
+notice, a USB reset that failed an error. Kinds:
+
+- `device`: connected, lost, released by the kernel, several screens match, restarting
+  after a settings change, a screen that reports no size (its aspect is a guess), reading
+  stopped on an internal error.
+- `resync`, `palm`, `grab` (another program let go), `enabled` (turned off or on).
+- `silence`: a screen went silent with fingers down, and once a run a screen that went
+  quiet and then reported the same finger again (it may report only while a finger
+  moves).
+- `usb`: a USB reset begun, done (with what else it dropped) or failed, a screen back
+  after resets, the USB port a screen is on, a port whose state cannot be read.
+- `restart` (asked for, and by whom), `settings` (a setting changed, with the old and new
+  value and who sent it; the settings or the state could not be saved), `subscriber`
+  (added, ended), `send` (a destination failing, at most once per 10 s each, with a
+  count).
+
+Each event is also a line in the journal. Events of one kind from one source are passed on
+up to 10 at once and then one a second; the rest are counted and reported in one event
+("N more ... came too fast to report one by one").
 
 Logging never holds the daemon up: when the journal cannot take a line at once, the line is
 dropped and counted, and the count is logged as soon as it can be. `log.level = "debug"`
@@ -348,9 +535,12 @@ adds a line for every command and every lease renewal; touches are never logged.
 `restart` answers first, then cancels every contact (`restarting`), writes any pending
 settings, sends `bye` and starts the same process again, which reads the config file and
 the saved settings afresh and runs the program as it is installed now (so it also brings
-in a new version). Leases are not kept: receivers renew as usual and get the full status
-again; the `run` changes. It is refused, and the daemon keeps running, when the config
-file would be refused at the restart.
+in a new version). Each lease whose host the new config still allows is kept: right after
+the restart it gets the full status and an alive with the new `run`. It is refused, and the
+daemon keeps running, when the config file would be refused at the restart, when the
+installed program would not start with it, when a changed `osc.listen` cannot be used,
+and while a USB reset runs. A repeat of the same request (the same seq, its reply lost) is
+answered from memory, also by the new run, and never restarts it again.
 
 Settings: each one is changed at the same address the status reports it on, and saved.
 
@@ -372,7 +562,8 @@ Settings: each one is changed at the same address the status reports it on, and 
     /touch/saved_destinations/add    s "ip:port" [i touches  i status]   (both 1 by default)
     /touch/saved_destinations/remove s "ip:port"
     /touch/settings/forget           [s name]   one setting, by its name in /touch/overrides,
-                                                or all of them: back to the config file
+                                                device/<id> for all of one device's, or
+                                                nothing for all of them: back to the config file
 
 - A value is checked with the config file's own rules and refused in the same words
   ("rotation must be 0, 90, 180 or 270"). Also refused: a change that would leave a device
@@ -393,24 +584,57 @@ Settings: each one is changed at the same address the status reports it on, and 
 
 - Every command can go inside a request and then gets exactly one reply. Replies are kept
   per (IP, port, seq) for 30 s or 64 newer requests: an exact repeat gets the kept reply
-  and is not run again; the same seq with another command is refused ("seq used for
-  another command").
+  and is not run again; the same seq with another command is refused ("seq 7 was used for
+  another command in the last 30 s: use a new seq for each command").
 - A bare command works too; a refusal then answers `/touch/error s address s note`.
+- An address that does not exist is refused with the closest one that does ("unknown
+  address (did you mean /touch/device/face/rotation?)"), and a value only reported by the
+  status says it cannot be set.
 - Commands and subscriptions from a host outside `osc.allowed_ips` are answered with
-  `/touch/error` saying so (at most once per 5 s per host, and at most 20 such answers a
-  second in all) and otherwise ignored.
+  `/touch/error` saying so and where the allowed hosts come from (at most once per 5 s per
+  host, and at most 20 such answers a second in all) and otherwise ignored.
 - There is deliberately no command that creates a touch or writes the config file.
 
 ## Watching it
 
-`tools/watch.py` subscribes exactly as a receiver should and prints every touch with its
-delay, every status change and event, and the alive. It says when the daemon is lost,
-restarted or stopped:
+`touch-to-osc-watch` (`tools/watch.py` in the source tree) subscribes exactly as a receiver
+should and prints every touch with its delay, every status change and event, and the alive.
+It says when the daemon is lost, restarted or stopped, and when nothing answers at all:
 
-    python3 tools/watch.py --target 192.168.1.246:9480 --no-alive
+    touch-to-osc-watch --no-alive                           the service on this machine
+    touch-to-osc-watch --target 192.168.1.246:9480 --device face
 
-Where the package is installed it is `/usr/share/touch-to-osc/watch.py`. The machine
-running it must be in `osc.allowed_ips`.
+`--target` defaults to 127.0.0.1:9480, `--device` shows one device only, `--no-alive`
+leaves out the alive and the counters, `--no-moves` the moves. The machine running it
+must be in `osc.allowed_ips`.
+
+## Building
+
+Linux with evdev, libevdev, a C++17 compiler, CMake 3.18 or newer and Ninja. Built and
+tested on Debian 11 (kernel 5.10, g++ 10, libevdev 1.11):
+
+    apt install build-essential cmake ninja-build pkg-config libevdev-dev
+
+`evtest` and `evemu-tools` are useful for looking at a screen and recording it. The tests
+also need `python3`.
+
+To build the package, do it on the oldest system it is meant for:
+
+    scripts/build-deb.sh
+    sudo apt install ./build-deb/touch-to-osc_*_amd64.deb
+
+`build-deb.sh` builds with warnings as errors, runs the unit tests and writes the package
+to `build-deb/`.
+
+Without the package, on any Linux with systemd, from the source tree:
+
+    sudo scripts/install.sh
+    sudo systemctl enable --now touch-to-osc
+
+`install.sh` builds, runs the unit tests and installs under `/usr/local` (the unit in
+`/usr/local/lib/systemd/system`), with the same config handling. `scripts/uninstall.sh`
+removes it again (`--purge` also removes the config and the saved settings). Both refuse
+while the package is installed.
 
 ## Tests
 

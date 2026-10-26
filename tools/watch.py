@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Subscribe to touch-to-osc exactly as a receiver should, and print what arrives.
 
-usage: watch.py --target HOST:PORT [--port N] [--lease S] [--prefix /touch] [--no-alive] [--no-moves]
+usage: touch-to-osc-watch (or watch.py) [--target HOST:PORT] [--port N] [--lease S] [--prefix /touch] [--device ID] [--no-alive] [--no-moves]
 
 Unsubscribes first (so a restart on the same port gets the full status again) and when
 stopped, renews its lease every 3 s, prints the alive, every status change, every event, every
 touch with its delay since the screen reported it (needs synced clocks), and says when
-the daemon is lost (no alive for 3 s), restarted (a new run) or stopped (bye).
+the daemon is lost (no alive for 3 s), restarted (a new run) or stopped (bye). --target
+defaults to touch-to-osc on this machine, 127.0.0.1:9480.
 """
 
 import argparse
@@ -100,6 +101,16 @@ def decode_packet(data):
     return False, [decode_message(data)]
 
 
+def shows_device(rest, device):
+    """With --device, keep what is about that device or about no device in particular."""
+    parts = rest.split("/")
+    if len(parts) >= 3 and parts[1] == "device":
+        return parts[2] == device
+    if len(parts) == 3 and parts[2] in ("down", "move", "up", "cancel"):
+        return parts[1] == device
+    return True
+
+
 def fmt_args(args):
     out = []
     for a in args:
@@ -109,10 +120,11 @@ def fmt_args(args):
 
 def main():
     ap = argparse.ArgumentParser(description="watch what touch-to-osc sends")
-    ap.add_argument("--target", required=True, help="the daemon, HOST:PORT (its osc.listen port)")
+    ap.add_argument("--target", default="127.0.0.1:9480", help="the daemon, HOST:PORT (its osc.listen port; default 127.0.0.1:9480)")
     ap.add_argument("--port", type=int, default=0, help="local UDP port to receive on (default: any free one)")
     ap.add_argument("--lease", type=int, default=10)
     ap.add_argument("--prefix", default="/touch")
+    ap.add_argument("--device", help="only show the touches and status of this device id")
     ap.add_argument("--no-alive", action="store_true", help="do not print the 1 s alive and counters")
     ap.add_argument("--no-moves", action="store_true", help="do not print moves")
     a = ap.parse_args()
@@ -140,15 +152,22 @@ def main():
     print("receiving on port %d, subscribing to %s:%d" % (me, target[0], target[1]), flush=True)
     sock.settimeout(0.5)
     t0 = time.time()
+    heard = False
+    hinted = False
     while True:
         now = time.time()
         if state["last_alive"] and now - state["last_alive"] > 3 and not state["lost"]:
             state["lost"] = True
             print("%9.3f LOST: no alive for 3 s" % (now - t0), flush=True)
+        if not heard and not hinted and now - t0 > 3:
+            hinted = True
+            print("%9.3f nothing from %s:%d yet: is touch-to-osc running there, is %d its osc.listen port, and is --prefix right?"
+                  % (now - t0, target[0], target[1], target[1]), flush=True)
         try:
             data, _ = sock.recvfrom(65536)
         except socket.timeout:
             continue
+        heard = True
         now = time.time()
         try:
             bundle, msgs = decode_packet(data)
@@ -158,6 +177,8 @@ def main():
         stamp = "%9.3f" % (now - t0)
         for address, args in msgs:
             rest = address[len(p):] if address.startswith(p) else address
+            if a.device and not shows_device(rest, a.device):
+                continue
             if rest == "/alive":
                 state["last_alive"] = now
                 if state["lost"]:
@@ -179,7 +200,7 @@ def main():
                 print(stamp, rest, fmt_args(args[:-1]), "(%.1f ms)" % delay, flush=True)
                 continue
             counters = ("/active", "/contacts", "/oldest_s", "/last_event_s", "/rate_hz", "/latency_us", "/counts")
-            if rest.endswith(counters) or rest in ("/subscribers", "/destinations"):
+            if rest.endswith(counters) or rest in ("/uptime_s", "/subscribers", "/destinations"):
                 if not a.no_alive:
                     print(stamp, "  ", rest, fmt_args(args), flush=True)
                 continue

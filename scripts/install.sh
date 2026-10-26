@@ -25,7 +25,8 @@ fi
 install -d -m 0755 /etc/touch-to-osc
 if [ ! -f /etc/touch-to-osc/touch-to-osc.toml ]; then
     install -m 0644 "$here/config.example.toml" /etc/touch-to-osc/touch-to-osc.toml
-    echo "wrote /etc/touch-to-osc/touch-to-osc.toml: add the receiver's address to osc.allowed_ips"
+    echo "wrote /etc/touch-to-osc/touch-to-osc.toml for one QDtech MPI1168 screen (usb 0712:0009); find yours with: touch-to-osc --list"
+    echo "set match_usb (and match_port) in its [[device]] block and each receiver's IP in osc.allowed_ips"
 fi
 /usr/local/bin/touch-to-osc --check-config=/etc/touch-to-osc/touch-to-osc.toml
 systemctl daemon-reload

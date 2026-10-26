@@ -23,15 +23,21 @@ public:
     bool claim(const std::string& sysname);
     void release(const std::string& sysname);
     bool claimed(const std::string& sysname);
+    void set_devices(std::vector<DeviceConfig> devices);
+    void set_device(size_t index, const DeviceConfig& d);
+    const NodeInfo* pick(size_t index, const std::vector<NodeInfo>& nodes);
 
 private:
     std::mutex m_;
     std::set<std::string> held_;
+    std::vector<DeviceConfig> devices_;
 };
+
+bool port_order(const NodeInfo& a, const NodeInfo& b);
 
 class DeviceReader {
 public:
-    DeviceReader(DeviceConfig cfg, const std::string& prefix, DeviceShared& shared, int notify_fd, NodeClaims& claims, SysPaths paths);
+    DeviceReader(DeviceConfig cfg, size_t index, const std::string& prefix, DeviceShared& shared, int notify_fd, NodeClaims& claims, SysPaths paths);
     ~DeviceReader();
     DeviceReader(const DeviceReader&) = delete;
     DeviceReader& operator=(const DeviceReader&) = delete;
@@ -45,6 +51,7 @@ private:
     bool open_device();
     void session();
     int drain();
+    int discard_events();
     void on_frame(const input_event& ev);
     void on_resync();
     void on_released();
@@ -66,6 +73,7 @@ private:
     bool silent(Nanos now) const;
 
     DeviceConfig cfg_;
+    size_t index_;
     std::string prefix_;
     DeviceShared& sh_;
     int notify_fd_;
@@ -100,6 +108,10 @@ private:
     std::string base_reason_;
     DevInfo info_;
     bool warned_ambiguous_ = false;
+    bool quiet_check_ = false;
+    bool hinted_quiet_ = false;
+    bool hinted_aspect_ = false;
+    int32_t quiet_tracking_[kMaxSlots] = {};
     std::string addr_down_, addr_move_, addr_up_, addr_cancel_;
     TouchEvent evs_[kMaxFrameEvents];
     // a full frame of the largest message (64-character prefix, 32-character id, a cancel) fits: 128 x 152 bytes + the header

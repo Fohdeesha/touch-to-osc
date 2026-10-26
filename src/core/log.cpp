@@ -7,6 +7,7 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace tto::log {
@@ -16,11 +17,20 @@ namespace {
 std::atomic<int> g_min{int(Level::info)};
 std::atomic<int> g_journal{-1};
 std::atomic<uint64_t> g_dropped{0};
+std::atomic<bool> g_cut{false};
+
+bool stderr_is_journal() {
+    const char* js = std::getenv("JOURNAL_STREAM");
+    unsigned long long dev = 0, ino = 0;
+    struct stat st {};
+    return js && std::sscanf(js, "%llu:%llu", &dev, &ino) == 2 && fstat(2, &st) == 0 && (unsigned long long)st.st_dev == dev &&
+           (unsigned long long)st.st_ino == ino;
+}
 
 bool to_journal() {
     int j = g_journal.load(std::memory_order_relaxed);
     if (j < 0) {
-        j = std::getenv("JOURNAL_STREAM") ? 1 : 0;
+        j = stderr_is_journal() ? 1 : 0;
         // a stalled journal must never stall the daemon: lines that cannot be written at once are dropped and counted
         if (j == 1) {
             int fl = fcntl(2, F_GETFL);
@@ -32,7 +42,12 @@ bool to_journal() {
 }
 
 bool put(const char* line, size_t len) {
+    if (g_cut.load(std::memory_order_relaxed)) {
+        if (::write(2, "\n", 1) != 1) return false;
+        g_cut.store(false, std::memory_order_relaxed);
+    }
     ssize_t n = ::write(2, line, len);
+    if (n > 0 && size_t(n) < len) g_cut.store(true, std::memory_order_relaxed);
     return n == ssize_t(len);
 }
 

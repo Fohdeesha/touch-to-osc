@@ -1,7 +1,10 @@
 #pragma once
 
+#include "core/names.h"
+
 #include <toml++/toml.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <set>
@@ -19,6 +22,7 @@ public:
     const toml::table* table() const { return t_; }
 
     const toml::node* take(const char* key) {
+        if (std::find(asked_.begin(), asked_.end(), key) == asked_.end()) asked_.push_back(key);
         if (!t_) return nullptr;
         const toml::node* v = t_->get(key);
         if (!v) return nullptr;
@@ -117,7 +121,7 @@ public:
     bool fail(const std::string& key, const std::string& what) {
         if (!error_.empty()) return false;
         std::string where = path_;
-        if (!key.empty()) where += where.empty() ? key : "." + key;
+        if (!key.empty()) where += where.empty() ? key : (where.find(' ') != std::string::npos ? ": " : ".") + key;
         error_ = (where.empty() ? std::string("the file") : where) + ": " + what;
         return false;
     }
@@ -128,7 +132,7 @@ public:
             (void)v;
             std::string key(k.str());
             if (!used_.count(key)) {
-                fail(key, "unknown key");
+                fail(key, "unknown key" + did_you_mean(key, asked_));
                 return;
             }
         }
@@ -145,6 +149,7 @@ private:
     const toml::table* t_;
     std::string path_;
     std::set<std::string> used_;
+    std::vector<std::string> asked_;
     std::string error_;
 };
 

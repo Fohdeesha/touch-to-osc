@@ -1,11 +1,14 @@
 #include "control/usb.h"
 
+#include "config/atomic_file.h"
 #include "core/fd.h"
 #include "core/process.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <linux/usbdevice_fs.h>
@@ -143,18 +146,96 @@ PortState read_port_state(const UsbPortRef& ref, const UsbPaths& paths, std::str
     return port_state_from(status, exists(paths.devices + "/" + ref.path));
 }
 
-Status rebind_hub(const std::string& hub_interface, const UsbPaths& paths) {
+Status rebind_hub(const std::string& hub_interface, const UsbPaths& paths, const std::string& marker) {
     std::string bound = paths.devices + "/" + hub_interface + "/driver";
+    if (!marker.empty()) {
+        Status m = write_file_atomic(marker, hub_interface + "\n");
+        (void)m;
+    }
+    auto done = [&] {
+        if (!marker.empty()) unlink(marker.c_str());
+    };
     Status un = write_text(paths.hub_driver + "/unbind", hub_interface);
-    if (!un && exists(bound)) return err("the USB hub " + hub_interface + " could not be reset (" + un.error() + ")" + root_hint("reset USB ports (its service does)"));
+    if (!un && exists(bound)) {
+        done();
+        return err("the USB hub " + hub_interface + " could not be reset (" + un.error() + ")" + root_hint("reset USB ports (its service does)"));
+    }
     Status st;
     for (int i = 0; i < 5; ++i) {
         st = write_text(paths.hub_driver + "/bind", hub_interface);
-        if (exists(bound)) return {};
+        if (exists(bound)) {
+            done();
+            return {};
+        }
         usleep(100000);
     }
     return err("the USB hub " + hub_interface + " could not be bound again (" + (st ? std::string("the kernel did not take it") : st.error()) +
                "): every device on it stays off until it is: echo " + hub_interface + " > " + paths.hub_driver + "/bind, or reboot");
+}
+
+Status bind_hub_left_unbound(const std::string& marker, const UsbPaths& paths, std::string* done) {
+    if (marker.empty() || !exists(marker)) return {};
+    auto text = read_file(marker, 256);
+    std::string hub = text ? text->substr(0, text->find('\n')) : std::string();
+    bool valid = hub.size() > 4 && hub.size() <= 32 && hub.compare(hub.size() - 4, 4, ":1.0") == 0 &&
+                 hub.find_first_not_of("0123456789-.:") == std::string::npos;
+    std::string bound = paths.devices + "/" + hub + "/driver";
+    if (!valid || exists(bound)) {
+        unlink(marker.c_str());
+        return {};
+    }
+    Status st;
+    for (int i = 0; i < 5; ++i) {
+        st = write_text(paths.hub_driver + "/bind", hub);
+        if (exists(bound)) {
+            unlink(marker.c_str());
+            if (done) *done = "the USB hub " + hub + " was left unbound by a reset cut short when touch-to-osc last stopped; it is bound again";
+            return {};
+        }
+        usleep(100000);
+    }
+    return err("the USB hub " + hub + " was left unbound by a reset cut short when touch-to-osc last stopped and could not be bound again (" +
+               (st ? std::string("the kernel did not take it") : st.error()) + "): every device on it stays off until it is: echo " + hub + " > " +
+               paths.hub_driver + "/bind, or reboot");
+}
+
+std::vector<std::string> usb_neighbours(const UsbPortRef& ref, const UsbPaths& paths) {
+    std::vector<std::string> out;
+    std::string under = ref.hub.rfind("usb", 0) == 0 ? std::to_string(ref.bus) + "-" : ref.hub + ".";
+    DIR* d = opendir(paths.devices.c_str());
+    if (!d) return out;
+    std::vector<std::string> names;
+    while (dirent* e = readdir(d)) {
+        std::string n = e->d_name;
+        if (n.find(':') != std::string::npos || n.rfind(under, 0) != 0) continue;
+        if (n == ref.path || n.rfind(ref.path + ".", 0) == 0) continue;
+        names.push_back(n);
+    }
+    closedir(d);
+    std::sort(names.begin(), names.end());
+    for (const auto& n : names) {
+        std::ifstream in(paths.devices + "/" + n + "/product");
+        std::string product;
+        std::getline(in, product);
+        for (char& c : product) {
+            if (c < 0x20 || c >= 0x7f) c = '?';
+        }
+        out.push_back((product.empty() ? std::string("a USB device") : product) + " (" + n + ")");
+    }
+    return out;
+}
+
+std::string usb_target_text(const UsbPortRef& ref) {
+    return ref.hub.rfind("usb", 0) == 0 ? "USB bus " + std::to_string(ref.bus) : "the USB hub " + ref.hub;
+}
+
+std::string usb_reset_reach(const UsbPortRef& ref, const UsbPaths& paths) {
+    std::string target = usb_target_text(ref);
+    auto others = usb_neighbours(ref, paths);
+    if (others.empty()) return target + ", which holds nothing else";
+    std::string list;
+    for (const auto& o : others) list += (list.empty() ? "" : ", ") + o;
+    return target + ", which also holds " + list;
 }
 
 Nanos UsbRecovery::wait_for(int attempts) {
@@ -188,6 +269,12 @@ void UsbRecovery::reset_done(Nanos now) {
     if (attempts_ < 1000) ++attempts_;
     stuck_ = true;
     stuck_since_ = now;
+}
+
+void reset_done_on_hub(std::vector<UsbRecovery>& recs, const std::vector<std::string>& watched, size_t asked, const std::string& hub, Nanos now) {
+    for (size_t j = 0; j < recs.size(); ++j) {
+        if (j == asked || (j < watched.size() && !hub.empty() && watched[j] == hub)) recs[j].reset_done(now);
+    }
 }
 
 void UsbRecovery::connected() {
@@ -228,8 +315,11 @@ void UsbWorker::check(std::vector<std::pair<size_t, UsbPortRef>> ports, Nanos no
     });
 }
 
-void UsbWorker::reset(std::string hub_interface, Nanos now) {
-    launch(true, now, [hub_interface = std::move(hub_interface), paths = paths_](Done& out) { out.result = rebind_hub(hub_interface, paths); });
+void UsbWorker::reset(const UsbPortRef& ref, Nanos now) {
+    launch(true, now, [ref, paths = paths_, marker = marker_](Done& out) {
+        out.dropped = usb_neighbours(ref, paths);
+        out.result = rebind_hub(ref.hub_interface, paths, marker);
+    });
 }
 
 void UsbWorker::launch(bool reset, Nanos now, std::function<void(Done&)> work) {

@@ -3,6 +3,7 @@ set -e
 
 unit=touch-to-osc.service
 config=/etc/touch-to-osc/touch-to-osc.toml
+was_on=/var/lib/touch-to-osc/enabled-before-remove
 
 if [ "$1" = configure ]; then
     for old in /etc/systemd/system/$unit /usr/local/lib/systemd/system/$unit; do
@@ -15,18 +16,33 @@ if [ "$1" = configure ]; then
     if [ ! -e "$config" ]; then
         install -d -m 0755 /etc/touch-to-osc
         install -m 0644 /usr/share/touch-to-osc/config.example.toml "$config"
-        echo "touch-to-osc: wrote $config: add the receiver's address to osc.allowed_ips there, then run: systemctl restart touch-to-osc"
+        echo "touch-to-osc: wrote $config for one QDtech MPI1168 screen (usb 0712:0009); find yours with: sudo touch-to-osc --list"
+        echo "touch-to-osc: set match_usb (and match_port) in its [[device]] block and each receiver's IP in osc.allowed_ips, then: sudo systemctl restart touch-to-osc"
     fi
-    /usr/bin/touch-to-osc --check-config="$config" || echo "touch-to-osc: the service stays stopped until $config is fixed"
-    if [ -z "$2" ]; then
+    checked=0
+    /usr/bin/touch-to-osc --check-config="$config" || checked=$?
+    # a first install, or one after "apt remove" of an enabled service, enables and starts it; an upgrade restarts it only if it runs
+    fresh=no
+    if [ -z "$2" ] || [ -e "$was_on" ]; then
+        fresh=yes
         systemctl enable "$unit" > /dev/null 2>&1 || true
+        rm -f "$was_on"
     fi
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
-        if [ -z "$2" ]; then
-            systemctl restart "$unit" || true
+        if [ "$checked" = 0 ] || [ "$checked" = 5 ]; then
+            if [ "$checked" = 5 ]; then
+                echo "touch-to-osc: its saved settings are refused (see above): when it starts it sets them aside and runs on $config"
+            fi
+            if [ "$fresh" = yes ]; then
+                systemctl restart "$unit" || true
+            else
+                systemctl try-restart "$unit" || true
+            fi
+        elif [ "$fresh" = no ] && systemctl is-active --quiet "$unit"; then
+            echo "touch-to-osc: this version refuses $config (see above), so the running service was not restarted: it runs the old version until it stops. Fix the file, then run: sudo systemctl restart touch-to-osc"
         else
-            systemctl try-restart "$unit" || true
+            echo "touch-to-osc: the service starts once $config is fixed (see above); then run: sudo systemctl restart touch-to-osc"
         fi
     fi
 fi

@@ -1,7 +1,9 @@
 #include "tools/tools.h"
 
+#include "control/usb.h"
 #include "core/process.h"
 #include "input/mapping.h"
+#include "input/reader.h"
 #include "input/tracker.h"
 
 #include <libevdev/libevdev.h>
@@ -9,6 +11,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
@@ -63,49 +66,97 @@ void print_touch_details(const NodeInfo& n, TouchKind kind) {
     int slots = mt ? libevdev_get_num_slots(o.dev) : 1;
     std::printf("    touchscreen, %s: %d contact%s at once, x %d..%d, y %d..%d", mt ? "multitouch" : "single touch", slots, slots == 1 ? "" : "s", x.min, x.max, y.min, y.max);
     if (x.resolution > 0 && y.resolution > 0)
-        std::printf(", %d units/mm (%.0f x %.0f mm)", x.resolution, double(x.max - x.min) / x.resolution, double(y.max - y.min) / y.resolution);
+        std::printf(", %d units/mm (%.0f x %.0f mm)", x.resolution, (double(x.max) - double(x.min)) / x.resolution, (double(y.max) - double(y.min)) / y.resolution);
     std::printf("\n");
     int g = libevdev_grab(o.dev, LIBEVDEV_GRAB);
     if (g == 0) libevdev_grab(o.dev, LIBEVDEV_UNGRAB);
     else std::printf("    held exclusively by another program (the touch-to-osc service?)\n");
 }
 
-const NodeInfo* find_node(const DeviceConfig& d, const std::vector<NodeInfo>& nodes) {
-    for (const auto& n : nodes) {
-        if (matches(d, n) && touch_kind(n) != TouchKind::none) return &n;
+std::vector<const NodeInfo*> assigned(const Config& cfg, const std::vector<NodeInfo>& nodes) {
+    NodeClaims claims;
+    claims.set_devices(cfg.devices);
+    std::vector<const NodeInfo*> out(cfg.devices.size(), nullptr);
+    for (size_t i = 0; i < out.size(); ++i) {
+        out[i] = claims.pick(i, nodes);
+        if (out[i]) claims.claim(out[i]->sysname);
     }
-    return nullptr;
+    return out;
+}
+
+void print_node_head(const NodeInfo& n) {
+    std::printf("%s  \"%s\"\n", n.node.c_str(), printable(n.name).c_str());
+    if (!n.usb_port.empty())
+        std::printf("    usb %s, serial \"%s\", port %s\n", usb_text(n.vendor, n.product).c_str(), printable(n.usb_serial).c_str(), n.usb_port.c_str());
+    else
+        std::printf("    id %s (not USB%s%s)\n", usb_text(n.vendor, n.product).c_str(), n.phys.empty() ? "" : ", ", printable(n.phys).c_str());
+}
+
+std::string spare_id(const Config* cfg) {
+    for (int k = cfg ? int(cfg->devices.size()) + 1 : 1;; ++k) {
+        std::string id = "screen" + std::to_string(k);
+        if (!cfg || std::none_of(cfg->devices.begin(), cfg->devices.end(), [&](const DeviceConfig& d) { return d.id == id; })) return id;
+    }
 }
 
 }
 
-int list_devices(const Config* cfg, const SysPaths& paths) {
+int list_devices(const Config* cfg, const SysPaths& paths, bool all) {
     auto nodes = scan_nodes(paths);
     if (nodes.empty()) {
         std::printf("no input devices found under %s\n", paths.sys_class_input.c_str());
         return 0;
     }
+    std::vector<const NodeInfo*> reads = cfg ? assigned(*cfg, nodes) : std::vector<const NodeInfo*>();
+    std::string usb_root = getenv("TTO_USB_ROOT") ? getenv("TTO_USB_ROOT") : "";
+    UsbPaths usb = usb_root.empty() ? UsbPaths() : usb_paths_under(usb_root);
+    int screens = 0, others = 0;
     for (const auto& n : nodes) {
-        std::printf("%s  \"%s\"\n", n.node.c_str(), printable(n.name).c_str());
-        if (!n.usb_port.empty())
-            std::printf("    usb %s, serial \"%s\", port %s\n", usb_text(n.vendor, n.product).c_str(), printable(n.usb_serial).c_str(), n.usb_port.c_str());
-        else
-            std::printf("    id %s (not USB%s%s)\n", usb_text(n.vendor, n.product).c_str(), n.phys.empty() ? "" : ", ", printable(n.phys).c_str());
-        std::string why;
-        TouchKind kind = touch_kind(n, &why);
-        if (kind == TouchKind::none) std::printf("    not a touchscreen: %s\n", why.c_str());
-        else print_touch_details(n, kind);
-        if (cfg) {
-            for (const auto& d : cfg->devices) {
-                if (!matches(d, n)) continue;
-                if (kind == TouchKind::none) std::printf("    matches device \"%s\" in the config, which will not use it: it is not a touchscreen\n", d.id.c_str());
-                else std::printf("    read as device \"%s\" in the config\n", d.id.c_str());
-            }
+        TouchKind kind = touch_kind(n);
+        if (kind == TouchKind::none) {
+            ++others;
+            continue;
         }
+        if (screens++ == 0) std::printf("touchscreens:\n\n");
+        print_node_head(n);
+        print_touch_details(n, kind);
+        std::string reader;
+        for (size_t i = 0; i < reads.size(); ++i) {
+            if (reads[i] == &n) reader = cfg->devices[i].id;
+        }
+        if (!reader.empty()) {
+            std::printf("    read as device \"%s\" in the config\n", reader.c_str());
+        } else {
+            std::printf("    %s; to read it, add this to the config:\n", cfg ? "not read by the config" : "no config read");
+            std::printf("        [[device]]\n        id = \"%s\"\n        match_usb = \"%s\"\n", spare_id(cfg).c_str(), usb_text(n.vendor, n.product).c_str());
+            std::string at = n.usb_port.empty() ? printable(n.phys) : n.usb_port;
+            if (!at.empty()) std::printf("        match_port = \"%s\"\n", at.c_str());
+        }
+        if (auto ref = parse_usb_port(n.usb_port)) std::printf("    a USB reset for it resets %s\n", usb_reset_reach(*ref, usb).c_str());
+        std::printf("\n");
     }
+    if (screens == 0) std::printf("no touchscreens found\n\n");
+    for (const auto& n : nodes) {
+        std::string why;
+        if (touch_kind(n, &why) != TouchKind::none) continue;
+        std::vector<std::string> claimed_by;
+        for (const auto& d : cfg ? cfg->devices : std::vector<DeviceConfig>()) {
+            if (matches(d, n)) claimed_by.push_back(d.id);
+        }
+        if (!all && claimed_by.empty()) continue;
+        print_node_head(n);
+        std::printf("    not a touchscreen: %s\n", why.c_str());
+        for (const auto& id : claimed_by) std::printf("    matches device \"%s\" in the config, which will not use it: it is not a touchscreen\n", id.c_str());
+        std::printf("\n");
+    }
+    if (!all && others > 0) std::printf("%d other input device%s (keyboards, buttons and the like): touch-to-osc --list --all shows them\n", others, others == 1 ? "" : "s");
     if (cfg) {
-        for (const auto& d : cfg->devices) {
-            if (!find_node(d, nodes)) std::printf("device \"%s\" in the config (%s): no touchscreen here matches it\n", d.id.c_str(), d.match_text().c_str());
+        for (size_t i = 0; i < cfg->devices.size(); ++i) {
+            const DeviceConfig& d = cfg->devices[i];
+            if (reads[i]) continue;
+            bool any = std::any_of(nodes.begin(), nodes.end(), [&](const NodeInfo& n) { return matches(d, n) && touch_kind(n) != TouchKind::none; });
+            if (any) std::printf("device \"%s\" in the config (%s): every touchscreen it matches is read by another device; set match_port to tell them apart\n", d.id.c_str(), d.match_text().c_str());
+            else std::printf("device \"%s\" in the config (%s): no touchscreen here matches it\n", d.id.c_str(), d.match_text().c_str());
         }
     }
     return 0;
@@ -120,11 +171,13 @@ int dump_device(const Config& cfg, const std::string& id, const SysPaths& paths)
         }
     }
     if (!d) {
-        std::fprintf(stderr, "no device \"%s\" in the config\n", id.c_str());
+        std::string ids;
+        for (const auto& c : cfg.devices) ids += (ids.empty() ? "" : ", ") + c.id;
+        std::fprintf(stderr, "no device \"%s\" in the config (its devices: %s)\n", id.c_str(), ids.c_str());
         return 2;
     }
     auto nodes = scan_nodes(paths);
-    const NodeInfo* n = find_node(*d, nodes);
+    const NodeInfo* n = assigned(cfg, nodes)[size_t(d - cfg.devices.data())];
     if (!n) {
         std::fprintf(stderr, "device %s (%s): no touchscreen matches; plug it in, or compare with touch-to-osc --list\n", d->id.c_str(), d->match_text().c_str());
         return 1;

@@ -60,6 +60,7 @@ struct Config {
     } log;
     struct Paths {
         std::string settings = "/var/lib/touch-to-osc/settings.toml";
+        std::string state = "/var/lib/touch-to-osc/state.toml";
     } paths;
     std::vector<DestinationConfig> destinations;
     std::vector<DeviceConfig> devices;
@@ -71,6 +72,7 @@ constexpr size_t kMaxAllowedIps = 64;
 
 Result<Config> parse_config(const std::string& toml_text, const std::string& source_name);
 Result<Config> load_config(const std::string& path);
+std::vector<std::string> overlap_warnings(const Config& c);
 
 bool parse_host_port(const std::string& s, HostPort& out);
 std::string usb_text(uint16_t vendor, uint16_t product);

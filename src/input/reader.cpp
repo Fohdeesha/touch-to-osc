@@ -6,8 +6,10 @@
 #include <libevdev/libevdev.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <climits>
+#include <cstdlib>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -50,8 +52,75 @@ bool NodeClaims::claimed(const std::string& sysname) {
     return held_.count(sysname) != 0;
 }
 
-DeviceReader::DeviceReader(DeviceConfig cfg, const std::string& prefix, DeviceShared& shared, int notify_fd, NodeClaims& claims, SysPaths paths)
-    : cfg_(std::move(cfg)), prefix_(prefix), sh_(shared), notify_fd_(notify_fd), claims_(claims), paths_(std::move(paths)) {
+void NodeClaims::set_devices(std::vector<DeviceConfig> devices) {
+    std::lock_guard<std::mutex> lock(m_);
+    devices_ = std::move(devices);
+}
+
+void NodeClaims::set_device(size_t index, const DeviceConfig& d) {
+    std::lock_guard<std::mutex> lock(m_);
+    if (index < devices_.size()) devices_[index] = d;
+}
+
+bool port_order(const NodeInfo& a, const NodeInfo& b) {
+    const std::string& x = a.usb_port.empty() ? a.phys : a.usb_port;
+    const std::string& y = b.usb_port.empty() ? b.phys : b.usb_port;
+    size_t i = 0, j = 0;
+    while (i < x.size() && j < y.size()) {
+        if (std::isdigit((unsigned char)x[i]) && std::isdigit((unsigned char)y[j])) {
+            size_t ei = i, ej = j;
+            while (ei < x.size() && std::isdigit((unsigned char)x[ei])) ++ei;
+            while (ej < y.size() && std::isdigit((unsigned char)y[ej])) ++ej;
+            unsigned long long nx = std::strtoull(x.substr(i, std::min<size_t>(ei - i, 18)).c_str(), nullptr, 10);
+            unsigned long long ny = std::strtoull(y.substr(j, std::min<size_t>(ej - j, 18)).c_str(), nullptr, 10);
+            if (nx != ny) return nx < ny;
+            i = ei;
+            j = ej;
+            continue;
+        }
+        if (x[i] != y[j]) return x[i] < y[j];
+        ++i;
+        ++j;
+    }
+    if (x.size() - i != y.size() - j) return x.size() - i < y.size() - j;
+    return a.number < b.number;
+}
+
+const NodeInfo* NodeClaims::pick(size_t index, const std::vector<NodeInfo>& nodes) {
+    std::vector<const NodeInfo*> screens;
+    for (const auto& n : nodes) {
+        if (touch_kind(n) != TouchKind::none) screens.push_back(&n);
+    }
+    std::sort(screens.begin(), screens.end(), [](const NodeInfo* a, const NodeInfo* b) { return port_order(*a, *b); });
+    std::lock_guard<std::mutex> lock(m_);
+    if (index >= devices_.size()) return nullptr;
+    // devices that say more about their screen choose first, so one matching by usb id alone never takes the screen
+    // a device names by port; the rest follow config order, and screens are taken in USB port order: the same cabling
+    // gives every device the same screen at every start
+    std::vector<size_t> order(devices_.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    auto says = [&](size_t i) { return (devices_[i].port.empty() ? 0 : 4) + (devices_[i].serial.empty() ? 0 : 2) + (devices_[i].has_usb ? 1 : 0); };
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return says(a) > says(b); });
+    std::set<const NodeInfo*> planned;
+    const NodeInfo* mine = nullptr;
+    for (size_t i : order) {
+        for (const NodeInfo* s : screens) {
+            if (planned.count(s) || !matches(devices_[i], *s)) continue;
+            planned.insert(s);
+            if (i == index) mine = s;
+            break;
+        }
+        if (i == index) break;
+    }
+    if (mine && !held_.count(mine->sysname)) return mine;
+    for (const NodeInfo* s : screens) {
+        if (matches(devices_[index], *s) && !held_.count(s->sysname) && !planned.count(s)) return s;
+    }
+    return nullptr;
+}
+
+DeviceReader::DeviceReader(DeviceConfig cfg, size_t index, const std::string& prefix, DeviceShared& shared, int notify_fd, NodeClaims& claims, SysPaths paths)
+    : cfg_(std::move(cfg)), index_(index), prefix_(prefix), sh_(shared), notify_fd_(notify_fd), claims_(claims), paths_(std::move(paths)) {
     std::string base = prefix + "/" + cfg_.id + "/";
     addr_down_ = base + "down";
     addr_move_ = base + "move";
@@ -162,7 +231,6 @@ void DeviceReader::wait_for_change(int timeout_ms) {
         drain_fd(p[1].fd);
         if (sh_.cfg_gen.load() != cfg_gen_) {
             pull_config();
-            set_state(DevState::restarting, "restarting after a settings change");
             publish_info();
         }
         apply_enabled();
@@ -170,9 +238,12 @@ void DeviceReader::wait_for_change(int timeout_ms) {
 }
 
 void DeviceReader::pull_config() {
-    std::lock_guard<std::mutex> lock(sh_.cfg_mutex);
-    cfg_ = sh_.next_cfg;
-    cfg_gen_ = sh_.cfg_gen.load();
+    {
+        std::lock_guard<std::mutex> lock(sh_.cfg_mutex);
+        cfg_ = sh_.next_cfg;
+        cfg_gen_ = sh_.cfg_gen.load();
+    }
+    claims_.set_device(index_, cfg_);
     info_.cfg_gen = cfg_gen_;
     warned_ambiguous_ = false;
 }
@@ -204,7 +275,6 @@ bool DeviceReader::reconfigure() {
 
 bool DeviceReader::open_device() {
     auto nodes = scan_nodes(paths_);
-    const NodeInfo* pick = nullptr;
     std::string why_not;
     int touchscreens = 0;
     bool any = false;
@@ -213,29 +283,45 @@ bool DeviceReader::open_device() {
         any = true;
         std::string why;
         if (touch_kind(n, &why) == TouchKind::none) {
-            if (why_not.empty()) why_not = "\"" + n.name + "\" (" + n.node + "), and " + why;
+            if (why_not.empty()) why_not = "\"" + printable(n.name) + "\" (" + n.node + "), and " + why;
             continue;
         }
         ++touchscreens;
-        if (!pick && !claims_.claimed(n.sysname)) pick = &n;
     }
+    const NodeInfo* pick = touchscreens ? claims_.pick(index_, nodes) : nullptr;
     if (!any) {
         eacces_since_ = 0;
-        set_state(DevState::not_connected,
-                  "no input device matches " + cfg_.match_text() + ": plug the touchscreen in, or check the id with touch-to-osc --list");
+        DeviceConfig anywhere = cfg_;
+        anywhere.port.clear();
+        const NodeInfo* moved = nullptr;
+        for (const auto& n : nodes) {
+            if (!cfg_.port.empty() && (cfg_.has_usb || !cfg_.serial.empty()) && matches(anywhere, n) && touch_kind(n) != TouchKind::none && !claims_.claimed(n.sysname))
+                moved = &n;
+        }
+        if (moved) {
+            std::string at = moved->usb_port.empty() ? printable(moved->phys) : moved->usb_port;
+            set_state(DevState::not_connected, "a " + usb_text(moved->vendor, moved->product) + " touchscreen is plugged into port " + at + ", not " + cfg_.port +
+                                                   ": plug it into " + cfg_.port + ", or set match_port to " + at);
+        } else {
+            set_state(DevState::not_connected,
+                      "no input device matches " + cfg_.match_text() + ": plug the touchscreen in, or check the id with touch-to-osc --list");
+        }
         return false;
     }
     if (!pick) {
         if (touchscreens == 0)
-            set_state(DevState::not_touchscreen, cfg_.match_text() + " is " + why_not + ": check usb and port in the config against touch-to-osc --list");
+            set_state(DevState::not_touchscreen,
+                      cfg_.match_text() + " is " + why_not + ": check match_usb and match_port against touch-to-osc --list");
         else
-            set_state(DevState::not_connected, "every touchscreen matching " + cfg_.match_text() + " is already read for another device in the config: set port to tell them apart");
+            set_state(DevState::not_connected, "every touchscreen matching " + cfg_.match_text() +
+                                                   " is read by another device in the config: set match_port to tell them apart");
         return false;
     }
     if (touchscreens > 1 && !warned_ambiguous_) {
         warned_ambiguous_ = true;
-        event(EventKind::device, log::Level::warning, "%s: %d touchscreens match %s; reading %s on port %s. Set port in the config to choose", cfg_.id.c_str(),
-              touchscreens, cfg_.match_text().c_str(), pick->node.c_str(), pick->usb_port.c_str());
+        std::string at = pick->usb_port.empty() ? printable(pick->phys) : pick->usb_port;
+        event(EventKind::device, log::Level::warning, "%s: %d touchscreens match %s; reading %s on port %s. Set match_port to choose",
+              cfg_.id.c_str(), touchscreens, cfg_.match_text().c_str(), pick->node.c_str(), at.c_str());
     }
     int fd = open(pick->node.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
@@ -273,6 +359,7 @@ bool DeviceReader::open_device() {
     sysname_ = pick->sysname;
     node_ = pick->node;
     kind_ = touch_kind(*pick);
+    info_.matching = touchscreens;
     copy_text(info_.node, sizeof info_.node, pick->node);
     copy_text(info_.name, sizeof info_.name, printable(pick->name));
     copy_text(info_.usb, sizeof info_.usb, usb_identity(*pick));
@@ -397,6 +484,18 @@ void DeviceReader::on_frame(const input_event& ev) {
     last_frame_ = t;
     sh_.last_frame_ns.store(t, std::memory_order_relaxed);
     read_raw();
+    if (quiet_check_) {
+        quiet_check_ = false;
+        bool same = false;
+        for (int i = 0; i < tracker_.slots(); ++i) same = same || (tracker_.raw(i).tracking != -1 && tracker_.raw(i).tracking == quiet_tracking_[i]);
+        if (same && !hinted_quiet_) {
+            hinted_quiet_ = true;
+            event(EventKind::silence, log::Level::warning,
+                  "%s went quiet with a finger down (silence_ms ended it), then reported the same finger again without letting go: if this screen "
+                  "reports only while a finger moves, set silence_ms = 0 for it; if it reports all the time, check its USB cable",
+                  cfg_.id.c_str());
+        }
+    }
     if (!enabled_) return;
     int n = tracker_.end_frame(evs_, t);
     if (n) send(n, t);
@@ -519,6 +618,7 @@ void DeviceReader::session() {
     }
     mapping_ = Mapping(cfg_, ax, ay);
     tracker_.reset(slots);
+    quiet_check_ = false;
     single_down_ = false;
     read_raw();
     tracker_.mute_down_slots();
@@ -536,8 +636,15 @@ void DeviceReader::session() {
     else
         set_state(DevState::ok, "");
     publish_info();
-    event(EventKind::device, log::Level::notice, "%s connected: %s (usb %s) on port %s, %s%s", cfg_.id.c_str(), info_.name, info_.usb, info_.port, node_.c_str(),
-          foreign ? ", but another program holds it" : info_.grabbed ? "" : ", not grabbed (grab = false)");
+    event(EventKind::device, log::Level::notice, "%s connected: %s (usb %s)%s%s, %s%s", cfg_.id.c_str(), info_.name, info_.usb, info_.port[0] ? " on port " : "",
+          info_.port, node_.c_str(), foreign ? ", but another program holds it" : info_.grabbed ? "" : ", not grabbed (grab = false)");
+    if (cfg_.aspect == 0 && mapping_.width_mm() == 0 && !hinted_aspect_) {
+        hinted_aspect_ = true;
+        event(EventKind::device, log::Level::notice,
+              "%s reports no physical size, so its aspect %.2f (width / height) is worked out from its units and may be wrong: set aspect for it "
+              "(1.778 for a 16:9 display)",
+              cfg_.id.c_str(), double(mapping_.aspect()));
+    }
 
     for (;;) {
         int timeout = -1;
@@ -573,7 +680,19 @@ void DeviceReader::session() {
             apply_enabled();
         }
         int rc = 0;
-        if (r == 0 || (r > 0 && p[0].revents)) rc = drain();
+        bool readable = r == 0 || (r > 0 && p[0].revents);
+        if (base_state_ == DevState::grab_refused) {
+            // events reach this client only once the other program has let go, and libevdev missed what it took
+            // meanwhile (the current slot among it): the device is read again from scratch, never from them
+            if (r > 0 && p[0].revents) rc = discard_events();
+            if (rc == 0 && readable && retry_grab()) {
+                cancel("device lost");
+                close_device();
+                return;
+            }
+        } else if (readable) {
+            rc = drain();
+        }
         if (rc < 0) {
             int n = cancel("device lost");
             sh_.losses.fetch_add(1, std::memory_order_relaxed);
@@ -593,6 +712,8 @@ void DeviceReader::session() {
         now = monotonic_ns();
         if (silent(now)) {
             Nanos quiet = now - last_frame_;
+            for (int i = 0; i < tracker_.slots(); ++i) quiet_tracking_[i] = tracker_.raw(i).tracking;
+            quiet_check_ = true;
             int n = cancel("device silent");
             sh_.silences.fetch_add(1, std::memory_order_relaxed);
             event(EventKind::silence, log::Level::warning,
@@ -602,10 +723,17 @@ void DeviceReader::session() {
                 set_state(DevState::grab_refused,
                           "another program took " + node_ + " exclusively, so no touches reach touch-to-osc: stop that program (fuser -v " + node_ + " names it)");
         }
-        if (r == 0 && base_state_ == DevState::grab_refused && retry_grab()) {
-            close_device();
-            return;
-        }
+    }
+}
+
+int DeviceReader::discard_events() {
+    input_event buf[64];
+    for (;;) {
+        ssize_t n = read(fd_.get(), buf, sizeof buf);
+        if (n > 0) continue;
+        if (n == 0) return -ENODEV;
+        if (errno == EINTR) continue;
+        return errno == EAGAIN ? 0 : -errno;
     }
 }
 

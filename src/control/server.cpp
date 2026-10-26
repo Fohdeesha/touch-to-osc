@@ -2,6 +2,7 @@
 
 #include "config/atomic_file.h"
 #include "core/log.h"
+#include "core/names.h"
 #include "core/process.h"
 
 #include "tto_version.h"
@@ -14,17 +15,43 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <poll.h>
+#include <spawn.h>
 #include <sys/eventfd.h>
 #include <sys/random.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char** environ;
 
 namespace tto {
 
 namespace {
+
+std::string count_text(uint64_t n, const char* thing) { return std::to_string(n) + " " + thing + (n == 1 ? "" : "s"); }
+
+const std::vector<std::string> kDeviceSettings = {"label",     "enabled",   "rotation",     "mirror",     "calibration",  "aspect",   "silence_ms",
+                                                  "grab",      "match_usb", "match_serial", "match_port", "usb_recovery", "usb_reset"};
+const std::vector<std::string> kDeviceReported = {"connected", "state",   "reason",   "usb_watched_port", "usb_port_state", "usb_resets",   "name",
+                                                  "usb",       "port",    "slots",    "size_mm",          "grabbed",        "contacts",     "oldest_s",
+                                                  "last_event_s", "rate_hz", "latency_us", "counts",       "active"};
+const std::vector<std::string> kCommands = {"ping",          "status/send",       "restart",          "subscribe",
+                                            "unsubscribe",   "request",           "log_level",        "allowed_ips/add",
+                                            "allowed_ips/remove", "saved_destinations/add", "saved_destinations/remove", "settings/forget"};
+const std::vector<std::string> kReported = {"osc_api",   "version", "run",      "health",       "reasons",     "host",     "config",
+                                            "settings_file", "overrides", "devices", "subscribers", "destinations", "uptime_s", "alive"};
+
+std::string not_settable(const std::string& name) { return name + " is reported by touch-to-osc and cannot be set"; }
+
+std::string ids_text(const Config& c) {
+    std::string s;
+    for (const auto& d : c.devices) s += (s.empty() ? "" : ", ") + d.id;
+    return s;
+}
 
 std::string env_text(const char* name) {
     const char* v = std::getenv(name);
@@ -41,6 +68,9 @@ constexpr Nanos kReportEvery = 10 * kSec;
 constexpr Nanos kSaveSettle = 300 * kMs;
 constexpr Nanos kSaveEvery = kSec;
 constexpr Nanos kUsbStopWait = 2 * kSec;
+constexpr Nanos kUsbLongWait = 30 * kSec;
+constexpr Nanos kWriteStopWait = 3 * kSec;
+constexpr Nanos kCheckWait = 2 * kSec;
 constexpr double kEventBurst = 10;
 constexpr double kEventsPerSecond = 1;
 constexpr double kRefusalBurst = 20;
@@ -139,18 +169,22 @@ bool take_token(double& tokens, Nanos& last, Nanos now, double burst, double per
 
 int32_t next_counter(int32_t v) { return v == INT32_MAX ? 1 : v + 1; }
 
-std::vector<std::vector<uint8_t>> pack(const std::vector<osc::Message>& msgs) {
+// a message named in `first` and the one after it always share a bundle (the health and its reasons)
+std::vector<std::vector<uint8_t>> pack(const std::vector<osc::Message>& msgs, const std::string& first = std::string()) {
     std::vector<std::vector<uint8_t>> out;
     std::vector<osc::Message> group;
     size_t size = 16;
-    for (const auto& m : msgs) {
-        size_t n = osc::encode(m).size() + 4;
-        if (!group.empty() && size + n > kBundleBytes) {
+    for (size_t i = 0; i < msgs.size(); ++i) {
+        size_t n = osc::encode(msgs[i]).size() + 4;
+        bool second = i > 0 && !first.empty() && msgs[i - 1].address == first;
+        size_t need = n;
+        if (!first.empty() && msgs[i].address == first && i + 1 < msgs.size()) need += osc::encode(msgs[i + 1]).size() + 4;
+        if (!group.empty() && !second && size + need > kBundleBytes) {
             out.push_back(osc::encode_bundle(group));
             group.clear();
             size = 16;
         }
-        group.push_back(m);
+        group.push_back(msgs[i]);
         size += n;
     }
     if (!group.empty()) out.push_back(osc::encode_bundle(group));
@@ -159,21 +193,69 @@ std::vector<std::vector<uint8_t>> pack(const std::vector<osc::Message>& msgs) {
 
 }
 
-Server::Server(Config base, SettingsLoad settings, std::string config_path, SysPaths paths)
+Server::Server(Config base, SettingsLoad settings, Launch launch, SysPaths paths)
     : base_(std::move(base)),
       over_(std::move(settings.overrides)),
+      over_values_(std::move(settings.config_values)),
       cfg_(apply_overrides(base_, over_)),
       settings_notes_(std::move(settings.notes)),
       settings_load_problem_(std::move(settings.problem)),
       settings_file_(settings.file_exists && !over_.empty() ? base_.paths.settings : std::string()),
-      config_path_(std::move(config_path)),
+      config_path_(std::move(launch.config_path)),
+      config_text_(std::move(launch.config_text)),
+      config_problem_(std::move(launch.config_problem)),
+      exe_(std::move(launch.exe)),
+      state_path_(base_.paths.state),
       paths_(std::move(paths)),
       prefix_(base_.osc.prefix),
       usb_root_(env_text("TTO_USB_ROOT")),
       usb_worker_(usb_root_.empty() ? UsbPaths() : usb_paths_under(usb_root_)) {
     char host[256] = {};
     if (gethostname(host, sizeof host - 1) == 0) host_ = host;
-    if (!over_.empty() && !settings.file_exists) settings_dirty_ = true;
+    if ((!over_.empty() && !settings.file_exists) || settings.rewrite) settings_dirty_ = true;
+    usb_worker_.set_marker(usb_reset_marker(state_path_));
+    keep_restart_reply();
+}
+
+void Server::keep_restart_reply() {
+    std::string leases = env_text(kKeptLeases);
+    unsetenv(kKeptLeases);
+    for (size_t at = 0; at < leases.size() && carried_leases_.size() < kMaxLeases;) {
+        size_t end = leases.find(';', at);
+        std::string one = leases.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        at = end == std::string::npos ? leases.size() : end + 1;
+        char lip[INET_ADDRSTRLEN] = {};
+        unsigned lport = 0;
+        int secs = 0;
+        if (std::sscanf(one.c_str(), "%15[0-9.]:%u:%d", lip, &lport, &secs) == 3 && lport > 0 && lport < 65536 && secs >= 1 && secs <= 60)
+            carried_leases_.push_back({Peer{lip, uint16_t(lport)}, secs});
+    }
+    std::string v = env_text(kRestartedBy);
+    unsetenv(kRestartedBy);
+    char ip[INET_ADDRSTRLEN] = {};
+    unsigned port = 0;
+    long seq = 0;
+    int used = 0;
+    if (v.empty() || std::sscanf(v.c_str(), "%15[0-9.]:%u:%ld:%n", ip, &port, &seq, &used) != 3 || port == 0 || port > 65535) return;
+    std::vector<uint8_t> command;
+    for (size_t i = size_t(used); i + 1 < v.size(); i += 2) command.push_back(uint8_t(std::strtoul(v.substr(i, 2).c_str(), nullptr, 16)));
+    kept_.keep(Peer{ip, uint16_t(port)}, int32_t(seq), std::move(command), true, std::string(), monotonic_ns());
+}
+
+void Server::restore_leases() {
+    Nanos now = monotonic_ns();
+    for (const auto& [peer, secs] : carried_leases_) {
+        bool allowed = cfg_.osc.open_to_any || std::find(cfg_.osc.allowed_ips.begin(), cfg_.osc.allowed_ips.end(), peer.ip) != cfg_.osc.allowed_ips.end();
+        if (!allowed) {
+            TTO_NOTICE("subscriber %s was not kept over the restart: it is no longer in osc.allowed_ips", peer.text().c_str());
+            continue;
+        }
+        if (leases_.subscribe(peer, secs, now) == Leases::Outcome::added)
+            TTO_NOTICE("subscriber %s kept over the restart (%d s of its lease left)", peer.text().c_str(), secs);
+    }
+    carried_leases_.clear();
+    // the first tick sends them the full status and an alive with the new run at once
+    if (!leases_.all().empty()) next_second_ = now;
 }
 
 Server::~Server() {
@@ -191,13 +273,15 @@ bool Server::open_sockets() {
         TTO_CRIT("cannot create a UDP socket: %s", errno_str().c_str());
         return false;
     }
-    int one = 1;
-    setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     sockaddr_in a{};
     to_sockaddr(Peer{cfg_.osc.listen.host, uint16_t(cfg_.osc.listen.port)}, a);
     if (bind(fd.get(), reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
-        TTO_CRIT("cannot listen on UDP %s:%d (%s): another program uses the port, or the address is not this machine's; change osc.listen in %s",
-                 cfg_.osc.listen.host.c_str(), cfg_.osc.listen.port, errno_str().c_str(), config_path_.c_str());
+        int e = errno;
+        std::string why = e == EADDRINUSE ? "another program listens there, most likely touch-to-osc itself (the service: systemctl stop touch-to-osc first)"
+                          : e == EADDRNOTAVAIL ? "that address is not one of this machine's"
+                                               : "the port cannot be used";
+        TTO_CRIT("cannot listen on UDP %s:%d (%s): %s; or change osc.listen in %s", cfg_.osc.listen.host.c_str(), cfg_.osc.listen.port, errno_str(e).c_str(),
+                 why.c_str(), config_path_.c_str());
         return false;
     }
     osc_fd_ = std::move(fd);
@@ -206,7 +290,8 @@ bool Server::open_sockets() {
 
 void Server::banner() {
     TTO_NOTICE("touch-to-osc %s (osc_api %d), run %d, config %s", TTO_VERSION, kOscApi, run_, config_path_.c_str());
-    std::string from = cfg_.osc.open_to_any ? std::string("ANY HOST") : std::to_string(cfg_.osc.allowed_ips.size()) + " allowed host(s)";
+    std::string from = cfg_.osc.open_to_any ? std::string("ANY HOST") : std::string();
+    for (const auto& ip : cfg_.osc.open_to_any ? std::vector<std::string>() : cfg_.osc.allowed_ips) from += (from.empty() ? "" : ", ") + ip;
     TTO_NOTICE("OSC on UDP %s:%d, prefix %s, commands and subscriptions from %s", cfg_.osc.listen.host.c_str(), cfg_.osc.listen.port, prefix_.c_str(), from.c_str());
     for (const auto& d : cfg_.devices) {
         std::string mirror = d.mirror_text();
@@ -231,6 +316,8 @@ void Server::banner() {
     }
     for (const auto& n : settings_notes_) TTO_WARN("%s", n.c_str());
     if (!settings_load_problem_.empty()) TTO_WARN("%s", settings_load_problem_.c_str());
+    if (!config_problem_.empty()) TTO_WARN("%s", config_problem_.c_str());
+    for (const auto& w : overlap_warnings(cfg_)) TTO_WARN("%s", w.c_str());
 }
 
 int Server::run() {
@@ -260,6 +347,7 @@ int Server::run() {
     its.it_value.tv_nsec = long(kTick);
     timerfd_settime(timer_fd_.get(), 0, &its, nullptr);
     banner();
+    claims_.set_devices(cfg_.devices);
     for (const auto& d : cfg_.devices) {
         auto sh = std::make_unique<DeviceShared>();
         sh->wake.reset(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
@@ -267,7 +355,7 @@ int Server::run() {
             TTO_CRIT("cannot create the event handles: %s", errno_str().c_str());
             return 4;
         }
-        readers_.push_back(std::make_unique<DeviceReader>(d, prefix_, *sh, notify_fd_.get(), claims_, paths_));
+        readers_.push_back(std::make_unique<DeviceReader>(d, readers_.size(), prefix_, *sh, notify_fd_.get(), claims_, paths_));
         shared_.push_back(std::move(sh));
         stats_.emplace_back();
         cfg_gen_.push_back(0);
@@ -279,11 +367,34 @@ int Server::run() {
         usb_why_.emplace_back();
         usb_resets_.push_back(0);
     }
+    std::string note;
+    state_ = load_state(state_path_, &note);
+    if (!note.empty()) TTO_WARN("%s", note.c_str());
+    bool state_changed = false;
+    for (auto it = state_.usb_ports.begin(); it != state_.usb_ports.end();) {
+        auto d = std::find_if(cfg_.devices.begin(), cfg_.devices.end(), [&](const DeviceConfig& c) { return c.id == it->first; });
+        if (d == cfg_.devices.end() || !parse_usb_port(it->second)) {
+            it = state_.usb_ports.erase(it);
+            state_changed = true;
+            continue;
+        }
+        usb_last_port_[size_t(d - cfg_.devices.begin())] = it->second;
+        ++it;
+    }
+    repair_usb_hub();
     rx_.resize(65536);
     next_second_ = monotonic_ns() + kSec;
+    restore_leases();
     publish_dests();
     for (auto& r : readers_) r->start();
     sd_notify_msg("READY=1");
+    if (config_problem_.empty() && !config_text_.empty() && (state_.config_path != config_path_ || state_.config_text != config_text_)) {
+        state_.config_path = config_path_;
+        state_.config_text = config_text_;
+        state_.config_saved = local_time_text();
+        state_changed = true;
+    }
+    if (state_changed) save_state();
 
     for (;;) {
         pollfd p[4] = {{osc_fd_.get(), POLLIN, 0}, {signal_fd_.get(), POLLIN, 0}, {notify_fd_.get(), POLLIN, 0}, {timer_fd_.get(), POLLIN, 0}};
@@ -320,14 +431,117 @@ int Server::run() {
     }
     for (auto& r : readers_) r->join();
     drain_reader_events();
-    if (!usb_worker_.wait(kUsbStopWait))
-        TTO_WARN("a USB %s is still waiting in the kernel; %s without waiting for it", usb_worker_.resetting() ? "reset" : "port check",
-                 restart_requested_ ? "restarting" : "stopping");
-    collect_usb(monotonic_ns(), false);
     if (settings_dirty_) save_settings();
     send_bye();
+    const char* doing = restart_requested_ ? "restarting" : "stopping";
+    // a reset cut short between its unbind and its bind leaves every device on that hub off, so one in flight is
+    // waited for; a restart also waits for a port check, since exec cannot end a thread the kernel holds
+    bool long_wait = usb_worker_.resetting() || restart_requested_;
+    if (!wait_usb_worker(long_wait ? kUsbLongWait : kUsbStopWait, !restart_requested_))
+        TTO_WARN("a USB %s is still waiting in the kernel; %s without waiting for it", usb_worker_.resetting() ? "reset" : "port check", doing);
+    collect_usb(monotonic_ns(), false);
+    if (!restart_requested_ && !writer_.idle()) sd_notify_msg("EXTEND_TIMEOUT_USEC=5000000");
+    if (!writer_.wait_idle(kWriteStopWait)) TTO_WARN("a file is still being written (the disk is slow or stuck); %s without waiting for it", doing);
+    collect_writes(monotonic_ns());
+    if (restart_requested_ && restart_asked_) {
+        char head[64];
+        std::snprintf(head, sizeof head, "%s:%u:%d:", restart_asked_->peer.ip.c_str(), unsigned(restart_asked_->peer.port), int(restart_asked_->seq));
+        std::string v = head;
+        char hex[3];
+        for (uint8_t b : restart_asked_->command) {
+            std::snprintf(hex, sizeof hex, "%02x", unsigned(b));
+            v += hex;
+        }
+        setenv(kRestartedBy, v.c_str(), 1);
+    }
+    if (restart_requested_) {
+        std::string kept;
+        Nanos now = monotonic_ns();
+        for (const auto& l : leases_.all()) {
+            if (l.until <= now) continue;
+            long long left = std::min<long long>(60, (l.until - now + kSec - 1) / kSec);
+            kept += (kept.empty() ? "" : ";") + l.peer.text() + ":" + std::to_string(left);
+        }
+        if (!kept.empty()) setenv(kKeptLeases, kept.c_str(), 1);
+    }
     TTO_NOTICE("%s", restart_requested_ ? "restarting" : "stopped");
     return restart_requested_ ? kRestartExit : 0;
+}
+
+Status Server::restart_check() {
+    const std::string keeps = "touch-to-osc keeps running: ";
+    auto fresh = load_config(config_path_);
+    if (!fresh) return err(keeps + "at a restart its config file would be refused (" + fresh.error() + ")");
+    const HostPort& to = fresh->osc.listen;
+    if (to.host != cfg_.osc.listen.host || to.port != cfg_.osc.listen.port) {
+        UniqueFd probe(socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+        sockaddr_in a{};
+        to_sockaddr(Peer{to.host, uint16_t(to.port)}, a);
+        if (!probe || bind(probe.get(), reinterpret_cast<sockaddr*>(&a), sizeof a) != 0)
+            return err(keeps + "at a restart it would listen on UDP " + to.text() + ", which cannot be used (" + errno_str() + "): change osc.listen in " + config_path_);
+    }
+    if (exe_.empty()) return {};
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) return err(keeps + "the installed program cannot be checked (" + errno_str() + ")");
+    UniqueFd rd(fds[0]), wr(fds[1]);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, wr.get(), 1);
+    posix_spawn_file_actions_adddup2(&fa, wr.get(), 2);
+    posix_spawnattr_t at;
+    posix_spawnattr_init(&at);
+    sigset_t none;
+    sigemptyset(&none);
+    posix_spawnattr_setsigmask(&at, &none);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK);
+    std::string arg = "--check-config=" + config_path_;
+    char* argv[] = {const_cast<char*>(exe_.c_str()), const_cast<char*>(arg.c_str()), nullptr};
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, exe_.c_str(), &fa, &at, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&at);
+    wr.reset();
+    if (rc != 0) return err(keeps + "the program it would restart, " + exe_ + ", cannot be run (" + errno_str(rc) + ")");
+    fcntl(rd.get(), F_SETFL, O_NONBLOCK);
+    std::string out;
+    auto take = [&] {
+        char buf[512];
+        ssize_t n;
+        while ((n = read(rd.get(), buf, sizeof buf)) > 0) {
+            if (out.size() < 4096) out.append(buf, size_t(n));
+        }
+    };
+    Nanos until = monotonic_ns() + kCheckWait;
+    int status = 0;
+    for (;;) {
+        take();
+        if (waitpid(pid, &status, WNOHANG) == pid) break;
+        if (monotonic_ns() >= until) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return err(keeps + "the installed program did not finish checking " + config_path_ + " in time");
+        }
+        usleep(5000);
+    }
+    take();
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code == 0 || code == kCheckSettingsRefused) return {};
+    std::string first = out.substr(0, out.find('\n'));
+    for (char& c : first) {
+        if (c < 0x20 || c >= 0x7f) c = '?';
+    }
+    return err(keeps + "the installed version (" + exe_ + ") would not start with " + config_path_ + (first.empty() ? std::string() : ": " + first));
+}
+
+bool Server::wait_usb_worker(Nanos max, bool stopping) {
+    Nanos until = monotonic_ns() + max;
+    for (;;) {
+        Nanos left = until - monotonic_ns();
+        if (usb_worker_.wait(std::max<Nanos>(0, std::min<Nanos>(kSec, left)))) return true;
+        if (monotonic_ns() >= until) return false;
+        if (sd_watchdog_enabled()) sd_notify_msg("WATCHDOG=1");
+        if (stopping) sd_notify_msg("EXTEND_TIMEOUT_USEC=5000000");
+    }
 }
 
 void Server::on_tick() {
@@ -335,6 +549,7 @@ void Server::on_tick() {
     drain_reader_events();
     drain_latency(now);
     collect_usb(now, true);
+    collect_writes(now);
     if (settings_dirty_ && now - dirty_since_ >= kSaveSettle && now - last_save_ >= kSaveEvery) save_settings();
     if (now >= next_second_) {
         next_second_ = now - next_second_ > 2 * kSec ? now + kSec : next_second_ + kSec;
@@ -395,7 +610,7 @@ void Server::emit(const std::string& key, log::Level level, const std::string& k
 void Server::report_suppressed(Nanos now) {
     for (auto& [key, l] : limits_) {
         if (!l.suppressed || !take_token(l.tokens, l.last, now, kEventBurst, kEventsPerSecond)) continue;
-        std::string text = std::to_string(l.suppressed) + " more \"" + l.kind + "\" events (" + key + ") came too fast to report one by one";
+        std::string text = count_text(l.suppressed, ("more \"" + l.kind + "\" event").c_str()) + " (" + key + ") came too fast to report one by one";
         l.suppressed = 0;
         TTO_WARN("%s", text.c_str());
         send_event(l.kind, text, l.level);
@@ -418,7 +633,8 @@ void Server::drain_reader_events() {
         uint64_t lost = shared_[i]->lost_events.load(std::memory_order_relaxed);
         if (lost != stats_[i].lost_events_seen) {
             emit(cfg_.devices[i].id + "/lost", log::Level::warning, "device",
-                 cfg_.devices[i].id + ": " + std::to_string(lost - stats_[i].lost_events_seen) + " device messages were dropped because they came too fast");
+                 cfg_.devices[i].id + ": " + count_text(lost - stats_[i].lost_events_seen, "status event") +
+                     " about it were dropped because they came too fast (touches were not affected)");
             stats_[i].lost_events_seen = lost;
         }
     }
@@ -525,24 +741,30 @@ void Server::send_status_changes(bool full) {
         last_status_.clear();
         return;
     }
+    auto all = status_messages();
+    std::vector<bool> send(all.size(), full);
+    for (size_t i = 0; i < all.size(); ++i) {
+        auto it = last_status_.find(all[i].address);
+        if (it == last_status_.end() || it->second != osc::encode(all[i])) send[i] = true;
+    }
+    for (size_t i = 0; i + 1 < all.size(); ++i) {
+        if (all[i].address == addr("health") && all[i + 1].address == addr("reasons") && (send[i] || send[i + 1])) send[i] = send[i + 1] = true;
+    }
     std::vector<osc::Message> changed;
-    for (auto& m : status_messages()) {
-        auto bytes = osc::encode(m);
-        auto it = last_status_.find(m.address);
-        if (full || it == last_status_.end() || it->second != bytes) {
-            last_status_[m.address] = std::move(bytes);
-            changed.push_back(std::move(m));
-        }
+    for (size_t i = 0; i < all.size(); ++i) {
+        if (!send[i]) continue;
+        last_status_[all[i].address] = osc::encode(all[i]);
+        changed.push_back(std::move(all[i]));
     }
     if (changed.empty()) return;
-    auto bundles = pack(changed);
+    auto bundles = pack(changed, addr("health"));
     for (const auto& t : tg) {
         for (const auto& b : bundles) send_target(t, b);
     }
 }
 
 void Server::send_bundled(const Peer& to, const std::vector<osc::Message>& msgs) {
-    for (const auto& b : pack(msgs)) send_bytes(to, b);
+    for (const auto& b : pack(msgs, addr("health"))) send_bytes(to, b);
 }
 
 void Server::send_alive(Nanos now) {
@@ -599,7 +821,7 @@ Server::Health Server::health(Nanos now) {
         if (info.cfg_gen < restart_gen_[i] || info.state == DevState::restarting) {
             warnings.push_back(d.label + " is restarting after a settings change");
         } else if (!info.enabled) {
-            warnings.push_back(d.label + " is turned off" + (base_.devices[i].enabled ? " (a saved setting)" : " in the config file"));
+            if (base_.devices[i].enabled) warnings.push_back(d.label + " is turned off by a saved setting");
         } else {
             switch (info.state) {
             case DevState::ok: break;
@@ -609,25 +831,29 @@ Server::Health Server::health(Nanos now) {
                 break;
             }
         }
+        if (info.connected && info.matching > 1 && d.port.empty())
+            warnings.push_back(d.label + " matches " + std::to_string(info.matching) + " touchscreens (" + d.match_text() + ") and reads the one on port " +
+                               std::string(info.port) + ", which can change at a restart: set match_port to choose");
         const auto& s = stats_[i].samples;
         if (s.size() >= 2) {
             uint64_t resyncs = s.back().resyncs - s.front().resyncs;
-            uint64_t silences = s.back().silences - s.front().silences;
             uint64_t drops = s.back().drops - s.front().drops;
-            uint64_t losses = s.back().losses - s.front().losses;
-            if (resyncs) warnings.push_back(d.label + ": the kernel dropped touch events " + std::to_string(resyncs) + " time(s) in the last minute; the machine may be overloaded");
-            if (silences) warnings.push_back(d.label + " went silent with fingers down " + std::to_string(silences) + " time(s) in the last minute: check its USB cable");
-            if (losses)
-                warnings.push_back(d.label + " was unplugged or dropped off USB " + std::to_string(losses) + " time(s) in the last minute: check its USB cable and its joints");
-            if (drops) warnings.push_back(d.label + ": " + std::to_string(drops) + " touch message(s) could not be sent in the last minute");
+            if (resyncs)
+                warnings.push_back(d.label + ": the kernel dropped touch events " + count_text(resyncs, "time") + " in the last minute; the machine may be overloaded");
+            if (drops)
+                warnings.push_back(d.label + ": " + count_text(drops, "touch message") +
+                                   " could not be sent in the last minute: the network or a receiver cannot keep up, or a receiver cannot be reached (" + prefix_ +
+                                   "/destinations lists them)");
         }
     }
     for (const auto& [key, h] : dest_health_) {
-        if (h.failing) warnings.push_back("sending to " + key + " fails: " + h.error);
+        if (h.failing) warnings.push_back("sending to " + key + " fails: " + h.error + "; check that it can be reached from this machine");
     }
     if (!usb_problem_.empty()) faults.push_back(usb_problem_);
+    if (!config_problem_.empty()) warnings.push_back(config_problem_);
     if (!settings_load_problem_.empty()) warnings.push_back(settings_load_problem_);
     if (!settings_problem_.empty()) warnings.push_back(settings_problem_);
+    if (!state_problem_.empty()) warnings.push_back(state_problem_);
     (void)now;
     Health out;
     out.level = !faults.empty() ? "fault" : !warnings.empty() ? "warning" : "ok";
@@ -651,9 +877,12 @@ void Server::watch_usb(Nanos now) {
         const DeviceConfig& d = cfg_.devices[i];
         const DevInfo& info = shared_[i]->info.latest();
         if (info.connected) {
-            if (info.usb_port[0]) usb_last_port_[i] = info.usb_port;
+            if (info.usb_port[0] && usb_last_port_[i] != info.usb_port) {
+                usb_last_port_[i] = info.usb_port;
+                remember_port(i);
+            }
             if (usb_rec_[i].attempts() > 0)
-                emit(d.id + "/usb", log::Level::notice, "usb", d.id + " is back after " + std::to_string(usb_rec_[i].attempts()) + " USB reset(s)");
+                emit(d.id + "/usb", log::Level::notice, "usb", d.id + " is back after " + count_text(unsigned(usb_rec_[i].attempts()), "USB reset"));
             usb_rec_[i].connected();
         }
         std::optional<UsbPortRef> ref;
@@ -717,15 +946,16 @@ void Server::start_usb_reset(size_t index, const UsbPortRef& ref, const std::str
     const std::string& id = cfg_.devices[index].id;
     usb_worker_dev_ = index;
     usb_worker_manual_ = !asked_by.empty();
-    usb_worker_target_ = ref.hub.rfind("usb", 0) == 0 ? "USB bus " + std::to_string(ref.bus) : "the USB hub " + ref.hub;
+    usb_worker_target_ = usb_target_text(ref);
+    usb_worker_hub_ = ref.hub_interface;
     if (usb_worker_manual_)
         emit(id + "/usb", log::Level::warning, "usb",
              id + ": resetting " + usb_worker_target_ + " as asked by " + asked_by + "; every device on it drops for a moment");
     else
         emit(id + "/usb", log::Level::warning, "usb",
-             id + ": something is plugged into USB port " + ref.path + " but the kernel has not set it up; resetting " + usb_worker_target_ +
-                 " (attempt " + std::to_string(usb_rec_[index].attempts() + 1) + "); every device on it drops for a moment");
-    usb_worker_.reset(ref.hub_interface, monotonic_ns());
+             id + ": something is plugged into USB port " + ref.path + " but the kernel has not set it up; resetting " + usb_worker_target_ + " (attempt " +
+                 std::to_string(usb_rec_[index].attempts() + 1) + "); every device on it drops for a moment");
+    usb_worker_.reset(ref, monotonic_ns());
     status_dirty_ = true;
 }
 
@@ -733,11 +963,20 @@ void Server::finish_usb_reset(Nanos now, const UsbWorker::Done& done) {
     size_t i = usb_worker_dev_;
     const std::string& id = cfg_.devices[i].id;
     ++usb_resets_[i];
-    if (!usb_worker_manual_) usb_rec_[i].reset_done(now);
+    if (!usb_worker_manual_) {
+        std::vector<std::string> watched(usb_rec_.size());
+        for (size_t j = 0; j < watched.size(); ++j) {
+            auto ref = usb_port_of(j);
+            if (usb_watching_[j] && ref) watched[j] = ref->hub_interface;
+        }
+        reset_done_on_hub(usb_rec_, watched, i, usb_worker_hub_, now);
+    }
+    std::string also = done.dropped.empty() ? "nothing else was on it" : "it also dropped ";
+    for (size_t k = 0; k < done.dropped.size(); ++k) also += (k ? ", " : "") + done.dropped[k];
     if (done.result) {
         usb_problem_.clear();
         emit(id + "/usb", log::Level::notice, "usb",
-             id + ": " + usb_worker_target_ + " reset in " + std::to_string(done.took / kMs) + " ms; waiting for the touchscreen to come back");
+             id + ": " + usb_worker_target_ + " reset in " + std::to_string(done.took / kMs) + " ms (" + also + "); waiting for the touchscreen to come back");
     } else {
         usb_problem_ = done.result.error();
         emit(id + "/usb", log::Level::err, "usb", id + ": " + done.result.error());
@@ -748,7 +987,7 @@ void Server::finish_usb_reset(Nanos now, const UsbWorker::Done& done) {
 std::string Server::usb_reason(size_t index) const {
     auto ref = usb_port_of(index);
     std::string port = ref ? ref->path : std::string("?");
-    std::string tries = std::to_string(usb_resets_[index]) + " reset(s) so far";
+    std::string tries = count_text(usb_resets_[index], "reset") + " so far";
     return "plugged into USB port " + port + " but the kernel has not set it up; touch-to-osc resets the USB connection by itself (" + tries +
            "). If this keeps happening, check the cable and its joints";
 }
@@ -756,7 +995,7 @@ std::string Server::usb_reason(size_t index) const {
 std::string Server::disabled_reason(size_t index) const {
     std::string on = "send " + prefix_ + "/device/" + cfg_.devices[index].id + "/enabled 1 to turn it back on";
     if (!base_.devices[index].enabled) return "turned off in the config file (enabled = false): set it to true there, or " + on;
-    return "turned off by a saved setting: " + on;
+    return "turned off by a saved setting (changed over OSC, for example from an app): turn it on there, or " + on;
 }
 
 std::vector<osc::Message> Server::status_messages() {
@@ -883,7 +1122,12 @@ void Server::on_osc() {
         }
         bool allowed = cfg_.osc.open_to_any || std::find(cfg_.osc.allowed_ips.begin(), cfg_.osc.allowed_ips.end(), peer.ip) != cfg_.osc.allowed_ips.end();
         if (!allowed) {
-            if (!msgs->empty()) refuse(peer, msgs->front().address, peer.ip + " may not send commands here: add it to osc.allowed_ips in " + config_path_, true);
+            bool removed = std::find(over_.allowed_removed.begin(), over_.allowed_removed.end(), peer.ip) != over_.allowed_removed.end();
+            std::string why = removed ? peer.ip + " may not send commands here: it was taken off the allowed hosts over OSC (a saved setting); send " + prefix_ +
+                                            "/allowed_ips/add " + peer.ip + " from an allowed host, or " + prefix_ + "/settings/forget allowed_ips"
+                                      : peer.ip + " may not send commands here: add it to osc.allowed_ips in " + config_path_ +
+                                            " and restart touch-to-osc, or send " + prefix_ + "/allowed_ips/add " + peer.ip + " from an allowed host";
+            if (!msgs->empty()) refuse(peer, msgs->front().address, why, true);
             continue;
         }
         for (const auto& m : *msgs) command(m, peer);
@@ -933,18 +1177,29 @@ bool Server::request(const osc::Message& m, const Peer& peer) {
     const KeptReplies::Kept* k = nullptr;
     switch (kept_.find(peer, s, bytes, now, &k)) {
     case KeptReplies::Lookup::repeat: answer(k->ok, k->note); return k->ok;
-    case KeptReplies::Lookup::conflict: answer(false, "seq used for another command"); return false;
+    case KeptReplies::Lookup::conflict:
+        answer(false, "seq " + std::to_string(s) + " was used for another command in the last " + std::to_string(kKeepReplies / kSec) + " s: use a new seq for each command");
+        return false;
     case KeptReplies::Lookup::none: break;
     }
-    Status st = inner.address == addr("request") ? Status(err("a request cannot carry another request")) : apply(inner, peer);
-    if (!st) TTO_LOG_EVERY(5 * kSec, log::Level::warning, "OSC %s from %s refused: %s", inner.address.c_str(), peer.ip.c_str(), st.error().c_str());
+    Status st;
+    if (!osc::valid_address(inner.address)) st = err("a request's address must be an OSC address: a slash, then printable characters");
+    else if (inner.address == addr("request")) st = err("a request cannot carry another request");
+    else {
+        asking_ = Asked{peer, s, bytes};
+        st = apply(inner, peer);
+        asking_.reset();
+    }
+    if (!st) TTO_LOG_EVERY(5 * kSec, log::Level::warning, "OSC %s from %s refused: %s", osc::valid_address(inner.address) ? inner.address.c_str() : "(not an address)",
+                           peer.ip.c_str(), st.error().c_str());
     kept_.keep(peer, s, bytes, st.ok(), st.ok() ? std::string() : st.error(), now);
     answer(st.ok(), st.ok() ? std::string() : st.error());
     return st.ok();
 }
 
 Status Server::apply(const osc::Message& m, const Peer& peer) {
-    if (m.address.size() <= prefix_.size() + 1 || m.address.compare(0, prefix_.size() + 1, prefix_ + "/") != 0) return err("unknown address");
+    if (m.address.size() <= prefix_.size() + 1 || m.address.compare(0, prefix_.size() + 1, prefix_ + "/") != 0)
+        return err("unknown address: every address here starts with " + prefix_ + "/");
     auto parts = split(m.address.substr(prefix_.size() + 1));
     auto reply_peer = [&]() {
         Peer to = peer;
@@ -970,9 +1225,10 @@ Status Server::apply(const osc::Message& m, const Peer& peer) {
     }
     if (parts.size() == 1 && parts[0] == "restart") {
         if (!m.args.empty()) return err("restart takes no arguments");
-        auto fresh = load_config(config_path_);
-        if (!fresh) return err("touch-to-osc keeps running: at a restart its config file would be refused (" + fresh.error() + ")");
+        if (usb_worker_.resetting() || usb_asked_) return err("a USB reset is running; touch-to-osc keeps running: try the restart again in a moment");
+        if (Status st = restart_check(); !st) return st;
         restart_requested_ = true;
+        restart_asked_ = asking_;
         emit("restart", log::Level::notice, "restart",
              "restarting, as asked by " + peer.ip + ": every contact is cancelled, then touch-to-osc starts again from " + config_path_ + " and its saved settings");
         return {};
@@ -981,12 +1237,12 @@ Status Server::apply(const osc::Message& m, const Peer& peer) {
     if (parts.size() == 1 && parts[0] == "unsubscribe") return unsubscribe(m, peer);
     if (parts.size() == 3 && parts[0] == "device") {
         auto it = std::find_if(cfg_.devices.begin(), cfg_.devices.end(), [&](const DeviceConfig& d) { return d.id == parts[1]; });
-        if (it == cfg_.devices.end()) return err("no device " + parts[1]);
+        if (it == cfg_.devices.end()) return err("no device " + parts[1] + " (devices: " + ids_text(cfg_) + ")");
         size_t index = size_t(it - cfg_.devices.begin());
         if (parts[2] == "usb_reset") {
             if (!m.args.empty()) return err("usb_reset takes no arguments");
             auto ref = usb_port_of(index);
-            if (!ref) return err(it->id + " has not been seen on a USB port since touch-to-osc started and no port is set for it, so there is nothing to reset: plug the screen in again, or set match_port (port in the config file) to the USB port it is plugged into, such as 3-3");
+            if (!ref) return err(it->id + " has not been seen on a USB port since touch-to-osc started and no port is set for it, so there is nothing to reset: plug the screen in again, or set match_port to the USB port it is plugged into, such as 3-3");
             collect_usb(monotonic_ns(), false);
             if (usb_worker_.resetting() || usb_asked_) return err("a USB reset is already running; try again in a moment");
             if (usb_worker_.busy()) {
@@ -1089,8 +1345,12 @@ Status Server::set_device(size_t index, const std::string& key, const std::vecto
         if (Status st = flag(b); !st) return st;
         x.usb_recovery = b;
         what += std::string(cur.usb_recovery ? "1" : "0") + " -> " + (b ? "1" : "0");
+    } else if (std::find(kDeviceReported.begin(), kDeviceReported.end(), key) != kDeviceReported.end()) {
+        bool where = key == "usb" || key == "port" || key == "name";
+        return err(not_settable(key) + (where ? ": it is the screen read now; to choose which screen is read, set match_usb, match_serial or match_port" : ""));
     } else {
-        return err("unknown address");
+        std::string near = closest_name(key, kDeviceSettings);
+        return err("unknown address" + (near.empty() ? std::string() : " (did you mean " + addr("device/" + cur.id + "/" + near) + "?)"));
     }
     return commit(std::move(next), peer, what);
 }
@@ -1107,17 +1367,20 @@ Status Server::set_global(const std::vector<std::string>& parts, const std::vect
     if (parts.size() == 2 && parts[0] == "allowed_ips" && (parts[1] == "add" || parts[1] == "remove")) {
         if (!s) return err("allowed_ips/" + parts[1] + " needs one IPv4 address");
         if (std::string p = check_ipv4(*s); !p.empty()) return err(p);
-        std::vector<std::string> list = cfg_.osc.allowed_ips;
-        auto it = std::find(list.begin(), list.end(), *s);
+        const auto& now = cfg_.osc.allowed_ips;
+        bool listed = std::find(now.begin(), now.end(), *s) != now.end();
+        bool in_file = std::find(base_.osc.allowed_ips.begin(), base_.osc.allowed_ips.end(), *s) != base_.osc.allowed_ips.end();
+        auto drop = [&](std::vector<std::string>& v) { v.erase(std::remove(v.begin(), v.end(), *s), v.end()); };
         if (parts[1] == "add") {
-            if (it != list.end()) return err(*s + " is already allowed");
-            if (list.size() >= kMaxAllowedIps) return err("at most " + std::to_string(kMaxAllowedIps) + " allowed hosts");
-            list.push_back(*s);
+            if (listed) return err(*s + " is already allowed");
+            if (now.size() >= kMaxAllowedIps) return err("at most " + std::to_string(kMaxAllowedIps) + " allowed hosts");
+            drop(next.allowed_removed);
+            if (!in_file) next.allowed_added.push_back(*s);
         } else {
-            if (it == list.end()) return err(*s + " is not in allowed_ips");
-            list.erase(it);
+            if (!listed) return err(*s + " is not in allowed_ips");
+            drop(next.allowed_added);
+            if (in_file) next.allowed_removed.push_back(*s);
         }
-        next.allowed_ips = list;
         return commit(std::move(next), peer, "allowed host " + *s + (parts[1] == "add" ? " added" : " removed"));
     }
     if (parts.size() == 2 && parts[0] == "saved_destinations" && (parts[1] == "add" || parts[1] == "remove")) {
@@ -1125,8 +1388,10 @@ Status Server::set_global(const std::vector<std::string>& parts, const std::vect
         if (!address) return err("saved_destinations/" + parts[1] + " needs \"IP:PORT\"" + (parts[1] == "add" ? " and optionally touches and status (0 or 1)" : ""));
         DestinationConfig d;
         if (std::string p = check_destination(*address, d.address); !p.empty()) return err("the destination " + p);
-        std::vector<DestinationConfig> list = cfg_.destinations;
-        auto it = std::find_if(list.begin(), list.end(), [&](const DestinationConfig& x) { return x.address.text() == d.address.text(); });
+        const std::string key = d.address.text();
+        auto same_address = [&](const DestinationConfig& x) { return x.address.text() == key; };
+        bool listed = std::any_of(cfg_.destinations.begin(), cfg_.destinations.end(), same_address);
+        bool in_file = std::any_of(base_.destinations.begin(), base_.destinations.end(), same_address);
         if (parts[1] == "add") {
             if (args.size() != 1 && args.size() != 3) return err("saved_destinations/add needs \"IP:PORT\", or \"IP:PORT\" touches status (each 0 or 1)");
             if (args.size() == 3) {
@@ -1136,16 +1401,16 @@ Status Server::set_global(const std::vector<std::string>& parts, const std::vect
                 d.status = *st == 1;
             }
             if (!d.touches && !d.status) return err("a destination needs touches or status, or both");
-            if (it != list.end()) return err(d.address.text() + " is already a saved destination");
-            if (list.size() >= kMaxDestinations) return err("at most " + std::to_string(kMaxDestinations) + " saved destinations");
-            list.push_back(d);
+            if (listed) return err(key + " is already a saved destination");
+            if (cfg_.destinations.size() >= kMaxDestinations) return err("at most " + std::to_string(kMaxDestinations) + " saved destinations");
+            next.destinations_added.push_back(d);
         } else {
             if (args.size() != 1) return err("saved_destinations/remove needs \"IP:PORT\"");
-            if (it == list.end()) return err(d.address.text() + " is not a saved destination");
-            list.erase(it);
+            if (!listed) return err(key + " is not a saved destination");
+            next.destinations_added.erase(std::remove_if(next.destinations_added.begin(), next.destinations_added.end(), same_address), next.destinations_added.end());
+            if (in_file) next.destinations_removed.push_back(key);
         }
-        next.saved_destinations = list;
-        return commit(std::move(next), peer, "saved destination " + (parts[1] == "add" ? destination_text(d) + " added" : d.address.text() + " removed"));
+        return commit(std::move(next), peer, "saved destination " + (parts[1] == "add" ? destination_text(d) + " added" : key + " removed"));
     }
     if (parts.size() == 2 && parts[0] == "settings" && parts[1] == "forget") {
         if (args.empty()) {
@@ -1153,15 +1418,21 @@ Status Server::set_global(const std::vector<std::string>& parts, const std::vect
             return commit(Overrides{}, peer, "every saved setting forgotten: back to the config file");
         }
         if (!s) return err("settings/forget takes the name of one setting (as /touch/overrides lists them), or nothing to forget them all");
-        if (!forget_override(next, *s)) return err("nothing is saved for " + *s);
+        if (!forget_override(next, *s)) return err(check_text(*s, 128).empty() ? "nothing is saved for " + *s : "nothing is saved under that name");
         return commit(std::move(next), peer, *s + " forgotten: back to the config file");
     }
-    return err("unknown address");
+    std::string name;
+    for (const auto& p : parts) name += (name.empty() ? "" : "/") + p;
+    if (name == "allowed_ips" || name == "saved_destinations")
+        return err(name + " is changed with " + addr(name + "/add") + " and " + addr(name + "/remove"));
+    if (std::find(kReported.begin(), kReported.end(), name) != kReported.end()) return err(not_settable(name));
+    std::string near = closest_name(name, kCommands);
+    return err("unknown address" + (near.empty() ? std::string() : " (did you mean " + addr(near) + "?)"));
 }
 
 Status Server::commit(Overrides next, const Peer& peer, const std::string& what) {
     drop_unchanged(next, base_);
-    if (settings_text(next, "") == settings_text(over_, "")) return {};
+    if (settings_text(next, Overrides(), "") == settings_text(over_, Overrides(), "")) return {};
     Config eff = apply_overrides(base_, next);
     for (const auto& d : eff.devices) {
         if (!d.has_usb && d.port.empty()) return err("device " + d.id + " would match nothing: it needs a usb id or a port");
@@ -1172,6 +1443,8 @@ Status Server::commit(Overrides next, const Peer& peer, const std::string& what)
             return err("this would lock out " + peer.ip + ", the host sending this command");
     }
     Config old = cfg_;
+    auto file = load_config(config_path_);
+    note_config_values(over_, next, file ? *file : base_, over_values_);
     over_ = std::move(next);
     cfg_ = std::move(eff);
     apply_effects(old);
@@ -1208,9 +1481,11 @@ void Server::apply_effects(const Config& old) {
         bool reopen = reopens(a, b);
         if (reopen && (a.has_usb != b.has_usb || a.vendor != b.vendor || a.product != b.product || a.serial != b.serial || a.port != b.port)) {
             usb_last_port_[i].clear();
+            remember_port(i);
             usb_rec_[i].connected();
             usb_watching_[i] = false;
         }
+        if (reopen) claims_.set_device(i, b);
         if (reopen || remaps(a, b)) {
             std::lock_guard<std::mutex> lock(sh.cfg_mutex);
             sh.next_cfg = b;
@@ -1225,31 +1500,75 @@ void Server::apply_effects(const Config& old) {
 
 void Server::save_settings() {
     const std::string& path = base_.paths.settings;
-    Nanos now = monotonic_ns();
     settings_dirty_ = false;
-    status_dirty_ = true;
-    last_save_ = now;
+    last_save_ = monotonic_ns();
     if (path.empty()) return;
-    if (over_.empty()) {
-        if (unlink(path.c_str()) == 0 || errno == ENOENT) {
-            settings_file_.clear();
-            settings_problem_.clear();
-        } else {
-            settings_problem_ = "removing the settings file " + path + " failed (" + errno_str() + "): its old settings come back at a restart";
-            emit("settings-save", log::Level::err, "settings", settings_problem_);
+    if (over_.empty()) writer_.remove(path);
+    else writer_.write(path, settings_text(over_, over_values_, config_path_));
+}
+
+void Server::save_state() {
+    if (!state_path_.empty()) writer_.write(state_path_, state_text(state_));
+}
+
+void Server::collect_writes(Nanos now) {
+    // the service's unit lets it write only in its state folder
+    auto hint = [](const Status& st) {
+        return st.error().find(std::strerror(EROFS)) == std::string::npos
+                   ? std::string()
+                   : "; the service can only write under /var/lib/touch-to-osc: keep paths.settings and paths.state there";
+    };
+    for (auto& o : writer_.outcomes()) {
+        if (o.path == base_.paths.settings) {
+            if (o.result) {
+                settings_problem_.clear();
+                settings_file_ = o.removed ? std::string() : o.path;
+            } else {
+                settings_problem_ = o.removed ? "removing the settings file " + o.path + " failed (" + o.result.error() + "): its old settings come back at a restart"
+                                              : "saving the settings to " + o.path + " failed (" + o.result.error() +
+                                                    "): changes made over OSC are lost at a restart; trying again every 10 s";
+                settings_problem_ += hint(o.result);
+                emit("settings-save", log::Level::err, "settings", settings_problem_);
+                if (!settings_dirty_) dirty_since_ = now;
+                settings_dirty_ = true;
+                last_save_ = now + 9 * kSec;
+            }
+            status_dirty_ = true;
+        } else if (o.path == state_path_) {
+            std::string was = state_problem_;
+            state_problem_ = o.result ? std::string()
+                                      : "keeping what touch-to-osc learns between runs in " + o.path + " failed (" + o.result.error() +
+                                            "): the USB port each screen was last on and the copy of the config that last worked are not kept" + hint(o.result);
+            if (!state_problem_.empty() && was.empty()) emit("state-save", log::Level::warning, "settings", state_problem_);
+            if (state_problem_ != was) status_dirty_ = true;
         }
-        return;
     }
-    Status st = write_file_atomic(path, settings_text(over_, config_path_));
+}
+
+void Server::remember_port(size_t index) {
+    const std::string& id = cfg_.devices[index].id;
+    auto it = state_.usb_ports.find(id);
+    std::string was = it == state_.usb_ports.end() ? std::string() : it->second;
+    if (was == usb_last_port_[index]) return;
+    if (auto ref = parse_usb_port(usb_last_port_[index]))
+        emit(id + "/usb-port", log::Level::notice, "usb",
+             id + " is on USB port " + ref->path + "; a USB reset for it resets " + usb_target_text(*ref) + " (sudo touch-to-osc --list names what else is on it)");
+    if (usb_last_port_[index].empty()) state_.usb_ports.erase(id);
+    else state_.usb_ports[id] = usb_last_port_[index];
+    save_state();
+}
+
+void Server::repair_usb_hub() {
+    std::string marker = usb_reset_marker(state_path_);
+    if (marker.empty()) return;
+    std::string done;
+    Status st = bind_hub_left_unbound(marker, usb_worker_.paths(), &done);
     if (!st) {
-        settings_problem_ = "saving the settings to " + path + " failed (" + st.error() + "): changes made over OSC are lost at a restart; trying again every 10 s";
-        emit("settings-save", log::Level::err, "settings", settings_problem_);
-        settings_dirty_ = true;
-        last_save_ = now + 9 * kSec;
-        return;
+        usb_problem_ = st.error();
+        TTO_ERR("%s", usb_problem_.c_str());
+    } else if (!done.empty()) {
+        TTO_WARN("%s", done.c_str());
     }
-    settings_problem_.clear();
-    settings_file_ = path;
 }
 
 Status Server::subscribe(const osc::Message& m, const Peer& peer) {
@@ -1273,7 +1592,8 @@ Status Server::subscribe(const osc::Message& m, const Peer& peer) {
         TTO_DEBUG("subscriber %s renewed (lease %lld s)", to.text().c_str(), (long long)secs);
         send_to(to, ack);
         return {};
-    case Leases::Outcome::full: return err("at most " + std::to_string(kMaxLeases) + " subscribers; this one is refused");
+    case Leases::Outcome::full:
+        return err("at most " + std::to_string(kMaxLeases) + " subscribers at once (" + prefix_ + "/subscribers lists them): one has to unsubscribe or let its lease run out");
     case Leases::Outcome::added: break;
     }
     publish_dests();
