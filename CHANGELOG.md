@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.7.0 - 2026-10-26
+
+OSC interface version 6, agreed with Bridge Studio: an app can find touch-to-osc, read what
+it can change, identify and calibrate screens and add them, and every problem can be shown
+for the screen it is about. Everything in version 5 is still sent as it was; version 6
+only adds addresses and appends arguments.
+
+- Every event names its device as a fourth string ("" when it is about no device), and
+  each device has its own `health` and `reasons` in the status. All health parts come in
+  one bundle whenever any of them changes.
+- `device/<id>/last_loss_s` and `last_gone_s` with the counters: seconds since the screen
+  last dropped out and how long that lasted, so a drop is seen even when its event was
+  lost; the `connected` event after a drop says how long it was gone.
+- Every status bundle starts with `/touch/status_gen`, numbering the bundles sent to the
+  status receivers, and the alive carries the latest number as an eighth argument: a
+  receiver that sees a gap asks for the full status.
+- `/touch/hello` is answered for any host, also as a broadcast, with the host, version,
+  osc_api, port, number of devices and whether the asking host is allowed.
+- `/touch/describe` sends every setting, action and device as a JSON item, with the value
+  in effect, the config file's value, where it comes from and what a change does.
+- `/touch/identify` pauses every screen's touches for up to 60 s and reports which screen
+  each touch lands on (`/touch/identified`); guided calibration
+  (`device/<id>/calibrate`) pauses one screen's touches and reports each touch before
+  calibration, and `device/<id>/calibration/fit` fits, applies and saves the calibration
+  from target and touch pairs, refusing points on one line or a fit that misses by more
+  than 5%. Both end by themselves; contacts down are cancelled `identifying` or
+  `calibrating`, and fingers still down afterwards are not announced until they lift.
+- `devices/add`, `devices/remove`, `listen` and `prefix` change the device list, the listen
+  address and the prefix over OSC: saved, and applied by a restart the daemon does itself
+  right after answering, with the new address in the reply's note. `unused_screens` in the
+  status and a `screens` event list the touchscreens no device reads.
+- A subscription can ask for `touches` or `status` only, and for `plain` types (no 64-bit
+  arguments: touches without `t_us`, counts as `i`), for receivers that cannot take `h`;
+  `plain = true` does the same for a `[[destination]]`. `/touch/subscribed` carries what was
+  asked for as a third argument.
+- Replies, errors, `pong` and `here` also go to every port the asking host holds a lease
+  on, and a refused subscription is answered on the port it names as well.
+- Commands take OSC doubles (`d`); an argument of a type commands never take (a blob, say)
+  is answered with `/touch/error` naming it instead of the packet being dropped.
+- New states `identifying` and `calibrating`, cancel reasons `identifying` and
+  `calibrating`, event kinds `screens`, `identify` and `calibrate`.
+- `touch-to-osc --list --touch` waits for a touch on a screen no device reads and prints a
+  block to paste for it; `--status` lists such screens.
+
 ## 0.6.0 - 2026-10-25
 
 From a full review of the daemon. The OSC interface stays at version 5: no address or

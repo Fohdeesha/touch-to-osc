@@ -4,15 +4,18 @@
 
 namespace tto {
 
-Leases::Outcome Leases::subscribe(const Peer& to, int seconds, Nanos now) {
+Leases::Outcome Leases::subscribe(const Peer& to, int seconds, Nanos now, bool touches, bool status, bool plain) {
     for (auto& l : leases_) {
         if (l.peer == to) {
             l.until = now + Nanos(seconds) * kSec;
+            l.touches = touches;
+            l.status = status;
+            l.plain = plain;
             return Outcome::renewed;
         }
     }
     if (leases_.size() >= kMaxLeases) return Outcome::full;
-    leases_.push_back(Lease{to, now + Nanos(seconds) * kSec});
+    leases_.push_back(Lease{to, now + Nanos(seconds) * kSec, touches, status, plain});
     return Outcome::added;
 }
 

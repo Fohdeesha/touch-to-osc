@@ -13,15 +13,18 @@
 #include "input/reader.h"
 #include "osc/osc.h"
 
+#include <atomic>
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace tto {
 
-constexpr int32_t kOscApi = 5;
+constexpr int32_t kOscApi = 6;
 constexpr int kRestartExit = 100;
 constexpr int kCheckSettingsRefused = 5;
 constexpr const char* kRestartedBy = "TTO_RESTARTED_BY";
@@ -45,6 +48,7 @@ private:
         Peer peer;
         bool touches = false;
         bool status = false;
+        bool plain = false;
     };
     struct DestHealth {
         bool failing = false;
@@ -69,6 +73,7 @@ private:
         Peer peer;
         int32_t seq = 0;
         std::vector<uint8_t> command;
+        std::string note;
     };
     struct DevStats {
         std::deque<std::pair<Nanos, uint32_t>> latency;
@@ -81,6 +86,7 @@ private:
     struct Health {
         std::string level;
         std::vector<std::string> reasons;
+        std::vector<std::pair<std::string, std::vector<std::string>>> devices;
     };
     struct Limit {
         double tokens = 0;
@@ -88,6 +94,7 @@ private:
         uint64_t suppressed = 0;
         std::string kind;
         log::Level level = log::Level::notice;
+        std::string device;
     };
 
     bool open_sockets();
@@ -106,7 +113,7 @@ private:
     Status unsubscribe(const osc::Message& m, const Peer& peer);
     Status set_device(size_t index, const std::string& key, const std::vector<osc::Arg>& args, const Peer& peer);
     Status set_global(const std::vector<std::string>& parts, const std::vector<osc::Arg>& args, const Peer& peer);
-    Status commit(Overrides next, const Peer& peer, const std::string& what);
+    Status commit(Overrides next, const Peer& peer, const std::string& what, std::string device = std::string());
     void apply_effects(const Config& old);
     void save_settings();
     void save_state();
@@ -117,7 +124,23 @@ private:
     void restore_leases();
     bool wait_usb_worker(Nanos max, bool stopping);
     Status restart_check();
-    void refuse(const Peer& peer, const std::string& address, const std::string& why, bool limited);
+    void refuse(const Peer& peer, const std::string& address, const std::string& why, bool limited, uint16_t also_port = 0);
+    void reply_to(const Peer& to, const std::vector<osc::Message>& msgs);
+    std::string outsider_reason(const Peer& peer) const;
+    void hello(const osc::Message& m, const Peer& peer, bool allowed);
+    void update_modes();
+    void expire_modes(Nanos now);
+    void mode_touch(size_t index, const ModeTouch& t);
+    Status calibration_fit(size_t index, const std::vector<osc::Arg>& args, const Peer& peer);
+    std::string calibrating_id() const;
+    const DeviceConfig* file_device(const std::string& id) const;
+    Status apply_by_restart(Overrides next, const Peer& peer, const std::string& what, const std::string& then);
+    Status test_bind(const HostPort& to) const;
+    std::vector<std::string> describe_items() const;
+    void send_description(const Peer& to);
+    void watch_screens();
+    void stop_screens();
+    void collect_screens();
 
     std::vector<Target> targets() const;
     void publish_dests();
@@ -126,12 +149,15 @@ private:
     void send_target(const Target& t, const std::vector<uint8_t>& bytes);
     void send_status_changes(bool full);
     void send_alive(Nanos now);
-    void send_event(const std::string& kind, const std::string& text, log::Level level);
-    void emit(const std::string& key, log::Level level, const std::string& kind, const std::string& text);
+    void send_event(const std::string& kind, const std::string& text, log::Level level, const std::string& device);
+    void emit(const std::string& key, log::Level level, const std::string& kind, const std::string& text, const std::string& device = std::string());
     void report_suppressed(Nanos now);
     void expire_leases(Nanos now);
     void prune(Nanos now);
-    void send_bundled(const Peer& to, const std::vector<osc::Message>& msgs);
+    void send_full_status(const Peer& to, bool plain, bool with_counters);
+    std::vector<std::vector<uint8_t>> pack_status(const std::vector<osc::Message>& msgs, bool numbered);
+    bool health_part(const std::string& address) const;
+    bool is_plain(const Peer& p) const;
     std::string disabled_reason(size_t index) const;
     std::optional<UsbPortRef> usb_port_of(size_t index) const;
     bool usb_watchable(size_t index, const DevInfo& info) const;
@@ -145,7 +171,7 @@ private:
     void report_destinations(Nanos now);
 
     std::vector<osc::Message> status_messages();
-    std::vector<osc::Message> counter_messages(Nanos now);
+    std::vector<osc::Message> counter_messages(Nanos now, bool plain = false);
     Health health(Nanos now);
     std::string addr(const std::string& rest) const { return prefix_ + "/" + rest; }
 
@@ -217,6 +243,20 @@ private:
     std::map<std::string, DestHealth> dest_health_;
     std::map<std::string, Nanos> refused_at_;
     int32_t alive_ = 0;
+    int32_t status_gen_ = 0;
+    Nanos identify_until_ = 0;
+    std::vector<Nanos> calibrate_until_;
+    std::string reply_note_;
+    Nanos describe_at_ = 0;
+    std::thread screens_thread_;
+    UniqueFd screens_stop_;
+    std::mutex screens_m_;
+    std::vector<std::string> screens_found_;
+    std::atomic<uint32_t> screens_gen_{0};
+    uint32_t screens_seen_ = 0;
+    bool screens_first_ = true;
+    std::vector<std::string> unused_screens_;
+    size_t usb_problem_dev_ = SIZE_MAX;
     int ticks_ = 0;
     Nanos full_at_ = 0;
     Nanos status_reply_at_ = 0;

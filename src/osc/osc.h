@@ -9,7 +9,7 @@
 
 namespace tto::osc {
 
-using Arg = std::variant<int32_t, float, std::string, int64_t>;
+using Arg = std::variant<int32_t, float, std::string, int64_t, double>;
 
 struct Message {
     std::string address;
@@ -18,8 +18,14 @@ struct Message {
 
 std::vector<uint8_t> encode(const Message& m);
 std::vector<uint8_t> encode_bundle(const std::vector<Message>& msgs);
-std::optional<Message> decode(const uint8_t* data, size_t len);
-std::optional<std::vector<Message>> decode_packet(const uint8_t* data, size_t len);
+// set when a message is well formed but carries an argument of a type commands never take
+struct DecodeIssue {
+    std::string address;
+    std::string what;
+};
+
+std::optional<Message> decode(const uint8_t* data, size_t len, DecodeIssue* issue = nullptr);
+std::optional<std::vector<Message>> decode_packet(const uint8_t* data, size_t len, DecodeIssue* issue = nullptr);
 
 bool valid_address(const std::string& a);
 

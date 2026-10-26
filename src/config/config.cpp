@@ -118,8 +118,7 @@ bool parse_usb(const std::string& s, uint16_t& vendor, uint16_t& product) {
 void device_table(StrictTable& o, DeviceConfig& d) {
     o.str("id", d.id, 32, false);
     if (o.ok() && d.id.empty()) o.fail("id", "is missing: give the device a short name such as \"face\"");
-    if (o.ok() && !valid_id(d.id)) o.fail("id", "may only use a-z, 0-9, _ and - (it becomes part of OSC addresses)");
-    if (o.ok() && reserved_id(d.id)) o.fail("id", "\"" + d.id + "\" is a name touch-to-osc uses in its own addresses: choose another, such as \"screen1\"");
+    if (o.ok()) o.check("id", check_device_id(d.id));
     o.str("label", d.label, 64);
     auto named = [&](const char* name, const char* older) -> const char* {
         bool now = o.table() && o.table()->get(name), before = o.table() && o.table()->get(older);
@@ -228,6 +227,22 @@ std::string check_log_level(const std::string& v) {
     return "must be crit, error, warning, notice, info or debug";
 }
 
+std::string check_listen(const std::string& v, HostPort& out) {
+    if (!parse_host_port(v, out)) return "must be an IPv4 address and a port, like \"0.0.0.0:9480\"";
+    return {};
+}
+
+std::string check_prefix(const std::string& v) {
+    if (v.size() <= 64 && osc::valid_address(v) && v.back() != '/') return {};
+    return "must look like \"/touch\": a slash, then letters, without a slash at the end";
+}
+
+std::string check_device_id(const std::string& v) {
+    if (!valid_id(v)) return "may only use a-z, 0-9, _ and - (it becomes part of OSC addresses), at most 32 of them";
+    if (reserved_id(v)) return "\"" + v + "\" is a name touch-to-osc uses in its own addresses: choose another, such as \"screen1\"";
+    return {};
+}
+
 std::string check_destination(const std::string& v, HostPort& out) {
     if (!parse_host_port(v, out)) return "must be an IPv4 address and a port, like \"192.168.1.27:9481\"";
     if (out.host == "0.0.0.0") return "must name a host, not 0.0.0.0";
@@ -269,9 +284,7 @@ Result<Config> parse_config(const std::string& toml_text, const std::string& sou
     StrictTable root(&tbl, "");
     section(root, "osc", [&](StrictTable& o) {
         host_port(o, "listen", c.osc.listen, true);
-        o.str("prefix", c.osc.prefix, 64, false);
-        if (o.ok() && (!osc::valid_address(c.osc.prefix) || c.osc.prefix.back() == '/'))
-            o.fail("prefix", "must look like \"/touch\": a slash, then letters, without a slash at the end");
+        if (o.str("prefix", c.osc.prefix, 64, false)) o.check("prefix", check_prefix(c.osc.prefix));
         o.strings("allowed_ips", c.osc.allowed_ips, kMaxAllowedIps, 64);
         for (const auto& ip : c.osc.allowed_ips) {
             if (o.ok()) o.check("allowed_ips", check_ipv4(ip));
@@ -295,6 +308,7 @@ Result<Config> parse_config(const std::string& toml_text, const std::string& sou
         if (o.ok() && d.address.port == 0) o.fail("address", "is missing: give the receiver as \"IP:PORT\"");
         o.boolean("touches", d.touches);
         o.boolean("status", d.status);
+        o.boolean("plain", d.plain);
         if (o.ok() && !d.touches && !d.status) o.fail("", "sends nothing: set touches or status (or both) to true");
         c.destinations.push_back(d);
     });

@@ -48,6 +48,9 @@ state = "/var/lib/touch-to-osc/state.toml"
 # touches = true
 # # The status, the events and the counters.
 # status = true
+# # No 64-bit arguments, for receivers whose OSC library takes only i, f and s: touches
+# # without their time stamp, counts as i.
+# plain = false
 
 # One block per touchscreen. sudo touch-to-osc --list shows every touchscreen with its usb
 # id, serial and port, which block here reads it, and a block to paste for any that none

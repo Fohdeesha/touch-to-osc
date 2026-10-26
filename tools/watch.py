@@ -30,6 +30,12 @@ def encode(address, *args):
         if isinstance(a, tuple) and a[0] == "h":
             tags += "h"
             body += struct.pack(">q", a[1])
+        elif isinstance(a, tuple) and a[0] == "d":
+            tags += "d"
+            body += struct.pack(">d", a[1])
+        elif isinstance(a, tuple) and a[0] == "b":
+            tags += "b"
+            body += struct.pack(">I", len(a[1])) + a[1] + b"\0" * ((4 - len(a[1]) % 4) % 4)
         elif isinstance(a, bool):
             tags += "i"
             body += struct.pack(">i", int(a))
@@ -73,6 +79,9 @@ def decode_message(data):
             pos += 4
         elif t == "h":
             args.append(struct.unpack_from(">q", data, pos)[0])
+            pos += 8
+        elif t == "d":
+            args.append(struct.unpack_from(">d", data, pos)[0])
             pos += 8
         elif t == "s":
             s, pos = _string(data, pos)
@@ -199,7 +208,7 @@ def main():
                 delay = (now * 1e6 - args[-1]) / 1000.0
                 print(stamp, rest, fmt_args(args[:-1]), "(%.1f ms)" % delay, flush=True)
                 continue
-            counters = ("/active", "/contacts", "/oldest_s", "/last_event_s", "/rate_hz", "/latency_us", "/counts")
+            counters = ("/active", "/contacts", "/oldest_s", "/last_event_s", "/last_loss_s", "/rate_hz", "/latency_us", "/counts", "/status_gen")
             if rest.endswith(counters) or rest in ("/uptime_s", "/subscribers", "/destinations"):
                 if not a.no_alive:
                     print(stamp, "  ", rest, fmt_args(args), flush=True)

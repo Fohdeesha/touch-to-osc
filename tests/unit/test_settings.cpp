@@ -2,6 +2,8 @@
 
 #include <doctest.h>
 
+#include <algorithm>
+
 using namespace tto;
 
 namespace {
@@ -185,4 +187,76 @@ TEST_CASE("what the config file said is recorded when a setting changes, and onl
     CHECK_FALSE(values.devices["face"].rotation);
     std::string text = settings_text(changed, values, "c.toml");
     CHECK(text.find("[config_values.device.face]") != std::string::npos);
+}
+
+TEST_CASE("the listen address, the prefix and devices added or removed over OSC survive the settings file") {
+    Config b = base();
+    Overrides o;
+    o.listen = HostPort{"0.0.0.0", 9490};
+    o.prefix = "/face";
+    DeviceConfig two;
+    two.id = "back";
+    two.label = "back";
+    two.has_usb = true;
+    two.vendor = 0x0712;
+    two.product = 0x0009;
+    two.port = "3-4";
+    o.devices_added = {two};
+    o.devices["back"].rotation = 90;
+    auto back = parse_settings(settings_text(o, Overrides(), "t.toml"), "s.toml", b);
+    REQUIRE(back);
+    const Overrides& r = back->overrides;
+    REQUIRE(r.listen);
+    CHECK(r.listen->text() == "0.0.0.0:9490");
+    CHECK(r.prefix == std::optional<std::string>("/face"));
+    REQUIRE(r.devices_added.size() == 1);
+    CHECK(r.devices_added[0].id == "back");
+    CHECK(r.devices_added[0].port == "3-4");
+    CHECK(r.devices.count("back") == 1);
+    Config eff = apply_overrides(b, r);
+    REQUIRE(eff.devices.size() == 2);
+    CHECK(eff.devices[1].id == "back");
+    CHECK(eff.devices[1].rotation == 90);
+    CHECK(eff.osc.prefix == "/face");
+    CHECK(eff.osc.listen.port == 9490);
+    std::vector<std::string> names = override_names(r);
+    CHECK(std::find(names.begin(), names.end(), "devices") != names.end());
+    CHECK(std::find(names.begin(), names.end(), "listen") != names.end());
+
+    Overrides gone;
+    gone.devices_removed = {"face"};
+    gone.devices_added = {two};
+    auto removed = parse_settings(settings_text(gone, Overrides(), "t.toml"), "s.toml", b);
+    REQUIRE(removed);
+    Config only = apply_overrides(b, removed->overrides);
+    REQUIRE(only.devices.size() == 1);
+    CHECK(only.devices[0].id == "back");
+    Overrides none;
+    none.devices_removed = {"face"};
+    CHECK_FALSE(parse_settings(settings_text(none, Overrides(), "t.toml"), "s.toml", b));
+    Overrides forget = r;
+    CHECK(forget_override(forget, "devices"));
+    CHECK(forget.devices_added.empty());
+    CHECK(forget_override(forget, "listen"));
+    CHECK_FALSE(forget.listen);
+}
+
+TEST_CASE("a device added over OSC that the config file now has by the same id is the config file's") {
+    Config b = base();
+    Overrides o;
+    DeviceConfig twin;
+    twin.id = "face";
+    twin.label = "face";
+    twin.port = "3-9";
+    o.devices_added = {twin};
+    auto back = parse_settings(settings_text(o, Overrides(), "t.toml"), "s.toml", b);
+    REQUIRE(back);
+    CHECK(back->overrides.devices_added.empty());
+    CHECK(back->rewrite);
+    REQUIRE(back->notes.size() == 1);
+    CHECK(back->notes[0].find("the config file's applies") != std::string::npos);
+    CHECK_FALSE(parse_settings("prefix = \"touch\"\n", "s.toml", b));
+    CHECK_FALSE(parse_settings("listen = \"nowhere\"\n", "s.toml", b));
+    CHECK(parse_settings("[[devices_added]]\nid = \"device\"\nmatch_usb = \"0712:0009\"\n", "s.toml", b).error().find("is a name touch-to-osc uses") !=
+          std::string::npos);
 }

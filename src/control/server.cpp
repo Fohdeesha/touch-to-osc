@@ -15,14 +15,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
+#include <set>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
 #include <sys/random.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
+#include <sstream>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -85,6 +89,9 @@ std::optional<int64_t> integer(const osc::Arg& a) {
     if (auto f = std::get_if<float>(&a)) {
         if (std::isfinite(*f) && std::floor(*f) == *f && std::abs(*f) < 1e9f) return int64_t(*f);
     }
+    if (auto d = std::get_if<double>(&a)) {
+        if (std::isfinite(*d) && std::floor(*d) == *d && std::abs(*d) < 9e15) return int64_t(*d);
+    }
     return std::nullopt;
 }
 
@@ -126,6 +133,9 @@ std::optional<double> number(const osc::Arg& a) {
     if (auto h = std::get_if<int64_t>(&a)) return double(*h);
     if (auto f = std::get_if<float>(&a)) {
         if (std::isfinite(*f)) return double(*f);
+    }
+    if (auto d = std::get_if<double>(&a)) {
+        if (std::isfinite(*d)) return *d;
     }
     return std::nullopt;
 }
@@ -169,26 +179,14 @@ bool take_token(double& tokens, Nanos& last, Nanos now, double burst, double per
 
 int32_t next_counter(int32_t v) { return v == INT32_MAX ? 1 : v + 1; }
 
-// a message named in `first` and the one after it always share a bundle (the health and its reasons)
-std::vector<std::vector<uint8_t>> pack(const std::vector<osc::Message>& msgs, const std::string& first = std::string()) {
-    std::vector<std::vector<uint8_t>> out;
-    std::vector<osc::Message> group;
-    size_t size = 16;
-    for (size_t i = 0; i < msgs.size(); ++i) {
-        size_t n = osc::encode(msgs[i]).size() + 4;
-        bool second = i > 0 && !first.empty() && msgs[i - 1].address == first;
-        size_t need = n;
-        if (!first.empty() && msgs[i].address == first && i + 1 < msgs.size()) need += osc::encode(msgs[i + 1]).size() + 4;
-        if (!group.empty() && !second && size + need > kBundleBytes) {
-            out.push_back(osc::encode_bundle(group));
-            group.clear();
-            size = 16;
+// receivers whose OSC library takes only i, f and s get 64-bit numbers as i
+std::vector<osc::Message> plain_copy(std::vector<osc::Message> msgs) {
+    for (auto& m : msgs) {
+        for (auto& a : m.args) {
+            if (auto h = std::get_if<int64_t>(&a)) a = int32_t(std::clamp<int64_t>(*h, INT32_MIN, INT32_MAX));
         }
-        group.push_back(msgs[i]);
-        size += n;
     }
-    if (!group.empty()) out.push_back(osc::encode_bundle(group));
-    return out;
+    return msgs;
 }
 
 }
@@ -207,7 +205,7 @@ Server::Server(Config base, SettingsLoad settings, Launch launch, SysPaths paths
       exe_(std::move(launch.exe)),
       state_path_(base_.paths.state),
       paths_(std::move(paths)),
-      prefix_(base_.osc.prefix),
+      prefix_(cfg_.osc.prefix),
       usb_root_(env_text("TTO_USB_ROOT")),
       usb_worker_(usb_root_.empty() ? UsbPaths() : usb_paths_under(usb_root_)) {
     char host[256] = {};
@@ -237,9 +235,16 @@ void Server::keep_restart_reply() {
     long seq = 0;
     int used = 0;
     if (v.empty() || std::sscanf(v.c_str(), "%15[0-9.]:%u:%ld:%n", ip, &port, &seq, &used) != 3 || port == 0 || port > 65535) return;
-    std::vector<uint8_t> command;
-    for (size_t i = size_t(used); i + 1 < v.size(); i += 2) command.push_back(uint8_t(std::strtoul(v.substr(i, 2).c_str(), nullptr, 16)));
-    kept_.keep(Peer{ip, uint16_t(port)}, int32_t(seq), std::move(command), true, std::string(), monotonic_ns());
+    auto unhex = [&](size_t from, size_t to) {
+        std::string out;
+        for (size_t i = from; i + 1 < to; i += 2) out += char(std::strtoul(v.substr(i, 2).c_str(), nullptr, 16));
+        return out;
+    };
+    size_t colon = v.find(':', size_t(used));
+    std::string command = unhex(size_t(used), colon == std::string::npos ? v.size() : colon);
+    std::string note = colon == std::string::npos ? std::string() : unhex(colon + 1, v.size());
+    if (!check_text(note, 320).empty()) note.clear();
+    kept_.keep(Peer{ip, uint16_t(port)}, int32_t(seq), std::vector<uint8_t>(command.begin(), command.end()), true, note, monotonic_ns());
 }
 
 void Server::restore_leases() {
@@ -259,11 +264,85 @@ void Server::restore_leases() {
 }
 
 Server::~Server() {
+    stop_screens();
     for (auto& sh : shared_) {
         sh->stop.store(true);
         if (sh->wake) write_one(sh->wake.get());
     }
     for (auto& r : readers_) r->join();
+}
+
+void Server::stop_screens() {
+    if (!screens_thread_.joinable()) return;
+    write_one(screens_stop_.get());
+    screens_thread_.join();
+}
+
+// the touchscreens no device reads, found off the control thread: reading the input devices reads USB attributes,
+// which wait for the USB device lock; a screen counts only when it is unread in two scans half a second apart
+void Server::watch_screens() {
+    set_thread_name("screens");
+    UniqueFd watch(inotify_init1(IN_NONBLOCK | IN_CLOEXEC));
+    if (watch) inotify_add_watch(watch.get(), paths_.dev_input.c_str(), IN_CREATE | IN_DELETE | IN_ATTRIB | IN_MOVED_TO);
+    auto unread = [&] {
+        std::set<std::string> out;
+        for (const auto& n : scan_nodes(paths_)) {
+            if (touch_kind(n) == TouchKind::none || claims_.claimed(n.sysname)) continue;
+            std::string port = n.usb_port.empty() ? printable(n.phys) : n.usb_port;
+            out.insert((port.empty() ? std::string("-") : port) + " " + usb_text(n.vendor, n.product) + " " + printable(n.name));
+        }
+        return out;
+    };
+    int wait_ms = 1000;
+    std::vector<std::string> last;
+    bool published = false;
+    for (;;) {
+        pollfd p[2] = {{screens_stop_.get(), POLLIN, 0}, {watch ? watch.get() : -1, POLLIN, 0}};
+        int r = poll(p, 2, wait_ms);
+        if (r > 0 && p[0].revents) return;
+        if (r > 0 && p[1].revents) drain(watch.get());
+        wait_ms = 5000;
+        auto first = unread();
+        pollfd s{screens_stop_.get(), POLLIN, 0};
+        if (poll(&s, 1, 500) > 0) return;
+        auto second = unread();
+        std::vector<std::string> both;
+        std::set_intersection(first.begin(), first.end(), second.begin(), second.end(), std::back_inserter(both));
+        if (published && both == last) continue;
+        last = both;
+        published = true;
+        {
+            std::lock_guard<std::mutex> lock(screens_m_);
+            screens_found_ = both;
+        }
+        screens_gen_.fetch_add(1);
+        write_one(notify_fd_.get());
+    }
+}
+
+void Server::collect_screens() {
+    uint32_t gen = screens_gen_.load();
+    if (gen == screens_seen_) return;
+    screens_seen_ = gen;
+    std::vector<std::string> now;
+    {
+        std::lock_guard<std::mutex> lock(screens_m_);
+        now = screens_found_;
+    }
+    if (!screens_first_) {
+        for (const auto& s : now) {
+            if (std::find(unused_screens_.begin(), unused_screens_.end(), s) != unused_screens_.end()) continue;
+            emit("screens", log::Level::notice, "screens",
+                 "a touchscreen that no device reads was plugged in (port, usb id, name: " + s + "): to read it, send " + addr("devices/add") +
+                     " with an id, its usb id and its port, or add a [[device]] block (sudo touch-to-osc --list prints one)");
+        }
+        for (const auto& s : unused_screens_) {
+            if (std::find(now.begin(), now.end(), s) == now.end()) emit("screens", log::Level::notice, "screens", "a touchscreen that no device read went away: " + s);
+        }
+    }
+    screens_first_ = false;
+    unused_screens_ = std::move(now);
+    status_dirty_ = true;
 }
 
 bool Server::open_sockets() {
@@ -337,8 +416,9 @@ int Server::run() {
     log::set_min_level(level);
     if (!open_sockets()) return 3;
     notify_fd_.reset(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+    screens_stop_.reset(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
     timer_fd_.reset(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC));
-    if (!notify_fd_ || !timer_fd_ || !signal_fd_) {
+    if (!notify_fd_ || !timer_fd_ || !signal_fd_ || !screens_stop_) {
         TTO_CRIT("cannot create the event handles: %s", errno_str().c_str());
         return 4;
     }
@@ -366,6 +446,7 @@ int Server::run() {
         usb_watching_.push_back(false);
         usb_why_.emplace_back();
         usb_resets_.push_back(0);
+        calibrate_until_.push_back(0);
     }
     std::string note;
     state_ = load_state(state_path_, &note);
@@ -388,6 +469,7 @@ int Server::run() {
     publish_dests();
     for (auto& r : readers_) r->start();
     sd_notify_msg("READY=1");
+    screens_thread_ = std::thread([this] { watch_screens(); });
     if (config_problem_.empty() && !config_text_.empty() && (state_.config_path != config_path_ || state_.config_text != config_text_)) {
         state_.config_path = config_path_;
         state_.config_text = config_text_;
@@ -413,6 +495,7 @@ int Server::run() {
         if (p[2].revents) {
             drain(notify_fd_.get());
             drain_reader_events();
+            collect_screens();
             send_status_changes(false);
         }
         if (p[3].revents) {
@@ -424,6 +507,7 @@ int Server::run() {
     }
 
     sd_notify_msg(restart_requested_ ? "RELOADING=1" : "STOPPING=1");
+    stop_screens();
     for (auto& sh : shared_) {
         sh->restarting.store(restart_requested_);
         sh->stop.store(true);
@@ -452,6 +536,11 @@ int Server::run() {
             std::snprintf(hex, sizeof hex, "%02x", unsigned(b));
             v += hex;
         }
+        v += ":";
+        for (unsigned char b : restart_asked_->note) {
+            std::snprintf(hex, sizeof hex, "%02x", unsigned(b));
+            v += hex;
+        }
         setenv(kRestartedBy, v.c_str(), 1);
     }
     if (restart_requested_) {
@@ -472,14 +561,8 @@ Status Server::restart_check() {
     const std::string keeps = "touch-to-osc keeps running: ";
     auto fresh = load_config(config_path_);
     if (!fresh) return err(keeps + "at a restart its config file would be refused (" + fresh.error() + ")");
-    const HostPort& to = fresh->osc.listen;
-    if (to.host != cfg_.osc.listen.host || to.port != cfg_.osc.listen.port) {
-        UniqueFd probe(socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
-        sockaddr_in a{};
-        to_sockaddr(Peer{to.host, uint16_t(to.port)}, a);
-        if (!probe || bind(probe.get(), reinterpret_cast<sockaddr*>(&a), sizeof a) != 0)
-            return err(keeps + "at a restart it would listen on UDP " + to.text() + ", which cannot be used (" + errno_str() + "): change osc.listen in " + config_path_);
-    }
+    HostPort to = apply_overrides(*fresh, over_).osc.listen;
+    if (Status st = test_bind(to); !st) return err(keeps + "at a restart it would " + st.error() + ": change osc.listen in " + config_path_);
     if (exe_.empty()) return {};
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) != 0) return err(keeps + "the installed program cannot be checked (" + errno_str() + ")");
@@ -533,6 +616,63 @@ Status Server::restart_check() {
     return err(keeps + "the installed version (" + exe_ + ") would not start with " + config_path_ + (first.empty() ? std::string() : ": " + first));
 }
 
+Status Server::test_bind(const HostPort& to) const {
+    if (to.host == cfg_.osc.listen.host && to.port == cfg_.osc.listen.port) return {};
+    UniqueFd probe(socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+    sockaddr_in a{};
+    to_sockaddr(Peer{to.host, uint16_t(to.port)}, a);
+    if (!probe || bind(probe.get(), reinterpret_cast<sockaddr*>(&a), sizeof a) != 0)
+        return err("listen on UDP " + to.text() + ", which cannot be used (" + errno_str() + ")");
+    return {};
+}
+
+Status Server::apply_by_restart(Overrides next, const Peer& peer, const std::string& what, const std::string& then) {
+    if (base_.paths.settings.empty())
+        return err("changes made over OSC are not saved here (paths.settings is empty), so the restart that applies this would lose it: change it in " + config_path_);
+    if (usb_worker_.resetting() || usb_asked_) return err("a USB reset is running: try again in a moment");
+    drop_unchanged(next, base_);
+    if (settings_text(next, Overrides(), "") == settings_text(over_, Overrides(), "")) return {};
+    Config eff = apply_overrides(base_, next);
+    if (eff.devices.empty()) return err("that would leave no device");
+    std::set<std::string> ids;
+    for (const auto& d : eff.devices) {
+        if (!d.has_usb && d.port.empty()) return err("device " + d.id + " would match nothing: it needs a usb id or a port");
+        if (!ids.insert(d.id).second) return err("two devices would be called " + d.id);
+    }
+    if (Status st = test_bind(eff.osc.listen); !st) return err("touch-to-osc could not " + st.error());
+    if (Status st = restart_check(); !st) return st;
+    auto file = load_config(config_path_);
+    note_config_values(over_, next, file ? *file : base_, over_values_);
+    over_ = std::move(next);
+    if (!settings_dirty_) dirty_since_ = monotonic_ns();
+    settings_dirty_ = true;
+    restart_requested_ = true;
+    restart_asked_ = asking_;
+    reply_note_ = "restarting to apply it" + then;
+    emit("settings", log::Level::notice, "settings", what + ", from " + peer.ip + "; touch-to-osc restarts to apply it");
+    emit("restart", log::Level::notice, "restart", "restarting to apply " + what + ", as asked by " + peer.ip + ": every contact is cancelled" + then);
+    return {};
+}
+
+void Server::send_description(const Peer& to) {
+    auto items = describe_items();
+    std::vector<osc::Message> group;
+    size_t size = 16;
+    for (const auto& item : items) {
+        osc::Message m{addr("describe/item"), {item}};
+        size_t n = osc::encode(m).size() + 4;
+        if (!group.empty() && size + n > kBundleBytes) {
+            send_bytes(to, osc::encode_bundle(group));
+            group.clear();
+            size = 16;
+        }
+        group.push_back(std::move(m));
+        size += n;
+    }
+    group.push_back({addr("describe/done"), {int32_t(items.size())}});
+    send_bytes(to, osc::encode_bundle(group));
+}
+
 bool Server::wait_usb_worker(Nanos max, bool stopping) {
     Nanos until = monotonic_ns() + max;
     for (;;) {
@@ -550,6 +690,7 @@ void Server::on_tick() {
     drain_latency(now);
     collect_usb(now, true);
     collect_writes(now);
+    expire_modes(now);
     if (settings_dirty_ && now - dirty_since_ >= kSaveSettle && now - last_save_ >= kSaveEvery) save_settings();
     if (now >= next_second_) {
         next_second_ = now - next_second_ > 2 * kSec ? now + kSec : next_second_ + kSec;
@@ -595,16 +736,17 @@ void Server::prune(Nanos now) {
     }
 }
 
-void Server::emit(const std::string& key, log::Level level, const std::string& kind, const std::string& text) {
+void Server::emit(const std::string& key, log::Level level, const std::string& kind, const std::string& text, const std::string& device) {
     Limit& l = limits_[key];
     l.kind = kind;
     l.level = level;
+    l.device = device;
     if (!take_token(l.tokens, l.last, monotonic_ns(), kEventBurst, kEventsPerSecond)) {
         ++l.suppressed;
         return;
     }
     log::write(level, "%s: %s", kind.c_str(), text.c_str());
-    send_event(kind, text, level);
+    send_event(kind, text, level, device);
 }
 
 void Server::report_suppressed(Nanos now) {
@@ -613,7 +755,7 @@ void Server::report_suppressed(Nanos now) {
         std::string text = count_text(l.suppressed, ("more \"" + l.kind + "\" event").c_str()) + " (" + key + ") came too fast to report one by one";
         l.suppressed = 0;
         TTO_WARN("%s", text.c_str());
-        send_event(l.kind, text, l.level);
+        send_event(l.kind, text, l.level, l.device);
     }
     if (refusals_dropped_) {
         TTO_WARN("%llu refusals to hosts outside osc.allowed_ips were not answered (too many)", (unsigned long long)refusals_dropped_);
@@ -625,16 +767,19 @@ void Server::drain_reader_events() {
     for (size_t i = 0; i < shared_.size(); ++i) {
         ReaderEvent e;
         bool any = false;
+        ModeTouch t;
+        while (shared_[i]->mode_touches.pop(t)) mode_touch(i, t);
         while (shared_[i]->events.pop(e)) {
             any = true;
-            emit(cfg_.devices[i].id + "/" + event_kind_name(e.kind), log::Level(e.level), event_kind_name(e.kind), e.text);
+            emit(cfg_.devices[i].id + "/" + event_kind_name(e.kind), log::Level(e.level), event_kind_name(e.kind), e.text, cfg_.devices[i].id);
         }
         if (any) status_dirty_ = true;
         uint64_t lost = shared_[i]->lost_events.load(std::memory_order_relaxed);
         if (lost != stats_[i].lost_events_seen) {
             emit(cfg_.devices[i].id + "/lost", log::Level::warning, "device",
                  cfg_.devices[i].id + ": " + count_text(lost - stats_[i].lost_events_seen, "status event") +
-                     " about it were dropped because they came too fast (touches were not affected)");
+                     " about it were dropped because they came too fast (touches were not affected)",
+                 cfg_.devices[i].id);
             stats_[i].lost_events_seen = lost;
         }
     }
@@ -666,18 +811,19 @@ void Server::sample(Nanos now) {
 
 std::vector<Server::Target> Server::targets() const {
     std::vector<Target> out;
-    auto add = [&](const Peer& p, bool touches, bool status) {
+    auto add = [&](const Peer& p, bool touches, bool status, bool plain) {
         for (auto& t : out) {
             if (t.peer == p) {
                 t.touches = t.touches || touches;
                 t.status = t.status || status;
+                t.plain = t.plain || plain;
                 return;
             }
         }
-        out.push_back(Target{p, touches, status});
+        out.push_back(Target{p, touches, status, plain});
     };
-    for (const auto& d : cfg_.destinations) add(Peer{d.address.host, uint16_t(d.address.port)}, d.touches, d.status);
-    for (const auto& l : leases_.all()) add(l.peer, true, true);
+    for (const auto& d : cfg_.destinations) add(Peer{d.address.host, uint16_t(d.address.port)}, d.touches, d.status, d.plain);
+    for (const auto& l : leases_.all()) add(l.peer, l.touches, l.status, l.plain);
     return out;
 }
 
@@ -688,7 +834,7 @@ void Server::publish_dests() {
         d.n = 0;
         for (const auto& t : tg) {
             if (!t.touches || d.n >= kMaxSendTargets) continue;
-            if (to_sockaddr(t.peer, d.addr[d.n])) ++d.n;
+            if (to_sockaddr(t.peer, d.addr[d.n])) d.plain[d.n++] = t.plain;
         }
         sh->dests.publish();
     }
@@ -727,8 +873,66 @@ void Server::report_destinations(Nanos now) {
         h.reported = h.failures;
         h.reported_at = now;
         TTO_WARN("sending to %s", text.c_str());
-        send_event("send", text, log::Level::warning);
+        send_event("send", text, log::Level::warning, std::string());
     }
+}
+
+bool Server::health_part(const std::string& address) const {
+    if (address.size() <= prefix_.size() + 1 || address.compare(0, prefix_.size() + 1, prefix_ + "/") != 0) return false;
+    std::string rest = address.substr(prefix_.size() + 1);
+    if (rest == "health" || rest == "reasons") return true;
+    auto ends = [&](const char* tail) {
+        size_t n = std::strlen(tail);
+        return rest.size() > n && rest.compare(rest.size() - n, n, tail) == 0;
+    };
+    return rest.rfind("device/", 0) == 0 && std::count(rest.begin(), rest.end(), '/') == 2 && (ends("/health") || ends("/reasons"));
+}
+
+// every status bundle starts with its number; the health and every device's health come in one bundle
+std::vector<std::vector<uint8_t>> Server::pack_status(const std::vector<osc::Message>& msgs, bool numbered) {
+    std::vector<std::vector<uint8_t>> out;
+    std::vector<osc::Message> group;
+    const size_t head = 16 + 4 + osc::encode({addr("status_gen"), {int32_t(0)}}).size();
+    size_t size = head;
+    auto flush = [&] {
+        if (group.empty()) return;
+        if (numbered) status_gen_ = next_counter(status_gen_);
+        group.insert(group.begin(), osc::Message{addr("status_gen"), {status_gen_}});
+        out.push_back(osc::encode_bundle(group));
+        group.clear();
+        size = head;
+    };
+    for (size_t i = 0; i < msgs.size();) {
+        size_t j = i + 1;
+        if (health_part(msgs[i].address)) {
+            while (j < msgs.size() && health_part(msgs[j].address)) ++j;
+        }
+        size_t need = 0;
+        for (size_t k = i; k < j; ++k) need += osc::encode(msgs[k]).size() + 4;
+        if (!group.empty() && size + need > kBundleBytes) flush();
+        for (size_t k = i; k < j; ++k) group.push_back(msgs[k]);
+        size += need;
+        i = j;
+    }
+    flush();
+    return out;
+}
+
+bool Server::is_plain(const Peer& p) const {
+    for (const auto& t : targets()) {
+        if (t.peer == p) return t.plain;
+    }
+    return false;
+}
+
+void Server::send_full_status(const Peer& to, bool plain, bool with_counters) {
+    send_status_changes(false);
+    auto msgs = status_messages();
+    for (const auto& m : msgs) last_status_[m.address] = osc::encode(m);
+    if (with_counters) {
+        for (auto& c : counter_messages(monotonic_ns(), plain)) msgs.push_back(std::move(c));
+    }
+    for (const auto& b : pack_status(msgs, false)) send_bytes(to, b);
 }
 
 void Server::send_status_changes(bool full) {
@@ -747,8 +951,10 @@ void Server::send_status_changes(bool full) {
         auto it = last_status_.find(all[i].address);
         if (it == last_status_.end() || it->second != osc::encode(all[i])) send[i] = true;
     }
-    for (size_t i = 0; i + 1 < all.size(); ++i) {
-        if (all[i].address == addr("health") && all[i + 1].address == addr("reasons") && (send[i] || send[i + 1])) send[i] = send[i + 1] = true;
+    bool health_changed = false;
+    for (size_t i = 0; i < all.size(); ++i) health_changed = health_changed || (send[i] && health_part(all[i].address));
+    for (size_t i = 0; i < all.size() && health_changed; ++i) {
+        if (health_part(all[i].address)) send[i] = true;
     }
     std::vector<osc::Message> changed;
     for (size_t i = 0; i < all.size(); ++i) {
@@ -757,14 +963,10 @@ void Server::send_status_changes(bool full) {
         changed.push_back(std::move(all[i]));
     }
     if (changed.empty()) return;
-    auto bundles = pack(changed, addr("health"));
+    auto bundles = pack_status(changed, true);
     for (const auto& t : tg) {
         for (const auto& b : bundles) send_target(t, b);
     }
-}
-
-void Server::send_bundled(const Peer& to, const std::vector<osc::Message>& msgs) {
-    for (const auto& b : pack(msgs, addr("health"))) send_bytes(to, b);
 }
 
 void Server::send_alive(Nanos now) {
@@ -783,26 +985,27 @@ void Server::send_alive(Nanos now) {
         for (int k = 0; k < a.n; ++k) m.args.emplace_back(a.ids[k]);
         base.push_back(std::move(m));
     }
-    base[0].args = {alive_, run_, std::string(TTO_VERSION), h.level, connected, int32_t(cfg_.devices.size()), contacts};
-    auto plain = osc::encode_bundle(base);
-    std::vector<uint8_t> with_counters;
+    base[0].args = {alive_, run_, std::string(TTO_VERSION), h.level, connected, int32_t(cfg_.devices.size()), contacts, status_gen_};
+    auto bare = osc::encode_bundle(base);
+    std::vector<uint8_t> with_counters[2];
     for (const auto& t : tg) {
         if (t.status) {
-            if (with_counters.empty()) {
+            std::vector<uint8_t>& b = with_counters[t.plain ? 1 : 0];
+            if (b.empty()) {
                 auto all = base;
-                for (auto& m : counter_messages(now)) all.push_back(std::move(m));
-                with_counters = osc::encode_bundle(all);
+                for (auto& m : counter_messages(now, t.plain)) all.push_back(std::move(m));
+                b = osc::encode_bundle(all);
             }
-            send_target(t, with_counters);
+            send_target(t, b);
         } else {
-            send_target(t, plain);
+            send_target(t, bare);
         }
     }
 }
 
-void Server::send_event(const std::string& kind, const std::string& text, log::Level level) {
+void Server::send_event(const std::string& kind, const std::string& text, log::Level level, const std::string& device) {
     const char* severity = level <= log::Level::err ? "error" : level == log::Level::warning ? "warning" : "notice";
-    auto bytes = osc::encode({addr("event"), {kind, text, std::string(severity)}});
+    auto bytes = osc::encode({addr("event"), {kind, text, std::string(severity), device}});
     for (const auto& t : targets()) {
         if (t.status) send_target(t, bytes);
     }
@@ -814,50 +1017,64 @@ void Server::send_bye() {
 }
 
 Server::Health Server::health(Nanos now) {
-    std::vector<std::string> faults, warnings;
+    // each device's faults and warnings are its own health; the top level adds what is about no device
+    std::vector<std::string> faults, warnings, device_faults, device_warnings;
+    Health out;
     for (size_t i = 0; i < shared_.size(); ++i) {
+        std::vector<std::string> f, w;
         const DeviceConfig& d = cfg_.devices[i];
         const DevInfo& info = shared_[i]->info.latest();
         if (info.cfg_gen < restart_gen_[i] || info.state == DevState::restarting) {
-            warnings.push_back(d.label + " is restarting after a settings change");
+            w.push_back(d.label + " is restarting after a settings change");
         } else if (!info.enabled) {
-            if (base_.devices[i].enabled) warnings.push_back(d.label + " is turned off by a saved setting");
+            const DeviceConfig* in_file = file_device(d.id);
+            if (!in_file || in_file->enabled) w.push_back(d.label + " is turned off by a saved setting");
         } else {
             switch (info.state) {
             case DevState::ok: break;
-            case DevState::starting: warnings.push_back(d.label + " is starting"); break;
+            case DevState::starting: w.push_back(d.label + " is starting"); break;
             default:
-                faults.push_back(d.label + ": " + (!info.connected && usb_watching_[i] && usb_state_[i] == PortState::stuck ? usb_reason(i) : std::string(info.reason)));
+                f.push_back(d.label + ": " + (!info.connected && usb_watching_[i] && usb_state_[i] == PortState::stuck ? usb_reason(i) : std::string(info.reason)));
                 break;
             }
         }
         if (info.connected && info.matching > 1 && d.port.empty())
-            warnings.push_back(d.label + " matches " + std::to_string(info.matching) + " touchscreens (" + d.match_text() + ") and reads the one on port " +
-                               std::string(info.port) + ", which can change at a restart: set match_port to choose");
+            w.push_back(d.label + " matches " + std::to_string(info.matching) + " touchscreens (" + d.match_text() + ") and reads the one on port " +
+                        std::string(info.port) + ", which can change at a restart: set match_port to choose");
         const auto& s = stats_[i].samples;
         if (s.size() >= 2) {
             uint64_t resyncs = s.back().resyncs - s.front().resyncs;
             uint64_t drops = s.back().drops - s.front().drops;
-            if (resyncs)
-                warnings.push_back(d.label + ": the kernel dropped touch events " + count_text(resyncs, "time") + " in the last minute; the machine may be overloaded");
+            if (resyncs) w.push_back(d.label + ": the kernel dropped touch events " + count_text(resyncs, "time") + " in the last minute; the machine may be overloaded");
             if (drops)
-                warnings.push_back(d.label + ": " + count_text(drops, "touch message") +
-                                   " could not be sent in the last minute: the network or a receiver cannot keep up, or a receiver cannot be reached (" + prefix_ +
-                                   "/destinations lists them)");
+                w.push_back(d.label + ": " + count_text(drops, "touch message") +
+                            " could not be sent in the last minute: the network or a receiver cannot keep up, or a receiver cannot be reached (" + prefix_ +
+                            "/destinations lists them)");
         }
+        if (!usb_problem_.empty() && usb_problem_dev_ == i) f.push_back(usb_problem_);
+        if (calibrate_until_[i] > now)
+            w.push_back(d.label + " is being calibrated: its touches are paused (" + addr("device/" + d.id + "/calibrate") + " 0 ends it)");
+        device_faults.insert(device_faults.end(), f.begin(), f.end());
+        device_warnings.insert(device_warnings.end(), w.begin(), w.end());
+        std::vector<std::string> mine = f;
+        mine.insert(mine.end(), w.begin(), w.end());
+        out.devices.push_back({!f.empty() ? "fault" : !w.empty() ? "warning" : "ok", std::move(mine)});
     }
     for (const auto& [key, h] : dest_health_) {
         if (h.failing) warnings.push_back("sending to " + key + " fails: " + h.error + "; check that it can be reached from this machine");
     }
-    if (!usb_problem_.empty()) faults.push_back(usb_problem_);
+    if (!usb_problem_.empty() && usb_problem_dev_ >= shared_.size()) faults.push_back(usb_problem_);
+    if (identify_until_ > now) warnings.push_back("touches are paused while screens are identified (" + addr("identify") + " 0 ends it)");
     if (!config_problem_.empty()) warnings.push_back(config_problem_);
     if (!settings_load_problem_.empty()) warnings.push_back(settings_load_problem_);
     if (!settings_problem_.empty()) warnings.push_back(settings_problem_);
     if (!state_problem_.empty()) warnings.push_back(state_problem_);
-    (void)now;
-    Health out;
-    out.level = !faults.empty() ? "fault" : !warnings.empty() ? "warning" : "ok";
-    out.reasons = faults;
+    bool any_fault = !faults.empty() || !device_faults.empty();
+    bool any_warning = !warnings.empty() || !device_warnings.empty();
+    out.level = any_fault ? "fault" : any_warning ? "warning" : "ok";
+    out.reasons = device_faults;
+    out.reasons.insert(out.reasons.end(), faults.begin(), faults.end());
+    out.reasons.insert(out.reasons.end(), device_warnings.begin(), device_warnings.end());
     out.reasons.insert(out.reasons.end(), warnings.begin(), warnings.end());
     return out;
 }
@@ -882,7 +1099,7 @@ void Server::watch_usb(Nanos now) {
                 remember_port(i);
             }
             if (usb_rec_[i].attempts() > 0)
-                emit(d.id + "/usb", log::Level::notice, "usb", d.id + " is back after " + count_text(unsigned(usb_rec_[i].attempts()), "USB reset"));
+                emit(d.id + "/usb", log::Level::notice, "usb", d.id + " is back after " + count_text(unsigned(usb_rec_[i].attempts()), "USB reset"), d.id);
             usb_rec_[i].connected();
         }
         std::optional<UsbPortRef> ref;
@@ -912,7 +1129,7 @@ void Server::note_port(size_t index, const std::string& port, PortState state, c
     const DeviceConfig& d = cfg_.devices[index];
     if (!usb_watching_[index] || state != usb_state_[index]) status_dirty_ = true;
     if (state == PortState::unknown && why != usb_why_[index])
-        emit(d.id + "/usb", log::Level::warning, "usb", d.id + ": cannot tell whether anything is plugged into USB port " + port + " (" + why + ")");
+        emit(d.id + "/usb", log::Level::warning, "usb", d.id + ": cannot tell whether anything is plugged into USB port " + port + " (" + why + ")", d.id);
     usb_why_[index] = state == PortState::unknown ? why : std::string();
     usb_state_[index] = state;
     usb_watching_[index] = true;
@@ -950,11 +1167,12 @@ void Server::start_usb_reset(size_t index, const UsbPortRef& ref, const std::str
     usb_worker_hub_ = ref.hub_interface;
     if (usb_worker_manual_)
         emit(id + "/usb", log::Level::warning, "usb",
-             id + ": resetting " + usb_worker_target_ + " as asked by " + asked_by + "; every device on it drops for a moment");
+             id + ": resetting " + usb_worker_target_ + " as asked by " + asked_by + "; every device on it drops for a moment", id);
     else
         emit(id + "/usb", log::Level::warning, "usb",
              id + ": something is plugged into USB port " + ref.path + " but the kernel has not set it up; resetting " + usb_worker_target_ + " (attempt " +
-                 std::to_string(usb_rec_[index].attempts() + 1) + "); every device on it drops for a moment");
+                 std::to_string(usb_rec_[index].attempts() + 1) + "); every device on it drops for a moment",
+             id);
     usb_worker_.reset(ref, monotonic_ns());
     status_dirty_ = true;
 }
@@ -975,11 +1193,13 @@ void Server::finish_usb_reset(Nanos now, const UsbWorker::Done& done) {
     for (size_t k = 0; k < done.dropped.size(); ++k) also += (k ? ", " : "") + done.dropped[k];
     if (done.result) {
         usb_problem_.clear();
+        usb_problem_dev_ = SIZE_MAX;
         emit(id + "/usb", log::Level::notice, "usb",
-             id + ": " + usb_worker_target_ + " reset in " + std::to_string(done.took / kMs) + " ms (" + also + "); waiting for the touchscreen to come back");
+             id + ": " + usb_worker_target_ + " reset in " + std::to_string(done.took / kMs) + " ms (" + also + "); waiting for the touchscreen to come back", id);
     } else {
         usb_problem_ = done.result.error();
-        emit(id + "/usb", log::Level::err, "usb", id + ": " + done.result.error());
+        usb_problem_dev_ = i;
+        emit(id + "/usb", log::Level::err, "usb", id + ": " + done.result.error(), id);
     }
     status_dirty_ = true;
 }
@@ -994,7 +1214,8 @@ std::string Server::usb_reason(size_t index) const {
 
 std::string Server::disabled_reason(size_t index) const {
     std::string on = "send " + prefix_ + "/device/" + cfg_.devices[index].id + "/enabled 1 to turn it back on";
-    if (!base_.devices[index].enabled) return "turned off in the config file (enabled = false): set it to true there, or " + on;
+    const DeviceConfig* f = file_device(cfg_.devices[index].id);
+    if (f && !f->enabled) return "turned off in the config file (enabled = false): set it to true there, or " + on;
     return "turned off by a saved setting (changed over OSC, for example from an app): turn it on there, or " + on;
 }
 
@@ -1008,9 +1229,15 @@ std::vector<osc::Message> Server::status_messages() {
     add("health", {h.level});
     std::vector<osc::Arg> reasons(h.reasons.begin(), h.reasons.end());
     add("reasons", reasons);
+    for (size_t i = 0; i < h.devices.size() && i < cfg_.devices.size(); ++i) {
+        add("device/" + cfg_.devices[i].id + "/health", {h.devices[i].first});
+        add("device/" + cfg_.devices[i].id + "/reasons", std::vector<osc::Arg>(h.devices[i].second.begin(), h.devices[i].second.end()));
+    }
     add("host", {host_});
     add("config", {config_path_});
     add("settings_file", {settings_file_});
+    add("listen", {cfg_.osc.listen.text()});
+    add("prefix", {prefix_});
     add("log_level", {cfg_.log.level});
     std::vector<osc::Arg> allowed;
     if (cfg_.osc.open_to_any) allowed.emplace_back(std::string("any"));
@@ -1025,6 +1252,9 @@ std::vector<osc::Message> Server::status_messages() {
     std::vector<osc::Arg> ids;
     for (const auto& d : cfg_.devices) ids.emplace_back(d.id);
     add("devices", ids);
+    add("unused_screens", std::vector<osc::Arg>(unused_screens_.begin(), unused_screens_.end()));
+    Nanos now_s = monotonic_ns();
+    add("identify_s", {int32_t(identify_until_ > now_s ? (identify_until_ - now_s + kSec - 1) / kSec : 0)});
     for (size_t i = 0; i < shared_.size(); ++i) {
         const DeviceConfig& d = cfg_.devices[i];
         const DevInfo& info = shared_[i]->info.latest();
@@ -1034,7 +1264,10 @@ std::vector<osc::Message> Server::status_messages() {
         add(b + "enabled", {int32_t(info.enabled ? 1 : 0)});
         add(b + "connected", {int32_t(info.connected ? 1 : 0)});
         bool stuck = !info.connected && usb_watching_[i] && usb_state_[i] == PortState::stuck;
-        add(b + "state", {std::string(restarting ? "restarting" : state_name(info.state))});
+        ReadMode mode = ReadMode(shared_[i]->mode.load());
+        bool paused = info.state == DevState::ok && info.enabled && mode != ReadMode::touches;
+        add(b + "state", {std::string(restarting ? "restarting" : paused ? (mode == ReadMode::identify ? "identifying" : "calibrating") : state_name(info.state))});
+        add(b + "calibrate_s", {int32_t(calibrate_until_[i] > now_s ? (calibrate_until_[i] - now_s + kSec - 1) / kSec : 0)});
         add(b + "reason", {restarting ? std::string("restarting after a settings change")
                            : !info.enabled ? disabled_reason(i)
                            : stuck         ? usb_reason(i)
@@ -1065,7 +1298,7 @@ std::vector<osc::Message> Server::status_messages() {
     return out;
 }
 
-std::vector<osc::Message> Server::counter_messages(Nanos now) {
+std::vector<osc::Message> Server::counter_messages(Nanos now, bool plain) {
     std::vector<osc::Message> out;
     auto add = [&](const std::string& rest, std::vector<osc::Arg> args) { out.push_back({addr(rest), std::move(args)}); };
     add("uptime_s", {int32_t(std::min<Nanos>((now - started_) / kSec, INT32_MAX))});
@@ -1077,6 +1310,9 @@ std::vector<osc::Message> Server::counter_messages(Nanos now) {
         add(b + "oldest_s", {oldest ? round1(double(now - oldest) / 1e9) : -1.0f});
         Nanos last = sh.last_frame_ns.load();
         add(b + "last_event_s", {last ? round1(double(now - last) / 1e9) : -1.0f});
+        Nanos loss = sh.last_loss_ns.load(), back = sh.last_back_ns.load();
+        add(b + "last_loss_s", {loss ? round1(double(now - loss) / 1e9) : -1.0f});
+        add(b + "last_gone_s", {loss && back > loss ? round1(double(back - loss) / 1e9) : -1.0f});
         add(b + "rate_hz", {stats_[i].rate});
         std::vector<uint32_t> lat;
         for (const auto& [at, v] : stats_[i].latency) lat.push_back(v);
@@ -1099,7 +1335,7 @@ std::vector<osc::Message> Server::counter_messages(Nanos now) {
         dests.emplace_back(t.peer.text() + (it != dest_health_.end() && it->second.failing ? " failing" : " ok"));
     }
     add("destinations", dests);
-    return out;
+    return plain ? plain_copy(std::move(out)) : out;
 }
 
 void Server::on_osc() {
@@ -1115,19 +1351,28 @@ void Server::on_osc() {
             TTO_LOG_EVERY(30 * kSec, log::Level::warning, "an OSC packet of %zd bytes from %s was dropped: larger than %zu", got, ip, rx_.size());
             continue;
         }
-        auto msgs = osc::decode_packet(rx_.data(), size_t(got));
+        bool allowed = cfg_.osc.open_to_any || std::find(cfg_.osc.allowed_ips.begin(), cfg_.osc.allowed_ips.end(), peer.ip) != cfg_.osc.allowed_ips.end();
+        osc::DecodeIssue issue;
+        auto msgs = osc::decode_packet(rx_.data(), size_t(got), &issue);
         if (!msgs) {
-            TTO_LOG_EVERY(30 * kSec, log::Level::warning, "a malformed OSC packet from %s was dropped", ip);
+            if (issue.address.empty()) TTO_LOG_EVERY(30 * kSec, log::Level::warning, "a malformed OSC packet from %s was dropped", ip);
+            else refuse(peer, issue.address, allowed ? issue.what : outsider_reason(peer), !allowed);
             continue;
         }
-        bool allowed = cfg_.osc.open_to_any || std::find(cfg_.osc.allowed_ips.begin(), cfg_.osc.allowed_ips.end(), peer.ip) != cfg_.osc.allowed_ips.end();
         if (!allowed) {
-            bool removed = std::find(over_.allowed_removed.begin(), over_.allowed_removed.end(), peer.ip) != over_.allowed_removed.end();
-            std::string why = removed ? peer.ip + " may not send commands here: it was taken off the allowed hosts over OSC (a saved setting); send " + prefix_ +
-                                            "/allowed_ips/add " + peer.ip + " from an allowed host, or " + prefix_ + "/settings/forget allowed_ips"
-                                      : peer.ip + " may not send commands here: add it to osc.allowed_ips in " + config_path_ +
-                                            " and restart touch-to-osc, or send " + prefix_ + "/allowed_ips/add " + peer.ip + " from an allowed host";
-            if (!msgs->empty()) refuse(peer, msgs->front().address, why, true);
+            const osc::Message* first = nullptr;
+            for (const auto& m : *msgs) {
+                if (m.address == addr("hello")) hello(m, peer, false);
+                else if (!first) first = &m;
+            }
+            if (first) {
+                uint16_t named = 0;
+                if (first->address == addr("subscribe") && !first->args.empty()) {
+                    int64_t port = integer(first->args[0]).value_or(0);
+                    if (port > 0 && port < 65536) named = uint16_t(port);
+                }
+                refuse(peer, first->address, outsider_reason(peer), true, named);
+            }
             continue;
         }
         for (const auto& m : *msgs) command(m, peer);
@@ -1135,7 +1380,157 @@ void Server::on_osc() {
     if (status_dirty_) send_status_changes(false);
 }
 
-void Server::refuse(const Peer& peer, const std::string& address, const std::string& why, bool limited) {
+std::string Server::outsider_reason(const Peer& peer) const {
+    bool removed = std::find(over_.allowed_removed.begin(), over_.allowed_removed.end(), peer.ip) != over_.allowed_removed.end();
+    if (removed)
+        return peer.ip + " may not send commands here: it was taken off the allowed hosts over OSC (a saved setting); send " + prefix_ + "/allowed_ips/add " +
+               peer.ip + " from an allowed host, or " + prefix_ + "/settings/forget allowed_ips";
+    return peer.ip + " may not send commands here: add it to osc.allowed_ips in " + config_path_ + " and restart touch-to-osc, or send " + prefix_ +
+           "/allowed_ips/add " + peer.ip + " from an allowed host";
+}
+
+void Server::hello(const osc::Message& m, const Peer& peer, bool allowed) {
+    Peer to = peer;
+    if (m.args.size() == 1) {
+        auto port = integer(m.args[0]);
+        if (port && *port > 0 && *port < 65536) to.port = uint16_t(*port);
+    }
+    std::vector<osc::Message> here{{addr("here"), {host_, std::string(TTO_VERSION), kOscApi, int32_t(cfg_.osc.listen.port), int32_t(cfg_.devices.size()),
+                                                   int32_t(allowed ? 1 : 0)}}};
+    if (allowed) {
+        reply_to(to, here);
+        return;
+    }
+    if (!take_token(refusal_tokens_, refusal_last_, monotonic_ns(), kRefusalBurst, kRefusalsPerSecond)) {
+        ++refusals_dropped_;
+        return;
+    }
+    send_to(to, here);
+}
+
+// a device as the config file has it, or as it was added over OSC; the running list may differ from both
+const DeviceConfig* Server::file_device(const std::string& id) const {
+    for (const auto& d : base_.devices) {
+        if (d.id == id) return &d;
+    }
+    for (const auto& d : over_.devices_added) {
+        if (d.id == id) return &d;
+    }
+    return nullptr;
+}
+
+std::string Server::calibrating_id() const {
+    Nanos now = monotonic_ns();
+    for (size_t i = 0; i < calibrate_until_.size(); ++i) {
+        if (calibrate_until_[i] > now) return cfg_.devices[i].id;
+    }
+    return {};
+}
+
+void Server::update_modes() {
+    Nanos now = monotonic_ns();
+    for (size_t i = 0; i < shared_.size(); ++i) {
+        ReadMode want = calibrate_until_[i] > now ? ReadMode::calibrate : identify_until_ > now ? ReadMode::identify : ReadMode::touches;
+        if (shared_[i]->mode.load() == uint8_t(want)) continue;
+        shared_[i]->mode.store(uint8_t(want));
+        write_one(shared_[i]->wake.get());
+        status_dirty_ = true;
+    }
+}
+
+void Server::expire_modes(Nanos now) {
+    bool changed = false;
+    if (identify_until_ && now >= identify_until_) {
+        identify_until_ = 0;
+        changed = true;
+        emit("identify", log::Level::notice, "identify", "identifying screens ended: its time ran out; touches go out again");
+    }
+    for (size_t i = 0; i < calibrate_until_.size(); ++i) {
+        if (!calibrate_until_[i] || now < calibrate_until_[i]) continue;
+        calibrate_until_[i] = 0;
+        changed = true;
+        const DeviceConfig& d = cfg_.devices[i];
+        emit(d.id + "/calibrate", log::Level::notice, "calibrate", d.label + ": guided calibration ended: its time ran out; touches go out again", d.id);
+    }
+    if (changed) update_modes();
+}
+
+void Server::mode_touch(size_t index, const ModeTouch& t) {
+    const DeviceConfig& d = cfg_.devices[index];
+    Nanos now = monotonic_ns();
+    osc::Message msg;
+    if (calibrate_until_[index] > now) {
+        msg = {addr("device/" + d.id + "/calibration/touch"), {t.contact, std::string(t.down ? "down" : "up"), t.u, t.v}};
+    } else if (identify_until_ > now && t.down) {
+        const DevInfo& info = shared_[index]->info.latest();
+        msg = {addr("identified"), {d.id, d.label, std::string(info.port), t.x, t.y}};
+        char at[48];
+        std::snprintf(at, sizeof at, "%.2f, %.2f", double(t.x), double(t.y));
+        emit(d.id + "/identify", log::Level::notice, "identify",
+             d.label + (info.port[0] ? " (port " + std::string(info.port) + ")" : std::string()) + " was touched at " + at, d.id);
+    } else {
+        return;
+    }
+    auto bytes = osc::encode(msg);
+    for (const auto& tg : targets()) {
+        if (tg.status) send_target(tg, bytes);
+    }
+}
+
+Status Server::calibration_fit(size_t index, const std::vector<osc::Arg>& args, const Peer& peer) {
+    // copied: applying the fit replaces cfg_
+    const DeviceConfig d = cfg_.devices[index];
+    if (args.empty() || args.size() % 4 != 0)
+        return err("calibration/fit takes 3 to 16 points, four numbers each: x y where the target was shown, u v where it was touched");
+    std::vector<CalPoint> pts;
+    for (size_t k = 0; k + 3 < args.size(); k += 4) {
+        auto x = number(args[k]), y = number(args[k + 1]), u = number(args[k + 2]), v = number(args[k + 3]);
+        if (!x || !y || !u || !v) return err("calibration/fit takes numbers only");
+        if (*x < 0 || *x > 1 || *y < 0 || *y > 1) return err("calibration/fit: x and y are where a target was shown, 0..1 of the display");
+        if (*u < -1 || *u > 2 || *v < -1 || *v > 2) return err("calibration/fit: u and v are where a target was touched, as calibration/touch reports it");
+        pts.push_back({*x, *y, *u, *v});
+    }
+    auto fit = fit_calibration(pts);
+    if (!fit) return err(fit.error());
+    char pct[16];
+    std::snprintf(pct, sizeof pct, "%.1f%%", fit->worst * 100);
+    if (fit->worst > 0.05)
+        return err(std::string("the touches do not line up with the targets: worst miss ") + pct + " of the screen (point " + std::to_string(fit->worst_at + 1) +
+                   "); touch each target as it is shown and fit again");
+    if (std::string p = check_calibration(fit->c); !p.empty()) return err("the fit gives a calibration that " + p + "; check the points");
+    const DevInfo& info = shared_[index]->info.latest();
+    bool turned = d.rotation == 90 || d.rotation == 270;
+    double w = turned ? info.h_mm : info.w_mm, h = turned ? info.w_mm : info.h_mm;
+    double worst_mm = -1;
+    if (w > 0 && h > 0) {
+        worst_mm = 0;
+        for (const auto& q : pts) {
+            double fx = fit->c[0] * q.u + fit->c[1] * q.v + fit->c[2], fy = fit->c[3] * q.u + fit->c[4] * q.v + fit->c[5];
+            worst_mm = std::max(worst_mm, std::hypot((fx - q.x) * w, (fy - q.y) * h));
+        }
+    }
+    std::vector<osc::Arg> c(fit->c.begin(), fit->c.end());
+    if (Status st = set_device(index, "calibration", c, peer); !st) return st;
+    char note[96];
+    if (worst_mm >= 0) std::snprintf(note, sizeof note, "fitted from %zu points: worst miss %s of the screen (%.1f mm)", pts.size(), pct, worst_mm);
+    else std::snprintf(note, sizeof note, "fitted from %zu points: worst miss %s of the screen", pts.size(), pct);
+    reply_note_ = note;
+    reply_to(peer, {{addr("device/" + d.id + "/calibration/fitted"), {float(fit->worst), float(worst_mm)}}});
+    emit(d.id + "/calibrate", log::Level::notice, "calibrate", d.label + ": calibration " + note + ", as asked by " + peer.ip, d.id);
+    return {};
+}
+
+void Server::reply_to(const Peer& to, const std::vector<osc::Message>& msgs) {
+    send_to(to, msgs);
+    std::vector<uint16_t> done{to.port};
+    for (const auto& l : leases_.all()) {
+        if (l.peer.ip != to.ip || std::find(done.begin(), done.end(), l.peer.port) != done.end()) continue;
+        done.push_back(l.peer.port);
+        send_to(l.peer, msgs);
+    }
+}
+
+void Server::refuse(const Peer& peer, const std::string& address, const std::string& why, bool limited, uint16_t also_port) {
     if (limited) {
         Nanos now = monotonic_ns();
         auto it = refused_at_.find(peer.ip);
@@ -1147,7 +1542,10 @@ void Server::refuse(const Peer& peer, const std::string& address, const std::str
         refused_at_[peer.ip] = now;
     }
     TTO_LOG_EVERY(5 * kSec, log::Level::warning, "OSC %s from %s refused: %s", address.c_str(), peer.ip.c_str(), why.c_str());
-    send_to(peer, {{addr("error"), {address, why}}});
+    std::vector<osc::Message> e{{addr("error"), {address, why}}};
+    if (limited) send_to(peer, e);
+    else reply_to(peer, e);
+    if (also_port && also_port != peer.port) send_to(Peer{peer.ip, also_port}, e);
 }
 
 bool Server::command(const osc::Message& m, const Peer& peer) {
@@ -1170,7 +1568,7 @@ bool Server::request(const osc::Message& m, const Peer& peer) {
     int32_t s = int32_t(*seq);
     osc::Message inner{std::get<std::string>(m.args[1]), std::vector<osc::Arg>(m.args.begin() + 2, m.args.end())};
     auto answer = [&](bool ok, const std::string& note) {
-        send_to(peer, {{addr("reply"), {s, std::string(ok ? "ok" : "refused"), note}}});
+        reply_to(peer, {{addr("reply"), {s, std::string(ok ? "ok" : "refused"), note}}});
     };
     Nanos now = monotonic_ns();
     auto bytes = osc::encode(inner);
@@ -1186,18 +1584,23 @@ bool Server::request(const osc::Message& m, const Peer& peer) {
     if (!osc::valid_address(inner.address)) st = err("a request's address must be an OSC address: a slash, then printable characters");
     else if (inner.address == addr("request")) st = err("a request cannot carry another request");
     else {
-        asking_ = Asked{peer, s, bytes};
+        asking_ = Asked{peer, s, bytes, std::string()};
+        reply_note_.clear();
         st = apply(inner, peer);
         asking_.reset();
     }
     if (!st) TTO_LOG_EVERY(5 * kSec, log::Level::warning, "OSC %s from %s refused: %s", osc::valid_address(inner.address) ? inner.address.c_str() : "(not an address)",
                            peer.ip.c_str(), st.error().c_str());
-    kept_.keep(peer, s, bytes, st.ok(), st.ok() ? std::string() : st.error(), now);
-    answer(st.ok(), st.ok() ? std::string() : st.error());
+    std::string note = st.ok() ? reply_note_ : st.error();
+    reply_note_.clear();
+    if (restart_asked_ && restart_asked_->seq == s && restart_asked_->peer == peer) restart_asked_->note = note;
+    kept_.keep(peer, s, bytes, st.ok(), note, now);
+    answer(st.ok(), note);
     return st.ok();
 }
 
 Status Server::apply(const osc::Message& m, const Peer& peer) {
+    if (restart_requested_) return err("touch-to-osc is restarting: send it again in a moment");
     if (m.address.size() <= prefix_.size() + 1 || m.address.compare(0, prefix_.size() + 1, prefix_ + "/") != 0)
         return err("unknown address: every address here starts with " + prefix_ + "/");
     auto parts = split(m.address.substr(prefix_.size() + 1));
@@ -1209,18 +1612,106 @@ Status Server::apply(const osc::Message& m, const Peer& peer) {
         }
         return to;
     };
+    if (parts.size() == 1 && parts[0] == "describe") {
+        if (m.args.size() > 1) return err("describe takes no arguments, or the port to answer to");
+        Nanos now = monotonic_ns();
+        if (describe_at_ && now - describe_at_ < 500 * kMs) return err("at most 2 descriptions a second");
+        describe_at_ = now;
+        send_description(reply_peer());
+        return {};
+    }
+    if (parts.size() == 2 && parts[0] == "devices" && parts[1] == "add") {
+        const char* usage = "devices/add needs an id, a usb id (vvvv:pppp) and a USB port: \"screen2\" \"0712:0009\" \"3-4\" (one of the two may be \"\")";
+        if (m.args.size() != 3) return err(usage);
+        const std::string* id = std::get_if<std::string>(&m.args[0]);
+        const std::string* usb = std::get_if<std::string>(&m.args[1]);
+        const std::string* port = std::get_if<std::string>(&m.args[2]);
+        if (!id || !usb || !port) return err(usage);
+        if (std::string p = check_device_id(*id); !p.empty()) return err("the id " + p);
+        if (std::any_of(cfg_.devices.begin(), cfg_.devices.end(), [&](const DeviceConfig& d) { return d.id == *id; })) return err("there is a device " + *id + " already");
+        if (cfg_.devices.size() >= kMaxDevices) return err("at most " + std::to_string(kMaxDevices) + " devices");
+        DeviceConfig d;
+        d.id = *id;
+        d.label = *id;
+        if (!usb->empty()) {
+            if (std::string p = check_usb(*usb, &d.vendor, &d.product); !p.empty()) return err("match_usb " + p);
+            d.has_usb = true;
+        }
+        if (std::string p = check_text(*port, 64); !p.empty()) return err("match_port " + p);
+        d.port = *port;
+        if (!d.has_usb && d.port.empty()) return err("device " + d.id + " would match nothing: give a usb id or a port");
+        Overrides next = over_;
+        auto gone = std::find(next.devices_removed.begin(), next.devices_removed.end(), d.id);
+        if (gone != next.devices_removed.end()) {
+            next.devices_removed.erase(gone);
+            DeviceOverrides& x = next.devices[d.id];
+            x.match_usb = d.usb_setting();
+            x.match_port = d.port;
+        } else {
+            next.devices_added.push_back(d);
+        }
+        return apply_by_restart(std::move(next), peer, "device " + d.id + " added (" + d.match_text() + ")", "; then touch-to-osc reads " + d.id + " too");
+    }
+    if (parts.size() == 2 && parts[0] == "devices" && parts[1] == "remove") {
+        const std::string* id = m.args.size() == 1 ? std::get_if<std::string>(&m.args[0]) : nullptr;
+        if (!id) return err("devices/remove needs the id of a device");
+        if (std::none_of(cfg_.devices.begin(), cfg_.devices.end(), [&](const DeviceConfig& d) { return d.id == *id; }))
+            return err(check_text(*id, 32).empty() ? "no device " + *id + " (devices: " + ids_text(cfg_) + ")" : std::string("no device by that name"));
+        if (cfg_.devices.size() == 1) return err(*id + " is the only device: touch-to-osc needs at least one");
+        Overrides next = over_;
+        auto added = std::find_if(next.devices_added.begin(), next.devices_added.end(), [&](const DeviceConfig& d) { return d.id == *id; });
+        if (added != next.devices_added.end()) next.devices_added.erase(added);
+        else next.devices_removed.push_back(*id);
+        return apply_by_restart(std::move(next), peer, "device " + *id + " removed", "; then touch-to-osc no longer reads " + *id);
+    }
+    if (parts.size() == 1 && (parts[0] == "listen" || parts[0] == "prefix")) {
+        const std::string* v = m.args.size() == 1 ? std::get_if<std::string>(&m.args[0]) : nullptr;
+        Overrides next = over_;
+        if (parts[0] == "listen") {
+            HostPort hp;
+            if (!v) return err("listen needs \"ip:port\", like \"0.0.0.0:9480\"");
+            if (std::string p = check_listen(*v, hp); !p.empty()) return err("listen " + p);
+            next.listen = hp;
+            return apply_by_restart(std::move(next), peer, "listen " + cfg_.osc.listen.text() + " -> " + hp.text(),
+                                    "; then touch-to-osc listens on " + hp.text() + ": send commands there");
+        }
+        if (!v) return err("prefix needs one string, like \"/touch\"");
+        if (std::string p = check_prefix(*v); !p.empty()) return err("prefix " + p);
+        next.prefix = *v;
+        return apply_by_restart(std::move(next), peer, "prefix " + prefix_ + " -> " + *v, "; then every address starts with " + *v);
+    }
+    if (parts.size() == 1 && parts[0] == "identify") {
+        auto s = m.args.size() == 1 ? integer(m.args[0]) : std::nullopt;
+        if (!s || *s < 0 || *s > 60) return err("identify needs a number of seconds: 1-60 to identify the screens (touches pause meanwhile), 0 to end it");
+        std::string busy = calibrating_id();
+        if (*s > 0 && !busy.empty()) return err(busy + " is being calibrated: end that first (" + addr("device/" + busy + "/calibrate") + " 0)");
+        bool was = identify_until_ != 0;
+        identify_until_ = *s ? monotonic_ns() + *s * kSec : 0;
+        update_modes();
+        status_dirty_ = true;
+        if (*s && !was)
+            emit("identify", log::Level::notice, "identify",
+                 "identifying screens for " + std::to_string(*s) + " s, as asked by " + peer.ip + ": touches are paused; each screen touched is reported");
+        else if (!*s && was)
+            emit("identify", log::Level::notice, "identify", "identifying screens ended, as asked by " + peer.ip + "; touches go out again");
+        return {};
+    }
+    if (parts.size() == 1 && parts[0] == "hello") {
+        if (m.args.size() > 1) return err("hello takes no arguments, or the port to answer to");
+        hello(m, peer, true);
+        return {};
+    }
     if (parts.size() == 1 && parts[0] == "ping") {
         if (m.args.size() > 1) return err("ping takes no arguments, or the port to answer to");
-        send_to(reply_peer(), {{addr("pong"), {run_}}});
+        reply_to(reply_peer(), {{addr("pong"), {run_}}});
         return {};
     }
     if (parts.size() == 2 && parts[0] == "status" && parts[1] == "send") {
         Nanos now = monotonic_ns();
         if (status_reply_at_ && now - status_reply_at_ < kStatusReplyEvery) return err("at most 5 status requests a second");
         status_reply_at_ = now;
-        auto msgs = status_messages();
-        for (auto& c : counter_messages(now)) msgs.push_back(std::move(c));
-        send_bundled(reply_peer(), msgs);
+        Peer to = reply_peer();
+        send_full_status(to, is_plain(to), true);
         return {};
     }
     if (parts.size() == 1 && parts[0] == "restart") {
@@ -1235,10 +1726,33 @@ Status Server::apply(const osc::Message& m, const Peer& peer) {
     }
     if (parts.size() == 1 && parts[0] == "subscribe") return subscribe(m, peer);
     if (parts.size() == 1 && parts[0] == "unsubscribe") return unsubscribe(m, peer);
+    if (parts.size() == 4 && parts[0] == "device" && parts[2] == "calibration" && parts[3] == "fit") {
+        auto it = std::find_if(cfg_.devices.begin(), cfg_.devices.end(), [&](const DeviceConfig& d) { return d.id == parts[1]; });
+        if (it == cfg_.devices.end()) return err("no device " + parts[1] + " (devices: " + ids_text(cfg_) + ")");
+        return calibration_fit(size_t(it - cfg_.devices.begin()), m.args, peer);
+    }
     if (parts.size() == 3 && parts[0] == "device") {
         auto it = std::find_if(cfg_.devices.begin(), cfg_.devices.end(), [&](const DeviceConfig& d) { return d.id == parts[1]; });
         if (it == cfg_.devices.end()) return err("no device " + parts[1] + " (devices: " + ids_text(cfg_) + ")");
         size_t index = size_t(it - cfg_.devices.begin());
+        if (parts[2] == "calibrate") {
+            auto s = m.args.size() == 1 ? integer(m.args[0]) : std::nullopt;
+            if (!s || *s < 0 || *s > 60) return err("calibrate needs a number of seconds: 1-60 to calibrate the screen (its touches pause meanwhile), 0 to end it");
+            if (*s > 0 && identify_until_) return err("screens are being identified: end that first (" + addr("identify") + " 0)");
+            std::string busy = calibrating_id();
+            if (*s > 0 && !busy.empty() && busy != it->id) return err(busy + " is being calibrated: end that first (" + addr("device/" + busy + "/calibrate") + " 0)");
+            bool was = calibrate_until_[index] != 0;
+            calibrate_until_[index] = *s ? monotonic_ns() + *s * kSec : 0;
+            update_modes();
+            status_dirty_ = true;
+            if (*s && !was)
+                emit(it->id + "/calibrate", log::Level::notice, "calibrate",
+                     it->label + ": guided calibration for " + std::to_string(*s) + " s, as asked by " + peer.ip + ": its touches are paused; each touch is reported",
+                     it->id);
+            else if (!*s && was)
+                emit(it->id + "/calibrate", log::Level::notice, "calibrate", it->label + ": guided calibration ended, as asked by " + peer.ip, it->id);
+            return {};
+        }
         if (parts[2] == "usb_reset") {
             if (!m.args.empty()) return err("usb_reset takes no arguments");
             auto ref = usb_port_of(index);
@@ -1352,7 +1866,7 @@ Status Server::set_device(size_t index, const std::string& key, const std::vecto
         std::string near = closest_name(key, kDeviceSettings);
         return err("unknown address" + (near.empty() ? std::string() : " (did you mean " + addr("device/" + cur.id + "/" + near) + "?)"));
     }
-    return commit(std::move(next), peer, what);
+    return commit(std::move(next), peer, what, cur.id);
 }
 
 Status Server::set_global(const std::vector<std::string>& parts, const std::vector<osc::Arg>& args, const Peer& peer) {
@@ -1393,12 +1907,16 @@ Status Server::set_global(const std::vector<std::string>& parts, const std::vect
         bool listed = std::any_of(cfg_.destinations.begin(), cfg_.destinations.end(), same_address);
         bool in_file = std::any_of(base_.destinations.begin(), base_.destinations.end(), same_address);
         if (parts[1] == "add") {
-            if (args.size() != 1 && args.size() != 3) return err("saved_destinations/add needs \"IP:PORT\", or \"IP:PORT\" touches status (each 0 or 1)");
-            if (args.size() == 3) {
+            if (args.size() != 1 && args.size() != 3 && args.size() != 4)
+                return err("saved_destinations/add needs \"IP:PORT\", or \"IP:PORT\" touches status [plain] (each 0 or 1)");
+            if (args.size() >= 3) {
                 auto t = integer(args[1]), st = integer(args[2]);
-                if (!t || !st || (*t != 0 && *t != 1) || (*st != 0 && *st != 1)) return err("touches and status must each be 0 or 1");
+                auto pl = args.size() == 4 ? integer(args[3]) : std::optional<int64_t>(0);
+                if (!t || !st || !pl || (*t != 0 && *t != 1) || (*st != 0 && *st != 1) || (*pl != 0 && *pl != 1))
+                    return err("touches, status and plain must each be 0 or 1");
                 d.touches = *t == 1;
                 d.status = *st == 1;
+                d.plain = *pl == 1;
             }
             if (!d.touches && !d.status) return err("a destination needs touches or status, or both");
             if (listed) return err(key + " is already a saved destination");
@@ -1430,9 +1948,19 @@ Status Server::set_global(const std::vector<std::string>& parts, const std::vect
     return err("unknown address" + (near.empty() ? std::string() : " (did you mean " + addr(near) + "?)"));
 }
 
-Status Server::commit(Overrides next, const Peer& peer, const std::string& what) {
+Status Server::commit(Overrides next, const Peer& peer, const std::string& what, std::string device) {
     drop_unchanged(next, base_);
     if (settings_text(next, Overrides(), "") == settings_text(over_, Overrides(), "")) return {};
+    // the listen address, the prefix and the device list are only ever changed by starting again
+    auto listen_text = [](const Overrides& o) { return o.listen ? o.listen->text() : std::string(); };
+    auto added_text = [](const Overrides& o) {
+        std::string s;
+        for (const auto& d : o.devices_added) s += d.id + "=" + d.match_text() + ";";
+        return s;
+    };
+    if (listen_text(next) != listen_text(over_) || next.prefix != over_.prefix || added_text(next) != added_text(over_) ||
+        next.devices_removed != over_.devices_removed)
+        return apply_by_restart(std::move(next), peer, what, std::string());
     Config eff = apply_overrides(base_, next);
     for (const auto& d : eff.devices) {
         if (!d.has_usb && d.port.empty()) return err("device " + d.id + " would match nothing: it needs a usb id or a port");
@@ -1451,7 +1979,7 @@ Status Server::commit(Overrides next, const Peer& peer, const std::string& what)
     if (!settings_dirty_) dirty_since_ = monotonic_ns();
     settings_dirty_ = true;
     status_dirty_ = true;
-    emit("settings", log::Level::notice, "settings", what + ", from " + peer.ip);
+    emit("settings", log::Level::notice, "settings", what + ", from " + peer.ip, device);
     return {};
 }
 
@@ -1464,6 +1992,10 @@ void Server::apply_effects(const Config& old) {
     if (!(old.destinations == cfg_.destinations)) {
         publish_dests();
         prune(monotonic_ns());
+    }
+    if (old.devices.size() != shared_.size() || cfg_.devices.size() != shared_.size()) {
+        TTO_ERR("internal error: the device list changed without a restart; the change waits for the next restart");
+        return;
     }
     for (size_t i = 0; i < shared_.size(); ++i) {
         const DeviceConfig& a = old.devices[i];
@@ -1552,7 +2084,7 @@ void Server::remember_port(size_t index) {
     if (was == usb_last_port_[index]) return;
     if (auto ref = parse_usb_port(usb_last_port_[index]))
         emit(id + "/usb-port", log::Level::notice, "usb",
-             id + " is on USB port " + ref->path + "; a USB reset for it resets " + usb_target_text(*ref) + " (sudo touch-to-osc --list names what else is on it)");
+             id + " is on USB port " + ref->path + "; a USB reset for it resets " + usb_target_text(*ref) + " (sudo touch-to-osc --list names what else is on it)", id);
     if (usb_last_port_[index].empty()) state_.usb_ports.erase(id);
     else state_.usb_ports[id] = usb_last_port_[index];
     save_state();
@@ -1572,36 +2104,74 @@ void Server::repair_usb_hub() {
 }
 
 Status Server::subscribe(const osc::Message& m, const Peer& peer) {
-    const char* usage = "subscribe needs a port (1-65535) and optionally a lease of 1-60 seconds";
-    if (m.args.empty() || m.args.size() > 2) return err(usage);
-    auto port = integer(m.args[0]);
+    const char* usage = "subscribe needs a port (1-65535), optionally a lease of 1-60 seconds, and optionally what to get: all, touches or status, "
+                        "with plain for no 64-bit arguments (\"touches plain\")";
+    auto port = m.args.empty() ? std::nullopt : integer(m.args[0]);
     if (!port || *port < 1 || *port > 65535) return err(usage);
+    auto refused = [&](const std::string& why) {
+        if (*port != peer.port) send_to(Peer{peer.ip, uint16_t(*port)}, {{addr("error"), {m.address, why}}});
+        return err(why);
+    };
+    if (m.args.size() > 3) return refused(usage);
     int64_t secs = 10;
-    if (m.args.size() == 2) {
-        auto s = integer(m.args[1]);
-        if (!s || *s < 1 || *s > 60) return err(usage);
+    size_t next = 1;
+    if (m.args.size() > next && !std::holds_alternative<std::string>(m.args[next])) {
+        auto s = integer(m.args[next]);
+        if (!s || *s < 1 || *s > 60) return refused(usage);
         secs = *s;
+        ++next;
     }
+    bool touches = true, status = true, plain = false;
+    std::string what = "all";
+    if (m.args.size() > next) {
+        const std::string* w = std::get_if<std::string>(&m.args[next]);
+        if (!w || m.args.size() > next + 1) return refused(usage);
+        int kinds = 0;
+        std::string word;
+        std::istringstream words(*w);
+        while (words >> word) {
+            if (word == "plain") plain = true;
+            else if (word == "all" || word == "touches" || word == "status") {
+                ++kinds;
+                what = word;
+                touches = word != "status";
+                status = word != "touches";
+            } else {
+                return refused("subscribe: " + (check_text(word, 32).empty() ? "\"" + word + "\"" : std::string("that word")) + " is not one of all, touches, status, plain");
+            }
+        }
+        if (kinds > 1) return refused("subscribe takes one of all, touches and status");
+    }
+    if (plain) what += " plain";
     Nanos now = monotonic_ns();
     expire_leases(now);
     Peer to{peer.ip, uint16_t(*port)};
-    std::vector<osc::Message> ack{{addr("subscribed"), {int32_t(*port), int32_t(secs)}}};
+    std::vector<osc::Message> ack{{addr("subscribed"), {int32_t(*port), int32_t(secs), what}}};
     send_status_changes(false);
-    switch (leases_.subscribe(to, int(secs), now)) {
+    const Lease* before = nullptr;
+    for (const auto& l : leases_.all()) {
+        if (l.peer == to) before = &l;
+    }
+    bool had_status = before && before->status;
+    bool changed = before && (before->touches != touches || before->status != status || before->plain != plain);
+    switch (leases_.subscribe(to, int(secs), now, touches, status, plain)) {
     case Leases::Outcome::renewed:
         TTO_DEBUG("subscriber %s renewed (lease %lld s)", to.text().c_str(), (long long)secs);
         send_to(to, ack);
+        if (changed) {
+            publish_dests();
+            if (status && !had_status) send_full_status(to, plain, false);
+        }
         return {};
     case Leases::Outcome::full:
-        return err("at most " + std::to_string(kMaxLeases) + " subscribers at once (" + prefix_ + "/subscribers lists them): one has to unsubscribe or let its lease run out");
+        return refused("at most " + std::to_string(kMaxLeases) + " subscribers at once (" + prefix_ +
+                       "/subscribers lists them): one has to unsubscribe or let its lease run out");
     case Leases::Outcome::added: break;
     }
     publish_dests();
-    auto full = status_messages();
-    for (const auto& msg : full) last_status_[msg.address] = osc::encode(msg);
     send_to(to, ack);
-    send_bundled(to, full);
-    emit("subscriber", log::Level::notice, "subscriber", to.text() + " added (lease " + std::to_string(secs) + " s)");
+    if (status) send_full_status(to, plain, false);
+    emit("subscriber", log::Level::notice, "subscriber", to.text() + " added (lease " + std::to_string(secs) + " s" + (what == "all" ? "" : ", " + what) + ")");
     return {};
 }
 

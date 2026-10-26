@@ -19,9 +19,10 @@ struct DestinationConfig {
     HostPort address;
     bool touches = true;
     bool status = true;
+    bool plain = false;
 
     bool operator==(const DestinationConfig& o) const {
-        return address.host == o.address.host && address.port == o.address.port && touches == o.touches && status == o.status;
+        return address.host == o.address.host && address.port == o.address.port && touches == o.touches && status == o.status && plain == o.plain;
     }
 };
 
@@ -87,6 +88,9 @@ std::string check_text(const std::string& v, size_t max_len);
 std::string check_ipv4(const std::string& v);
 std::string check_log_level(const std::string& v);
 std::string check_destination(const std::string& v, HostPort& out);
+std::string check_listen(const std::string& v, HostPort& out);
+std::string check_prefix(const std::string& v);
+std::string check_device_id(const std::string& v);
 void set_mirror(DeviceConfig& d, const std::string& m);
 
 }

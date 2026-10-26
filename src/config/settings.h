@@ -29,6 +29,10 @@ struct DeviceOverrides {
 
 struct Overrides {
     std::optional<std::string> log_level;
+    std::optional<HostPort> listen;
+    std::optional<std::string> prefix;
+    std::vector<DeviceConfig> devices_added;
+    std::vector<std::string> devices_removed;
     std::vector<std::string> allowed_added;
     std::vector<std::string> allowed_removed;
     std::vector<DestinationConfig> destinations_added;

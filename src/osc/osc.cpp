@@ -45,9 +45,24 @@ bool get_be32(const uint8_t* d, size_t len, size_t& pos, uint32_t& v) {
 
 bool is_bundle(const uint8_t* d, size_t len) { return len >= 16 && std::memcmp(d, kBundleTag, 8) == 0; }
 
-bool unpack(const uint8_t* d, size_t len, int depth, std::vector<Message>& out) {
+const char* type_name(char t) {
+    switch (t) {
+    case 'b': return "a blob (b)";
+    case 'm': return "a MIDI message (m)";
+    case 'c': return "a character (c)";
+    case 'r': return "a colour (r)";
+    case 't': return "a time tag (t)";
+    case 'S': return "a symbol (S)";
+    case 'N': return "nil (N)";
+    case 'I': return "an impulse (I)";
+    case '[': case ']': return "an array ([ ])";
+    default: return nullptr;
+    }
+}
+
+bool unpack(const uint8_t* d, size_t len, int depth, std::vector<Message>& out, DecodeIssue* issue) {
     if (!is_bundle(d, len)) {
-        auto m = decode(d, len);
+        auto m = decode(d, len, issue);
         if (!m) return false;
         out.push_back(std::move(*m));
         return true;
@@ -58,7 +73,7 @@ bool unpack(const uint8_t* d, size_t len, int depth, std::vector<Message>& out) 
         uint32_t size;
         if (!get_be32(d, len, pos, size)) return false;
         if (size == 0 || size % 4 || size > len - pos) return false;
-        if (!unpack(d + pos, size, depth + 1, out)) return false;
+        if (!unpack(d + pos, size, depth + 1, out, issue)) return false;
         pos += size;
     }
     return true;
@@ -78,7 +93,8 @@ std::vector<uint8_t> encode(const Message& m) {
     std::vector<uint8_t> out;
     put_padded(out, m.address);
     std::string tags = ",";
-    for (const auto& a : m.args) tags += std::holds_alternative<int32_t>(a) ? 'i' : std::holds_alternative<float>(a) ? 'f' : std::holds_alternative<int64_t>(a) ? 'h' : 's';
+    for (const auto& a : m.args)
+        tags += std::holds_alternative<int32_t>(a) ? 'i' : std::holds_alternative<float>(a) ? 'f' : std::holds_alternative<int64_t>(a) ? 'h' : std::holds_alternative<double>(a) ? 'd' : 's';
     put_padded(out, tags);
     for (const auto& a : m.args) {
         if (auto i = std::get_if<int32_t>(&a)) put_be32(out, uint32_t(*i));
@@ -89,6 +105,11 @@ std::vector<uint8_t> encode(const Message& m) {
         } else if (auto h = std::get_if<int64_t>(&a)) {
             put_be32(out, uint32_t(uint64_t(*h) >> 32));
             put_be32(out, uint32_t(uint64_t(*h)));
+        } else if (auto dv = std::get_if<double>(&a)) {
+            uint64_t bits;
+            std::memcpy(&bits, dv, 8);
+            put_be32(out, uint32_t(bits >> 32));
+            put_be32(out, uint32_t(bits));
         } else put_padded(out, std::get<std::string>(a));
     }
     return out;
@@ -106,7 +127,7 @@ std::vector<uint8_t> encode_bundle(const std::vector<Message>& msgs) {
     return out;
 }
 
-std::optional<Message> decode(const uint8_t* d, size_t len) {
+std::optional<Message> decode(const uint8_t* d, size_t len, DecodeIssue* issue) {
     if (len < 8 || len % 4 || len > kMaxPacket) return std::nullopt;
     size_t pos = 0;
     Message m;
@@ -130,6 +151,13 @@ std::optional<Message> decode(const uint8_t* d, size_t len) {
             uint32_t hi, lo;
             if (!get_be32(d, len, pos, hi) || !get_be32(d, len, pos, lo)) return std::nullopt;
             m.args.emplace_back(int64_t((uint64_t(hi) << 32) | lo));
+        } else if (t == 'd') {
+            uint32_t hi, lo;
+            if (!get_be32(d, len, pos, hi) || !get_be32(d, len, pos, lo)) return std::nullopt;
+            uint64_t bits = (uint64_t(hi) << 32) | lo;
+            double v;
+            std::memcpy(&v, &bits, 8);
+            m.args.emplace_back(v);
         } else if (t == 's') {
             std::string s;
             if (!get_padded(d, len, pos, s) || s.size() > 1024) return std::nullopt;
@@ -139,6 +167,11 @@ std::optional<Message> decode(const uint8_t* d, size_t len) {
         } else if (t == 'F') {
             m.args.emplace_back(int32_t(0));
         } else {
+            const char* name = type_name(t);
+            if (issue && name && issue->address.empty()) {
+                issue->address = m.address;
+                issue->what = "argument " + std::to_string(i) + " is " + name + ": commands take numbers (i, h, f, d, T, F) and text (s)";
+            }
             return std::nullopt;
         }
     }
@@ -146,10 +179,10 @@ std::optional<Message> decode(const uint8_t* d, size_t len) {
     return m;
 }
 
-std::optional<std::vector<Message>> decode_packet(const uint8_t* d, size_t len) {
+std::optional<std::vector<Message>> decode_packet(const uint8_t* d, size_t len, DecodeIssue* issue) {
     if (len > kMaxPacket) return std::nullopt;
     std::vector<Message> out;
-    if (!unpack(d, len, 0, out)) return std::nullopt;
+    if (!unpack(d, len, 0, out, issue)) return std::nullopt;
     return out;
 }
 

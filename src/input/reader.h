@@ -7,6 +7,7 @@
 #include "input/mapping.h"
 #include "input/probe.h"
 #include "input/tracker.h"
+#include "osc/osc.h"
 
 #include <linux/input.h>
 #include <mutex>
@@ -58,8 +59,11 @@ private:
     void read_raw();
     int cancel(const char* reason);
     void send(int n, Nanos frame_t);
+    bool encode(osc::Writer& w, int n, int32_t frame, int64_t t_us, bool plain);
     void publish_active();
     void apply_enabled();
+    void apply_mode();
+    void mode_frame(int n);
     bool retry_grab();
     bool foreign_grab();
     void pull_config();
@@ -111,11 +115,13 @@ private:
     bool quiet_check_ = false;
     bool hinted_quiet_ = false;
     bool hinted_aspect_ = false;
+    ReadMode mode_ = ReadMode::touches;
     int32_t quiet_tracking_[kMaxSlots] = {};
     std::string addr_down_, addr_move_, addr_up_, addr_cancel_;
     TouchEvent evs_[kMaxFrameEvents];
     // a full frame of the largest message (64-character prefix, 32-character id, a cancel) fits: 128 x 152 bytes + the header
     uint8_t buf_[32768];
+    uint8_t plain_buf_[32768];
 };
 
 }

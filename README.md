@@ -84,10 +84,12 @@ service.
   config and the saved settings; installing it again later enables and starts it again if
   it was enabled before. `sudo apt purge touch-to-osc` removes the config and the saved
   settings too.
-- **Going back to 0.5.1 or older:** those versions refuse `match_usb`, `match_serial`,
+- **Going back to an older version:** 0.5.1 and older refuse `match_usb`, `match_serial`,
   `match_port` and `[paths] state` in the config (use `usb`, `serial` and `port` and drop
-  `state`), and refuse a settings file written by 0.6.0 (they set it aside and run on the
-  config file).
+  `state`) and a settings file written by 0.6.0 or later; 0.6.0 refuses a destination's
+  `plain` and a settings file that holds a listen address, a prefix or devices added or
+  removed over OSC. A refused settings file is set aside and the daemon runs on the config
+  file.
 
 The service runs as root, which it needs to reset a USB bus (see USB recovery), but systemd
 takes every capability away from it, lets it reach no devices but the input and USB ones,
@@ -111,7 +113,7 @@ program and its unit. To build the package or install from the source tree, see 
   the address `prefix` (`/touch`), and `allowed_ips`, the hosts that may subscribe and
   send commands. Add the receiver's machine there.
 - `[[destination]]` (optional, none by default): receivers that get everything without
-  subscribing.
+  subscribing (`plain = true` for receivers that cannot take 64-bit arguments).
 - `[[device]]`, one per screen: an `id` that becomes part of the addresses, which screen
   it reads (`match_usb` vendor:product, `match_serial`, `match_port`), how its touch panel
   lines up with the screen's display (`rotation`, `mirror`, `calibration`), and the
@@ -137,6 +139,8 @@ which still work:
 | log level | `[log] level` | `log_level` | `log_level` |
 | hosts allowed | `[osc] allowed_ips` | `allowed_ips/add`, `allowed_ips/remove` | `allowed_ips` |
 | receivers without a lease | `[[destination]]` | `saved_destinations/add`, `/remove` | `saved_destinations` |
+| where commands arrive | `[osc] listen`, `prefix` | `listen`, `prefix` (applied by a restart) | `listen`, `prefix` |
+| the devices | `[[device]]` blocks | `devices/add`, `devices/remove` (applied by a restart) | `devices` |
 
 ### Settings changed over OSC
 
@@ -158,6 +162,11 @@ To see and drop them from a shell:
     touch-to-osc --send settings/forget device/face/rotation    one setting
     touch-to-osc --send settings/forget device/face             every saved setting of one device
     touch-to-osc --send settings/forget                         all of them
+
+The listen address, the prefix and the device list can be changed over OSC too
+(`listen`, `prefix`, `devices/add`, `devices/remove`); they are saved like the rest and
+applied by a restart the daemon does itself right after answering, as is forgetting
+them.
 
 Changes are written within about a second; several changes in quick succession are written
 once, and a clean stop writes at once. A settings file the daemon refuses or cannot read
@@ -188,8 +197,17 @@ of them matches several screens. A block whose port has no screen but whose scre
 plugged in elsewhere says where it is ("a 0712:0009 touchscreen is plugged into port 3-4,
 not 3-3").
 
-To see which physical screen is which, run `touch-to-osc-watch` and touch each one in
-turn: every touch names its device. `--list` shows the screens no block reads.
+To see which physical screen is which:
+
+- For the screens the config reads: `touch-to-osc --send identify 30` pauses every
+  screen's touches for 30 s and reports which screen each touch lands on, and
+  `touch-to-osc-watch` prints them (`identified face front 3-3 0.42 0.61`). It ends by
+  itself; `--send identify 0` ends it at once.
+- For screens no block reads: `sudo touch-to-osc --list --touch` waits for a touch on any
+  of them and prints the one touched with a block to paste.
+- `--list` and the status's `unused_screens` list the touchscreens no block reads, and an
+  event says when one is plugged in. `touch-to-osc --send devices/add screen2 0712:0009 3-4`
+  adds a device for one over OSC (the daemon restarts to read it).
 
 ## Lining up the touch panel
 
@@ -210,7 +228,9 @@ IP:9480` if that machine is in `allowed_ips`) and touch each corner of the displ
    90 or 270, then the mirrors.
 
 2. **Calibration** then corrects a panel that is offset or a little too large or small.
-   Readings are clamped to 0..1, which hides errors at the edges, so measure on targets
+   An app can do it for you with guided calibration (see Guided calibration): it pauses the
+   screen's touches, shows targets and has the daemon fit and save the numbers. By hand:
+   readings are clamped to 0..1, which hides errors at the edges, so measure on targets
    about 10% in from them. Remove any calibration first, so the readings are the
    uncorrected ones:
 
@@ -294,6 +314,7 @@ journal (`journalctl -u touch-to-osc`) has the same and more.
     touch-to-osc [--config=FILE]               run (default /etc/touch-to-osc/touch-to-osc.toml)
     touch-to-osc --check-config[=FILE]         check a config and its saved settings, and exit
     touch-to-osc --list [--all] [--config=FILE]  the touchscreens and what the config makes of them
+    touch-to-osc --list --touch[=SECONDS]      wait for a touch on a screen no device reads (30 s)
     touch-to-osc --dump[=ID] [--config=FILE]   one line per touch frame of a configured device
     touch-to-osc --status [--config=FILE]      the running service's health, screens and settings
     touch-to-osc [--config=FILE] --send ADDRESS [VALUE...]   one command to the running service
@@ -331,17 +352,21 @@ the service already runs: stop it first), 4 internal error, 5 (`--check-config`)
 is good but its saved settings are refused, 6 (`--status`, `--send`) no answer, or the
 command was refused.
 
-## OSC interface (osc_api 5)
+## OSC interface (osc_api 6)
 
 All addresses start with the prefix (`/touch` here) and devices appear by their config
-`id` (`face` here). Number arguments in commands may be `i`, `h` or a whole `f`; `T` and `F`
-count as 1 and 0. The daemon always sends the types written below. Strings are ASCII.
+`id` (`face` here). Number arguments in commands may be `i`, `h`, `d` or a whole `f`; `T`
+and `F` count as 1 and 0. A command with an argument of another type (a blob, say) is
+answered with `/touch/error` naming it. The daemon always sends the types written below
+(see Plain types for receivers that cannot take `h`). Strings are ASCII. Everything in
+osc_api 5 is still sent as it was; osc_api 6 only adds addresses and appends arguments,
+so a receiver that ignores what it does not know keeps working.
 
 Commands and subscriptions go to `osc.listen` (UDP 9480 by default). Everything the daemon
 sends comes from other ports of its machine, so a receiver behind a firewall must let in
-UDP from that machine to the receiver's own port. Replies, errors and `pong` go to the IP
-and port the command came from (or the port given to `ping` and `status/send`): a tool has
-to listen on the port it sends from.
+UDP from that machine to the receiver's own port. Replies, errors, `pong` and `here` go to
+the IP and port the command came from (or the port given to `ping`, `hello`, `describe`
+and `status/send`), and also to every port that IP holds a lease on, each port once.
 
 ### Touches
 
@@ -374,31 +399,43 @@ holds one message per contact that changed:
   `silence_ms` with the contact down), `device disabled` (a command), `resync` (the kernel
   dropped events because they were not read in time; the state was read again), `palm`
   (the screen marked the contact as a palm), `reconfigured` (a settings change restarts
-  reading the screen), `stopping` (the daemon is stopping), `restarting` (the daemon is
-  restarting on a command).
+  reading the screen), `identifying` and `calibrating` (touches pause, see Identify screens
+  and Guided calibration), `stopping` (the daemon is stopping), `restarting` (the daemon is
+  restarting on a command or to apply a setting).
 
 From the kernel's frame to the send, the daemon took about 0.1 ms at the median and 0.2 to
-0.35 ms at the 99th percentile on the testing box (an HP t730, replaying a recorded touch,
-over this version's test runs); the status reports each screen's own figure as
-`latency_us`. The screen's scan and the USB
+0.35 ms at the 99th percentile on the testing box (an HP t730, replaying a recorded touch);
+the status reports each screen's own figure as `latency_us`. The screen's scan and the USB
 polling come before the kernel's frame and are not measured here.
 
 ### Liveness
 
-    /touch/subscribe    i port [i seconds]   -> /touch/subscribed   i port  i seconds
+    /touch/hello [i port]                -> /touch/here  s host  s version  i osc_api  i listen_port  i devices  i allowed
+    /touch/subscribe    i port [i seconds] [s what]   -> /touch/subscribed   i port  i seconds  s what
     /touch/unsubscribe  i port               -> /touch/unsubscribed i port
-    /touch/alive        i counter  i run  s version  s health  i devices_connected  i devices_configured  i contacts_active
+    /touch/alive        i counter  i run  s version  s health  i devices_connected  i devices_configured  i contacts_active  i status_gen
     /touch/device/face/active  i frame  i contact ...
     /touch/bye          i run
 
+- `hello` is answered for any host, also when sent as a broadcast, so an app can find
+  touch-to-osc on the network. `allowed` is 1 when the asking host may subscribe and send
+  commands, 0 when it has to be added to `osc.allowed_ips` first. Answers to hosts that are
+  not allowed are capped like refusals (below).
 - A lease is kept per (sender IP, port), 1-60 s, 10 by default, at most 8 at once. Renew
   it every few seconds. A renewal answers only `subscribed`; a new lease gets
   `subscribed`, the full status, then the event "IP:PORT added (lease N s)". Leases are
-  kept over a `restart` (below) but not over a stop.
+  kept over a `restart` (below) but not over a stop. A subscription that is refused is
+  answered on the port it names as well.
+- `what` says what the lease gets: `all` (the default), `touches` (the touches, the alive,
+  the active lists and `bye`) or `status` (the status, the events, the counters, the alive
+  and `bye`), optionally followed by `plain` (see Plain types), as words separated by
+  spaces: "touches plain". A renewal can change it. `/touch/subscribers` lists the leases
+  as before.
 - `alive` goes out every second to every subscriber and saved destination, in one bundle
   with one `active` message per configured device. `active` lists the contacts down on
   that device as of bundle `frame` (no contacts: just the frame). `run` is a random
   non-zero number chosen at each start. `health` is `ok`, `warning` or `fault`.
+  `status_gen` is the number of the last status bundle sent (see Status).
 - `bye` goes out once every contact has been cancelled on a clean stop or a restart.
 
 What a receiver does with these:
@@ -409,17 +446,31 @@ What a receiver does with these:
 3. On each `active` list, end every contact held on that device that is missing from the
    list and whose last message had a frame number not above the list's `frame`. Ignore
    listed contacts it does not hold.
-4. Ignore a `move` or `up` for a contact whose `down` it never saw (it subscribed in the
-   middle of a touch).
+4. Ignore a `move`, `up` or `cancel` for a contact whose `down` it never saw (it subscribed
+   in the middle of a touch).
 5. Never treat a `cancel` as a tap.
+6. Keep the last `status_gen` it got. When a status bundle's `status_gen` is not one more
+   than that, or an alive's is higher, it missed a status bundle: ask for the full status
+   (`status/send`).
+
+### Plain types
+
+A lease subscribed with `plain` (or a `[[destination]]` with `plain = true`) gets no `h`
+arguments, for receivers whose OSC library takes only `i`, `f` and `s`: touches leave out
+`t_us` (`i contact f x f y i frame`, a cancel `i contact s reason i frame`) and `counts`
+carries `i` values (2147483647 at most). Everything else is the same.
 
 ### Status
 
 Sent in full on a new lease, on `status/send` and every 10 s, and each part again as soon
-as it changes. Status messages may arrive one by one or several to a bundle; `health` and
-`reasons` always come together, in one bundle, whenever either changes:
+as it changes. Every status bundle starts with `/touch/status_gen i n`: the bundles sent to
+the status receivers are numbered 1, 2, 3... within a run, and a full status sent to one
+receiver (a new lease, `status/send`) carries the current number without taking a new one.
+All of `health`, `reasons` and every device's `health` and `reasons` come together, in one
+bundle, whenever any of them changes:
 
-    /touch/osc_api                  i 5
+    /touch/status_gen               i
+    /touch/osc_api                  i 6
     /touch/version                  s
     /touch/run                      i
     /touch/health                   s ok|warning|fault
@@ -427,16 +478,23 @@ as it changes. Status messages may arrive one by one or several to a bundle; `he
     /touch/host                     s        the machine's host name
     /touch/config                   s        path of the config file
     /touch/settings_file            s        path of the saved settings, "" when nothing is saved
+    /touch/listen                   s        "ip:port" it takes commands on; settable (restart)
+    /touch/prefix                   s        settable (restart)
     /touch/log_level                s        settable
     /touch/allowed_ips              s ...    hosts allowed to send commands ("any" first with open_to_any)
     /touch/saved_destinations       s ...    "ip:port touches status", "ip:port touches" or "ip:port status"
     /touch/overrides                s ...    the settings that come from the settings file, by name
     /touch/devices                  s id ...
+    /touch/unused_screens           s ...    touchscreens plugged in that no device reads: "port usb name"
+    /touch/identify_s               i        seconds left identifying screens, 0 when off
+    /touch/device/face/health       s ok|warning|fault   this device's part of the health
+    /touch/device/face/reasons      s ...    this device's reasons
     /touch/device/face/label        s        settable
     /touch/device/face/enabled      i 0|1    settable; the applied state
     /touch/device/face/connected    i 0|1
-    /touch/device/face/state        s starting|ok|not connected|disabled|no permission|grab refused|read error|not a touchscreen|restarting
+    /touch/device/face/state        s starting|ok|not connected|disabled|no permission|grab refused|read error|not a touchscreen|restarting|identifying|calibrating
     /touch/device/face/reason       s        what to do about the state
+    /touch/device/face/calibrate_s  i        seconds left in guided calibration, 0 when off
     /touch/device/face/match_usb    s        settable: the "vvvv:pppp" it matches, or ""
     /touch/device/face/match_serial s        settable
     /touch/device/face/match_port   s        settable
@@ -462,7 +520,8 @@ as it changes. Status messages may arrive one by one or several to a bundle; `he
 `starting` lasts from the start until a device's reader has looked for its screen.
 `restarting` lasts from a settings change that reopens the screen (`grab` or a `match_`
 setting) until it has been opened again; then the state is whatever the reopen found. A
-screen that is not connected goes on reading `not connected`.
+screen that is not connected goes on reading `not connected`. `identifying` and
+`calibrating` are read instead of `ok` while those modes run.
 
 With every alive, to the receivers that get status:
 
@@ -470,6 +529,8 @@ With every alive, to the receivers that get status:
     /touch/device/face/contacts     i        down now
     /touch/device/face/oldest_s     f        age of the oldest contact down, -1 when none
     /touch/device/face/last_event_s f        seconds since the screen's last frame, -1 never
+    /touch/device/face/last_loss_s  f        seconds since the screen last dropped out, -1 never
+    /touch/device/face/last_gone_s  f        how long that drop lasted, -1 while it is still gone or never
     /touch/device/face/rate_hz      f        frames per second while touched, last measured
     /touch/device/face/latency_us   i p50  i p99   screen frame to sent, last 10 s
     /touch/device/face/counts       h frames  h touches  h resyncs  h send_drops  h cancels  h losses
@@ -477,26 +538,31 @@ With every alive, to the receivers that get status:
     /touch/destinations             s "ip:port ok|failing" ...
 
 The counts run from the start of the run; `losses` is how many times the screen was
-unplugged, dropped off USB or could not be read.
+unplugged, dropped off USB or could not be read. `losses` rising or `last_loss_s` getting
+smaller says a screen dropped out even when its event was lost, and `last_gone_s` says for
+how long; the `connected` event after a drop says so too ("back after 0.6 s").
 
-`health` says what is true now. It is `fault` when an enabled device is not working (not
-connected, no permission, held by another program, read error, not a touchscreen) or the
-last USB reset failed, and `warning` when a device is turned off by a saved setting or
-restarting after a settings change, when a device matches several screens with no
+`health` says what is true now; each device's `health` and `reasons` are its own part of
+it, and the top-level ones add what is about no device. It is `fault` when an enabled
+device is not working (not connected, no permission, held by another program, read error,
+not a touchscreen) or the last USB reset failed, and `warning` when a device is turned off
+by a saved setting or restarting after a settings change, while screens are identified or
+a screen is calibrated (touches are paused), when a device matches several screens with no
 `match_port` to choose, when in the last minute the kernel dropped events or touch messages
 could not be sent, when sending to a destination fails, when the config file is refused and
-the daemon runs on the copy that last worked, or when the settings file was refused or
-the settings or the state could not be saved. A device turned off in the config file
-counts as nothing. A screen that drops out is a `fault` while it is gone and `ok` again as
-soon as it reads; the drop stays in its event and in `losses`. `reasons` says which, in
-words that say what to do. The heartbeat is the alive's `counter`.
+the daemon runs on the copy that last worked, or when the settings file was refused or the
+settings or the state could not be saved. A device turned off in the config file counts as
+nothing. A screen that drops out is a `fault` while it is gone and `ok` again as soon as it
+reads; the drop stays in its event, in `losses` and in `last_loss_s`. `reasons` says which,
+in words that say what to do. The heartbeat is the alive's `counter`.
 
 ### Events
 
-    /touch/event  s kind  s text  s level
+    /touch/event  s kind  s text  s level  s device
 
 `level` is `notice`, `warning` or `error`: a screen lost is a warning, a screen connected a
-notice, a USB reset that failed an error. Kinds:
+notice, a USB reset that failed an error. `device` is the id of the device it is about, or
+"" when it is about no device. Kinds:
 
 - `device`: connected, lost, released by the kernel, several screens match, restarting
   after a settings change, a screen that reports no size (its aspect is a guess), reading
@@ -507,6 +573,9 @@ notice, a USB reset that failed an error. Kinds:
   moves).
 - `usb`: a USB reset begun, done (with what else it dropped) or failed, a screen back
   after resets, the USB port a screen is on, a port whose state cannot be read.
+- `screens`: a touchscreen that no device reads was plugged in or went away.
+- `identify` (on, off, and each screen touched while on) and `calibrate` (on, off, a fit
+  applied).
 - `restart` (asked for, and by whom), `settings` (a setting changed, with the old and new
   value and who sent it; the settings or the state could not be saved), `subscriber`
   (added, ended), `send` (a destination failing, at most once per 10 s each, with a
@@ -520,17 +589,88 @@ Logging never holds the daemon up: when the journal cannot take a line at once, 
 dropped and counted, and the count is logged as soon as it can be. `log.level = "debug"`
 adds a line for every command and every lease renewal; touches are never logged.
 
+### Identify screens
+
+    /touch/identify  i seconds          1-60 starts it, or extends it; 0 ends it
+
+While it runs no touch goes out from any screen: contacts that are down are cancelled
+`identifying`, each device's state reads `identifying`, the health is `warning` ("touches
+are paused while screens are identified (/touch/identify 0 ends it)") and `identify_s` counts down. Each new
+touch on a screen sends, to the receivers of status,
+
+    /touch/identified  s device  s label  s usb_port  f x  f y
+
+and an `identify` event. It ends by itself when the seconds run out, so an app that is gone
+never leaves the screens dead; an app keeps it on by sending it again. When it ends,
+fingers still down are not announced until they lift. Refused while a screen is
+calibrated.
+
+### Guided calibration
+
+    /touch/device/face/calibrate  i seconds                   1-60 starts it or extends it; 0 ends it
+    /touch/device/face/calibration/fit  f x f y f u f v ...    3 to 16 points
+        -> /touch/device/face/calibration/fitted  f worst  f worst_mm
+
+While a screen is calibrated it sends no touches to anyone (contacts are cancelled
+`calibrating`, its state reads `calibrating`, `calibrate_s` counts down, the health is
+`warning`), and each touch on it sends, to the receivers of status,
+
+    /touch/device/face/calibration/touch  i contact  s phase  f u  f v      phase: down or up
+
+with `u`, `v` where the touch landed after rotation and mirror, before any calibration and
+not clamped. An app shows targets on the display, collects where each one was touched, and
+sends the pairs to `calibration/fit`: `x`, `y` where the target was shown (0..1 of the
+display), `u`, `v` where it was touched. The daemon fits the six calibration numbers by
+least squares, applies them and saves them as the `calibration` setting, and answers with
+the worst miss of the fit (0..1 of the screen, and in mm when the screen reports its size,
+-1 when it does not). Refused: fewer than 3 or more than 16 points, points that all lie on
+one line, and a fit that misses a point by more than 5% of the screen ("the touches do not
+line up with the targets: worst miss 12% of the screen; touch each target as it is shown
+and fit again"). It ends by itself like identify; an app can also send the six numbers to
+`calibration` itself, as before.
+
+### Self-description
+
+    /touch/describe [i port]   -> /touch/describe/item s json ...   then   /touch/describe/done i items
+
+Everything an app can show and change, one JSON object per item, in bundles of about 1200
+bytes, the last one followed by `done` with the number of items. Item keys are stable;
+new ones may be added, so ignore keys you do not know.
+
+    {"kind":"setting","address":"device/face/rotation","device":"face","label":"Rotation","type":"int",
+     "values":[0,90,180,270],"unit":"degrees","value":0,"config":0,"source":"config","effect":"cancels",
+     "help":"Turns touch positions clockwise to match the display."}
+    {"kind":"action","address":"device/face/usb_reset","device":"face","label":"Reset USB","args":[],
+     "confirm":"Every device on USB bus 3 drops for a moment.","help":"..."}
+    {"kind":"device","id":"face","label":"face screen","source":"config"}
+
+- `address` is without the prefix. `type`: `flag` (0 or 1), `int`, `float`, `text`,
+  `floats` (with `count`, or `counts` for the allowed numbers of them), `list` (changed with
+  its `add` and `remove` actions). Allowed values: `values` (exact ones) and `range`
+  [min, max]; with both, either. `value` is the value in effect, `config` the config
+  file's, `source` `config` or `saved`.
+- `effect`: `live` (applies at once), `cancels` (applies at once and cancels that screen's
+  contacts), `reopens` (the screen is opened again: contacts cancelled, state
+  `restarting`), `restart` (touch-to-osc restarts itself to apply it).
+- An action's `confirm` is set when it disrupts something: ask the person first. `args`
+  lists each argument as `{"name":..,"type":..,"range":[..]}`.
+- Ask again after `/touch/devices` or `/touch/overrides` changes.
+
 ### Commands
 
     /touch/request  i seq  s address  ...args   -> /touch/reply  i seq  s ok|refused  s note
 
     /touch/ping [i port]                  -> /touch/pong i run
+    /touch/hello [i port]                 -> /touch/here (Liveness)
     /touch/status/send [i port]           -> the full status and the counters (at most 5 a second)
+    /touch/describe [i port]              -> the self-description
     /touch/subscribe, /touch/unsubscribe  as above
+    /touch/identify i seconds             identify screens (above)
     /touch/restart                        start the daemon again (below)
     /touch/device/face/usb_reset          reset the USB hub the screen's port belongs to now
                                              (see USB recovery); refused when no port is known
                                              or while a reset runs
+    /touch/device/face/calibrate i seconds, /touch/device/face/calibration/fit   (above)
 
 `restart` answers first, then cancels every contact (`restarting`), writes any pending
 settings, sends `bye` and starts the same process again, which reads the config file and
@@ -561,6 +701,10 @@ Settings: each one is changed at the same address the status reports it on, and 
     /touch/allowed_ips/remove        s ip
     /touch/saved_destinations/add    s "ip:port" [i touches  i status]   (both 1 by default)
     /touch/saved_destinations/remove s "ip:port"
+    /touch/devices/add               s id  s match_usb  s match_port      (one of the two may be "")
+    /touch/devices/remove            s id
+    /touch/listen                    s "ip:port"
+    /touch/prefix                    s
     /touch/settings/forget           [s name]   one setting, by its name in /touch/overrides,
                                                 device/<id> for all of one device's, or
                                                 nothing for all of them: back to the config file
@@ -577,10 +721,20 @@ Settings: each one is changed at the same address the status reports it on, and 
   reopen the device: its contacts are cancelled `reconfigured` and its state reads
   `restarting` until it is open again. Either way, fingers still on it are not announced
   until they lift.
+- `devices/add`, `devices/remove`, `listen` and `prefix` are saved and applied by a restart
+  the daemon does itself right after answering, as `restart` above; the reply's note says
+  so, and for `listen` and `prefix` names the new address ("restarting to apply it; then
+  touch-to-osc listens on 0.0.0.0:9481"): an app has to change where it sends. Refused: an
+  id in use, not valid or taken by the daemon's own addresses, a device that would match
+  nothing, removing the last device, a listen address that cannot be used, a prefix that
+  is not valid, and any of them while a USB reset runs. A device added here and later
+  added to the config file under the same id: the config file's wins, with a journal line.
 - A value set back to what the config file says stops being an override, and a command
-  that changes nothing is answered `ok` without being saved or reported.
-- `osc.listen`, `osc.prefix`, `open_to_any` and adding or removing devices stay in the
-  config file; after editing it, `/touch/restart` applies it.
+  that changes nothing is answered `ok` without being saved or reported. `settings/forget`
+  that forgets the listen address, the prefix or added or removed devices restarts the
+  daemon too, as above.
+- `open_to_any` stays in the config file. While a restart is on its way, every further
+  command is refused ("touch-to-osc is restarting").
 
 - Every command can go inside a request and then gets exactly one reply. Replies are kept
   per (IP, port, seq) for 30 s or 64 newer requests: an exact repeat gets the kept reply
@@ -592,7 +746,8 @@ Settings: each one is changed at the same address the status reports it on, and 
   status says it cannot be set.
 - Commands and subscriptions from a host outside `osc.allowed_ips` are answered with
   `/touch/error` saying so and where the allowed hosts come from (at most once per 5 s per
-  host, and at most 20 such answers a second in all) and otherwise ignored.
+  host, and at most 20 such answers a second in all) and otherwise ignored; `hello` is the
+  only command they may send.
 - There is deliberately no command that creates a touch or writes the config file.
 
 ## Watching it

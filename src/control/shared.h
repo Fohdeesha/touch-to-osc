@@ -20,6 +20,7 @@ constexpr size_t kMaxSendTargets = kMaxDestinations + kMaxLeases;
 struct DestSet {
     uint32_t n = 0;
     sockaddr_in addr[kMaxSendTargets] = {};
+    bool plain[kMaxSendTargets] = {};
 };
 
 enum class DevState : uint8_t { starting, ok, not_connected, disabled, no_permission, grab_refused, read_error, not_touchscreen, restarting };
@@ -78,6 +79,16 @@ inline const char* event_kind_name(EventKind k) {
     return "?";
 }
 
+enum class ReadMode : uint8_t { touches, identify, calibrate };
+
+// a touch seen while touches are paused: where it landed, for identify and guided calibration
+struct ModeTouch {
+    int32_t contact = 0;
+    bool down = true;
+    float x = 0, y = 0;
+    float u = 0, v = 0;
+};
+
 struct ReaderEvent {
     EventKind kind = EventKind::device;
     uint8_t level = 6;
@@ -90,6 +101,8 @@ struct DeviceShared {
     TripleBuffer<ActiveSnap> active;
     SpscRing<ReaderEvent, 64> events;
     SpscRing<uint32_t, 2048> latency_us;
+    SpscRing<ModeTouch, 128> mode_touches;
+    std::atomic<uint8_t> mode{0};
     std::atomic<bool> want_enabled{true};
     std::atomic<int32_t> silence_ms{0};
     std::atomic<bool> stop{false};
@@ -107,6 +120,8 @@ struct DeviceShared {
     std::atomic<uint64_t> cancels{0};
     std::atomic<uint64_t> silences{0};
     std::atomic<uint64_t> losses{0};
+    std::atomic<int64_t> last_loss_ns{0};
+    std::atomic<int64_t> last_back_ns{0};
     std::atomic<uint64_t> lost_events{0};
     std::atomic<uint64_t> touched_frames{0};
     std::atomic<int64_t> touched_ns{0};

@@ -234,6 +234,7 @@ void DeviceReader::wait_for_change(int timeout_ms) {
             publish_info();
         }
         apply_enabled();
+        apply_mode();
     }
 }
 
@@ -406,12 +407,40 @@ void DeviceReader::read_raw() {
 }
 
 void DeviceReader::publish_active() {
+    bool paused = mode_ != ReadMode::touches;
     ActiveSnap& s = sh_.active.back();
     s.frame = frame_;
-    s.n = tracker_.active_ids(s.ids);
+    s.n = paused ? 0 : tracker_.active_ids(s.ids);
     sh_.active.publish();
     sh_.contacts.store(s.n, std::memory_order_relaxed);
-    sh_.oldest_down_ns.store(tracker_.oldest_down(), std::memory_order_relaxed);
+    sh_.oldest_down_ns.store(paused ? 0 : tracker_.oldest_down(), std::memory_order_relaxed);
+}
+
+bool DeviceReader::encode(osc::Writer& w, int n, int32_t frame, int64_t t_us, bool plain) {
+    w.begin_bundle();
+    for (int i = 0; i < n; ++i) {
+        const TouchEvent& e = evs_[i];
+        if (e.phase == Phase::cancel) {
+            w.begin_message(addr_cancel_.c_str(), plain ? "isi" : "isih");
+            w.i(e.contact);
+            w.s(e.reason);
+            w.i(frame);
+            if (!plain) w.h(t_us);
+            w.end_message();
+            continue;
+        }
+        float x, y;
+        mapping_.map(e.x, e.y, x, y);
+        const std::string& a = e.phase == Phase::down ? addr_down_ : e.phase == Phase::move ? addr_move_ : addr_up_;
+        w.begin_message(a.c_str(), plain ? "iffi" : "iffih");
+        w.i(e.contact);
+        w.f(x);
+        w.f(y);
+        w.i(frame);
+        if (!plain) w.h(t_us);
+        w.end_message();
+    }
+    return w.ok();
 }
 
 void DeviceReader::send(int n, Nanos frame_t) {
@@ -419,43 +448,26 @@ void DeviceReader::send(int n, Nanos frame_t) {
     int32_t frame = frame_;
     Nanos mono = monotonic_ns();
     int64_t t_us = ((frame_t ? frame_t : mono) + (realtime_ns() - mono)) / kUs;
-    osc::Writer w(buf_, sizeof buf_);
-    w.begin_bundle();
     uint64_t downs = 0, cancels = 0;
     for (int i = 0; i < n; ++i) {
-        const TouchEvent& e = evs_[i];
-        if (e.phase == Phase::cancel) {
-            w.begin_message(addr_cancel_.c_str(), "isih");
-            w.i(e.contact);
-            w.s(e.reason);
-            w.i(frame);
-            w.h(t_us);
-            w.end_message();
-            ++cancels;
-            continue;
-        }
-        float x, y;
-        mapping_.map(e.x, e.y, x, y);
-        const std::string& a = e.phase == Phase::down ? addr_down_ : e.phase == Phase::move ? addr_move_ : addr_up_;
-        w.begin_message(a.c_str(), "iffih");
-        w.i(e.contact);
-        w.f(x);
-        w.f(y);
-        w.i(frame);
-        w.h(t_us);
-        w.end_message();
-        if (e.phase == Phase::down) ++downs;
+        if (evs_[i].phase == Phase::down) ++downs;
+        else if (evs_[i].phase == Phase::cancel) ++cancels;
     }
     if (downs) sh_.touches.fetch_add(downs, std::memory_order_relaxed);
     if (cancels) sh_.cancels.fetch_add(cancels, std::memory_order_relaxed);
-    if (w.ok()) {
-        const DestSet& d = sh_.dests.latest();
-        for (uint32_t i = 0; i < d.n; ++i) {
-            if (sendto(sock_.get(), w.data(), w.size(), MSG_DONTWAIT | MSG_NOSIGNAL, reinterpret_cast<const sockaddr*>(&d.addr[i]), sizeof d.addr[i]) < 0)
-                sh_.send_drops.fetch_add(1, std::memory_order_relaxed);
+    const DestSet& d = sh_.dests.latest();
+    osc::Writer full(buf_, sizeof buf_), plain(plain_buf_, sizeof plain_buf_);
+    bool full_ok = false, plain_ok = false, full_done = false, plain_done = false;
+    for (uint32_t i = 0; i < d.n; ++i) {
+        osc::Writer& w = d.plain[i] ? plain : full;
+        bool& done = d.plain[i] ? plain_done : full_done;
+        bool& ok = d.plain[i] ? plain_ok : full_ok;
+        if (!done) {
+            ok = encode(w, n, frame, t_us, d.plain[i]);
+            done = true;
         }
-    } else {
-        sh_.send_drops.fetch_add(1, std::memory_order_relaxed);
+        if (!ok || sendto(sock_.get(), w.data(), w.size(), MSG_DONTWAIT | MSG_NOSIGNAL, reinterpret_cast<const sockaddr*>(&d.addr[i]), sizeof d.addr[i]) < 0)
+            sh_.send_drops.fetch_add(1, std::memory_order_relaxed);
     }
     if (frame_t) {
         Nanos lat = monotonic_ns() - frame_t;
@@ -465,6 +477,11 @@ void DeviceReader::send(int n, Nanos frame_t) {
 }
 
 int DeviceReader::cancel(const char* reason) {
+    if (mode_ != ReadMode::touches) {
+        tracker_.cancel_all(reason, evs_);
+        publish_active();
+        return 0;
+    }
     int n = tracker_.cancel_all(reason, evs_);
     if (n) send(n, 0);
     else publish_active();
@@ -498,7 +515,43 @@ void DeviceReader::on_frame(const input_event& ev) {
     }
     if (!enabled_) return;
     int n = tracker_.end_frame(evs_, t);
-    if (n) send(n, t);
+    if (mode_ != ReadMode::touches) mode_frame(n);
+    else if (n) send(n, t);
+}
+
+void DeviceReader::mode_frame(int n) {
+    bool any = false;
+    for (int i = 0; i < n; ++i) {
+        const TouchEvent& e = evs_[i];
+        if (e.phase != Phase::down && e.phase != Phase::up) continue;
+        ModeTouch m;
+        m.contact = e.contact;
+        m.down = e.phase == Phase::down;
+        mapping_.map(e.x, e.y, m.x, m.y);
+        mapping_.map_uncalibrated(e.x, e.y, m.u, m.v);
+        any = sh_.mode_touches.push(m) || any;
+    }
+    if (any) notify();
+}
+
+// while touches are paused the contacts seen are never announced, so nothing is ever sent for them; on the way in
+// the announced ones are cancelled, on the way out the fingers still down stay muted until they lift
+void DeviceReader::apply_mode() {
+    ReadMode want = ReadMode(sh_.mode.load());
+    if (want == mode_) return;
+    if (mode_ == ReadMode::touches) {
+        int n = dev_ && enabled_ ? cancel(want == ReadMode::identify ? "identifying" : "calibrating") : 0;
+        (void)n;
+        mode_ = want;
+    } else {
+        mode_ = want;
+        if (want == ReadMode::touches && dev_) {
+            tracker_.reset(tracker_.slots());
+            read_raw();
+            tracker_.mute_down_slots();
+        }
+    }
+    publish_active();
 }
 
 void DeviceReader::on_resync() {
@@ -548,7 +601,7 @@ int DeviceReader::drain() {
 
 bool DeviceReader::silent(Nanos now) const {
     int32_t ms = sh_.silence_ms.load(std::memory_order_relaxed);
-    return enabled_ && ms > 0 && tracker_.announced() > 0 && now - last_frame_ >= Nanos(ms) * kMs;
+    return enabled_ && mode_ == ReadMode::touches && ms > 0 && tracker_.announced() > 0 && now - last_frame_ >= Nanos(ms) * kMs;
 }
 
 void DeviceReader::apply_enabled() {
@@ -625,6 +678,7 @@ void DeviceReader::session() {
     prev_frame_ = 0;
     last_frame_ = monotonic_ns();
     enabled_ = sh_.want_enabled.load();
+    mode_ = ReadMode(sh_.mode.load());
     info_.connected = true;
     info_.slots = slots;
     info_.w_mm = mapping_.width_mm();
@@ -636,8 +690,15 @@ void DeviceReader::session() {
     else
         set_state(DevState::ok, "");
     publish_info();
-    event(EventKind::device, log::Level::notice, "%s connected: %s (usb %s)%s%s, %s%s", cfg_.id.c_str(), info_.name, info_.usb, info_.port[0] ? " on port " : "",
-          info_.port, node_.c_str(), foreign ? ", but another program holds it" : info_.grabbed ? "" : ", not grabbed (grab = false)");
+    Nanos lost_at = sh_.last_loss_ns.load(std::memory_order_relaxed);
+    char gone[48] = "";
+    if (lost_at && lost_at > sh_.last_back_ns.load(std::memory_order_relaxed)) {
+        Nanos back = monotonic_ns();
+        sh_.last_back_ns.store(back, std::memory_order_relaxed);
+        std::snprintf(gone, sizeof gone, ", back after %.1f s", double(back - lost_at) / 1e9);
+    }
+    event(EventKind::device, log::Level::notice, "%s connected: %s (usb %s)%s%s, %s%s%s", cfg_.id.c_str(), info_.name, info_.usb, info_.port[0] ? " on port " : "",
+          info_.port, node_.c_str(), foreign ? ", but another program holds it" : info_.grabbed ? "" : ", not grabbed (grab = false)", gone);
     if (cfg_.aspect == 0 && mapping_.width_mm() == 0 && !hinted_aspect_) {
         hinted_aspect_ = true;
         event(EventKind::device, log::Level::notice,
@@ -650,7 +711,7 @@ void DeviceReader::session() {
         int timeout = -1;
         Nanos now = monotonic_ns();
         int32_t silence = sh_.silence_ms.load(std::memory_order_relaxed);
-        if (enabled_ && silence > 0 && tracker_.announced() > 0) {
+        if (enabled_ && mode_ == ReadMode::touches && silence > 0 && tracker_.announced() > 0) {
             Nanos due = last_frame_ + Nanos(silence) * kMs;
             timeout = int(std::max<Nanos>(0, (due - now + kMs - 1) / kMs));
         }
@@ -661,6 +722,7 @@ void DeviceReader::session() {
             int e = errno;
             int n = cancel("device lost");
             sh_.losses.fetch_add(1, std::memory_order_relaxed);
+            sh_.last_loss_ns.store(monotonic_ns(), std::memory_order_relaxed);
             event(EventKind::device, log::Level::err, "%s lost: waiting for it failed (%s); %d contact%s cancelled", cfg_.id.c_str(), errno_str(e).c_str(), n, plural(n));
             close_device();
             set_state(DevState::read_error, "waiting for " + node_ + " failed: " + errno_str(e));
@@ -678,6 +740,7 @@ void DeviceReader::session() {
             }
             if (sh_.cfg_gen.load() != cfg_gen_ && reconfigure()) return;
             apply_enabled();
+            apply_mode();
         }
         int rc = 0;
         bool readable = r == 0 || (r > 0 && p[0].revents);
@@ -696,6 +759,7 @@ void DeviceReader::session() {
         if (rc < 0) {
             int n = cancel("device lost");
             sh_.losses.fetch_add(1, std::memory_order_relaxed);
+            sh_.last_loss_ns.store(monotonic_ns(), std::memory_order_relaxed);
             if (rc == -ENODEV) {
                 event(EventKind::device, log::Level::warning, "%s lost: unplugged or dropped off USB; %d contact%s cancelled", cfg_.id.c_str(), n, plural(n));
                 close_device();

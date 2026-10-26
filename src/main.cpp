@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <map>
@@ -32,6 +33,7 @@ void usage(FILE* f) {
                  "       touch-to-osc --check-config[=FILE]  check a config file and its saved settings, and exit\n"
                  "       touch-to-osc --list [--all] [--config=FILE]  list the touchscreens (--all: every input device) and\n"
                  "                                           what the config makes of them\n"
+                 "       touch-to-osc --list --touch[=SECONDS]  wait for a touch on a screen no device reads, and name it\n"
                  "       touch-to-osc --dump[=ID] [--config=FILE]  print each touch frame of a configured device\n"
                  "       touch-to-osc --status [--config=FILE]  show the running service's health, screens and settings\n"
                  "       touch-to-osc [--config=FILE] --send ADDRESS [VALUE...]  send it one command, such as\n"
@@ -119,13 +121,14 @@ int run_main(int argc, char** argv) {
         auto eq = s.find('=');
         std::string key = eq == std::string::npos ? s.substr(2) : s.substr(2, eq - 2);
         std::string value = eq == std::string::npos ? std::string() : s.substr(eq + 1);
-        bool takes_value = key == "config" || key == "check-config" || key == "dump";
+        bool takes_value = key == "config" || key == "check-config" || key == "dump" || key == "touch";
         if (eq == std::string::npos && takes_value && i + 1 < argc && std::string(argv[i + 1]).rfind("-", 0) != 0) value = argv[++i];
         opts[key] = value;
     }
     for (const auto& [k, v] : opts) {
         (void)v;
-        if (k != "config" && k != "check-config" && k != "list" && k != "all" && k != "dump" && k != "status" && k != "send" && k != "version" && k != "help") {
+        if (k != "config" && k != "check-config" && k != "list" && k != "all" && k != "touch" && k != "dump" && k != "status" && k != "send" && k != "version" &&
+            k != "help") {
             std::fprintf(stderr, "unknown option --%s\n", k.c_str());
             usage(stderr);
             return 1;
@@ -184,14 +187,24 @@ int run_main(int argc, char** argv) {
     if (opts.count("list")) {
         bool explicit_config = opts.count("config") != 0;
         bool all = opts.count("all") != 0;
-        if (!explicit_config && access(path.c_str(), F_OK) != 0) return tto::list_devices(nullptr, tto::SysPaths(), all);
+        int touch = 0;
+        if (opts.count("touch")) {
+            const std::string& v = opts["touch"];
+            touch = v.empty() ? 30 : std::atoi(v.c_str());
+            if (touch < 1 || touch > 600 || v.find_first_not_of("0123456789") != std::string::npos) {
+                std::fprintf(stderr, "--touch takes the seconds to wait, 1-600 (30 by default)\n");
+                return 1;
+            }
+        }
+        auto list = [&](const tto::Config* c) { return touch ? tto::touch_to_find(c, tto::SysPaths(), touch) : tto::list_devices(c, tto::SysPaths(), all); };
+        if (!explicit_config && access(path.c_str(), F_OK) != 0) return list(nullptr);
         auto cfg = tto::load_config(path);
         if (!cfg) {
             std::fprintf(stderr, "(config not used: %s)\n", cfg.error().c_str());
-            return tto::list_devices(nullptr, tto::SysPaths(), all);
+            return list(nullptr);
         }
         tto::Config effective = tto::apply_overrides(*cfg, tto::load_settings(*cfg, false).overrides);
-        return tto::list_devices(&effective, tto::SysPaths(), all);
+        return list(&effective);
     }
     Loaded l = load(path);
     if (!l.cfg || (opts.count("dump") && !l.refused.empty())) {

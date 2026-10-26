@@ -106,3 +106,51 @@ TEST_CASE("a configured aspect wins over the device's") {
     Mapping m(d, kX, kY);
     CHECK(m.aspect() == doctest::Approx(1.25));
 }
+
+TEST_CASE("a calibration fit recovers the numbers that line the touches up, and refuses points it cannot use") {
+    const double c[6] = {1.05, 0.02, -0.03, -0.01, 0.97, 0.04};
+    std::vector<CalPoint> pts;
+    for (double x : {0.1, 0.5, 0.9}) {
+        for (double y : {0.1, 0.9}) {
+            // where a target shown at x, y was touched, given that the calibration c takes u, v to x, y
+            double det = c[0] * c[4] - c[1] * c[3];
+            double u = ((x - c[2]) * c[4] - (y - c[5]) * c[1]) / det, v = ((y - c[5]) * c[0] - (x - c[2]) * c[3]) / det;
+            pts.push_back({x, y, u, v});
+        }
+    }
+    auto fit = fit_calibration(pts);
+    REQUIRE(fit);
+    REQUIRE(fit->c.size() == 6);
+    for (int i = 0; i < 6; ++i) CHECK(fit->c[size_t(i)] == doctest::Approx(c[i]).epsilon(1e-9));
+    CHECK(fit->worst < 1e-9);
+    pts[2].x += 0.1;
+    auto off = fit_calibration(pts);
+    REQUIRE(off);
+    CHECK(off->worst > 0.04);
+    CHECK(off->worst_at == 2);
+    CHECK_FALSE(fit_calibration({{0.1, 0.1, 0.1, 0.1}, {0.9, 0.9, 0.9, 0.9}}));
+    auto line = fit_calibration({{0.1, 0.1, 0.1, 0.1}, {0.5, 0.5, 0.5, 0.5}, {0.9, 0.9, 0.9, 0.9}});
+    REQUIRE_FALSE(line);
+    CHECK(line.error().find("lie on one line") != std::string::npos);
+    std::vector<CalPoint> many(17, CalPoint{0.5, 0.5, 0.5, 0.5});
+    CHECK_FALSE(fit_calibration(many));
+}
+
+TEST_CASE("positions before calibration are turned and mirrored but neither calibrated nor clamped") {
+    DeviceConfig d = dev(90, "x");
+    d.calibration = {2, 0, 0, 0, 2, 0};
+    Mapping m(d, kX, kY);
+    float u, v, x, y;
+    m.map_uncalibrated(1920, 0, u, v);
+    m.map(1920, 0, x, y);
+    CHECK(u == doctest::Approx(0.0));
+    CHECK(v == doctest::Approx(1.0));
+    m.map_uncalibrated(960, 540, u, v);
+    m.map(960, 540, x, y);
+    CHECK(u == doctest::Approx(0.5));
+    CHECK(x == doctest::Approx(1.0));
+    Mapping wide(dev(0), Axis{0, 1000, 0}, Axis{0, 1000, 0});
+    wide.map_uncalibrated(1500, -500, u, v);
+    CHECK(u == doctest::Approx(1.5));
+    CHECK(v == doctest::Approx(-0.5));
+}

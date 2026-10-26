@@ -21,13 +21,16 @@ struct Peer {
 struct Lease {
     Peer peer;
     Nanos until = 0;
+    bool touches = true;
+    bool status = true;
+    bool plain = false;
 };
 
 class Leases {
 public:
     enum class Outcome { renewed, added, full };
 
-    Outcome subscribe(const Peer& to, int seconds, Nanos now);
+    Outcome subscribe(const Peer& to, int seconds, Nanos now, bool touches = true, bool status = true, bool plain = false);
     bool unsubscribe(const Peer& to);
     std::vector<Peer> expire(Nanos now);
     const std::vector<Lease>& all() const { return leases_; }

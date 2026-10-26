@@ -791,7 +791,7 @@ def status_describes_the_device():
         r = c.receiver()
         connected(r)
         want = {
-            "/touch/osc_api": [5],
+            "/touch/osc_api": [6],
             "/touch/device/t/usb_recovery": [1],
             "/touch/device/t/usb_watched_port": [""],
             "/touch/device/t/usb_port_state": [""],
@@ -834,7 +834,7 @@ def status_describes_the_device():
         log = c.daemons[0].log_text()
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "CMakeLists.txt")) as f:
             version = f.read().split("project(touch-to-osc VERSION ", 1)[1].split()[0]
-        check("touch-to-osc %s (osc_api 5)" % version in log, "banner for %s" % version)
+        check("touch-to-osc %s (osc_api 6)" % version in log, "banner for %s" % version)
 
 
 @test()
@@ -1358,7 +1358,7 @@ def restart_starts_again_with_a_new_run():
         s.touch(0, 2, 20, 20)
         s.frame()
         r.wait("/touch/t/down", since=m2)
-        check(d.log_text().count("(osc_api 5), run") == 2, "expected two start banners in the log")
+        check(d.log_text().count("(osc_api 6), run") == 2, "expected two start banners in the log")
 
 
 @test()
@@ -1399,6 +1399,26 @@ def a_repeated_restart_request_is_answered_without_restarting_again():
         r.none("/touch/bye", during=2.0, since=m)
         check(r.wait("/touch/alive", since=m).args[1] == run2, "the run changed again")
         check(d.log_text().count("(osc_api ") == 2, "expected two start banners in the log")
+    with Ctx("addonce") as c:
+        pa, pb = test_product(), test_product()
+        c.screen(pa)
+        c.screen(pb)
+        d = c.daemon([device(pa)])
+        r = c.receiver()
+        connected(r)
+        run1 = r.wait("/touch/alive", timeout=2.5).args[1]
+        _seq[0] += 1
+        s = _seq[0]
+        m = r.mark()
+        r.send("/touch/request", s, "/touch/devices/add", "b", "7470:%04x" % pb, "")
+        first = r.wait("/touch/reply", lambda x: x.args[0] == s, since=m).args[1:]
+        check(first == ["ok", "restarting to apply it; then touch-to-osc reads b too"], "add %s" % first)
+        run2 = r.wait("/touch/alive", lambda x: x.args[1] != run1, since=m, timeout=6).args[1]
+        m = r.mark()
+        r.send("/touch/request", s, "/touch/devices/add", "b", "7470:%04x" % pb, "")
+        check(r.wait("/touch/reply", lambda x: x.args[0] == s, since=m).args[1:] == first, "the repeated request's reply")
+        r.none("/touch/bye", during=1.5, since=m)
+        check(r.wait("/touch/alive", since=m).args[1] == run2, "the run changed again")
 
 
 @test()
@@ -1922,6 +1942,535 @@ def status_and_send_work_from_the_command_line():
     check(st.returncode == 6 and "no answer from touch-to-osc on 127.0.0.1:%d" % DAEMON_PORT in st.stdout, "nobody: %d %s" % (st.returncode, st.stdout))
 
 
+def raw_receiver(port, host="127.0.0.1"):
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((host, port))
+    s.settimeout(0.2)
+    return s
+
+
+def raw_messages(sock, during):
+    """Every message that arrives within `during` seconds, with its type tags: (address, tags, args)."""
+    import socket
+    import watch
+    out = []
+    end = time.time() + during
+    while time.time() < end:
+        try:
+            data, _ = sock.recvfrom(65536)
+        except socket.timeout:
+            continue
+        for part in split_packet(data):
+            address, pos = watch._string(part, 0)
+            tags, _ = watch._string(part, pos)
+            out.append((address, tags, watch.decode_message(part)[1]))
+    return out
+
+
+def split_packet(data):
+    import struct
+    if not data.startswith(b"#bundle\0"):
+        return [data]
+    out, pos = [], 16
+    while pos < len(data):
+        size = struct.unpack_from(">I", data, pos)[0]
+        out += split_packet(data[pos + 4:pos + 4 + size])
+        pos += 4 + size
+    return out
+
+
+@test()
+def health_is_per_device_and_every_event_names_its_device():
+    with Ctx("devhealth") as c:
+        pa, pb = test_product(), test_product()
+        c.screen(pa)
+        c.daemon([device(pa, id="a"), device(pb, id="b")])
+        r = c.receiver()
+        connected(r, "a")
+        r.wait("/touch/device/b/health", lambda x: x.args == ["fault"], timeout=3)
+        reasons = r.wait("/touch/device/b/reasons", lambda x: x.args and "no input device matches" in x.args[0], timeout=3)
+        r.wait("/touch/device/a/health", lambda x: x.args == ["ok"], timeout=3)
+        r.wait("/touch/device/a/reasons", lambda x: x.args == [], timeout=3)
+        r.wait("/touch/health", lambda x: x.args == ["fault"], timeout=3)
+        sub = r.wait("/touch/event", lambda x: x.args[0] == "subscriber", timeout=2)
+        check(sub.args[3] == "", "a subscriber event names a device: %s" % sub.args)
+        m = r.mark()
+        c.screen(pb)
+        back = r.wait("/touch/event", lambda x: x.args[0] == "device" and " connected: " in x.args[1], since=m, timeout=4)
+        check(back.args[2:] == ["notice", "b"], "the event %s" % back.args)
+        ok = r.wait("/touch/device/b/health", lambda x: x.args == ["ok"], since=m, timeout=3)
+        same = [x.address for x in r.all(m) if x.bundle == ok.bundle]
+        for want in ("/touch/health", "/touch/reasons", "/touch/device/a/health", "/touch/device/a/reasons", "/touch/device/b/reasons"):
+            check(want in same, "%s not in the bundle of device/b/health: %s" % (want, same))
+        check(same[0] == "/touch/status_gen", "the bundle does not start with its number: %s" % same)
+        r.wait("/touch/health", lambda x: x.args == ["ok"], since=m, timeout=3)
+        check(reasons.args[0].startswith("b: "), "device reasons %s" % reasons.args)
+
+
+@test()
+def last_loss_and_losses_say_a_screen_dropped_out():
+    with Ctx("lastloss") as c:
+        p = test_product()
+        s = c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        r.wait("/touch/device/t/last_loss_s", lambda x: x.args == [-1.0], timeout=2.5)
+        r.wait("/touch/device/t/last_gone_s", lambda x: x.args == [-1.0], timeout=2.5)
+        m = r.mark()
+        s.destroy()
+        connected(r, value=0, since=m)
+        gone = r.wait("/touch/device/t/last_loss_s", lambda x: x.args[0] >= 0, since=m, timeout=2.5)
+        check(r.all(m, "/touch/device/t/last_gone_s", lambda x: x.bundle == gone.bundle)[0].args == [-1.0], "last_gone_s while the screen is gone")
+        time.sleep(0.8)
+        c.screen(p)
+        connected(r, since=m, timeout=4)
+        back = r.wait("/touch/event", lambda x: x.args[0] == "device" and " connected: " in x.args[1], since=m, timeout=3)
+        check(", back after " in back.args[1], "the connected event says how long it was gone: %s" % back.args[1])
+        lasted = r.wait("/touch/device/t/last_gone_s", lambda x: x.args[0] > 0, since=m, timeout=2.5).args[0]
+        check(0.8 <= lasted < 4, "last_gone_s %s" % lasted)
+        got = r.wait("/touch/device/t/last_loss_s", lambda x: 0 <= x.args[0] < 3, since=m, timeout=2.5)
+        later = r.wait("/touch/device/t/last_loss_s", lambda x: x.at > got.at + 1.5, since=m, timeout=3)
+        check(later.args[0] > got.args[0], "last_loss_s does not grow: %s then %s" % (got.args, later.args))
+        r.wait("/touch/device/t/counts", lambda x: x.args[5] == 1, since=m, timeout=2.5)
+
+
+@test()
+def status_bundles_are_numbered_and_the_alive_carries_the_number():
+    with Ctx("statusgen") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        time.sleep(1.2)
+        m = r.mark()
+        for k in range(4):
+            check(req(r, "/touch/device/t/label", "label %d" % k) == ["ok", ""], "label %d" % k)
+            r.wait("/touch/device/t/label", lambda x: x.args == ["label %d" % k], since=m)
+        gens = [x.args[0] for x in r.all(m, "/touch/status_gen")]
+        check(len(gens) >= 4 and all(b == a + 1 for a, b in zip(gens, gens[1:])), "status bundles are not numbered one by one: %s" % gens)
+        for g in r.all(m, "/touch/status_gen"):
+            first = [x for x in r.all(0) if x.bundle == g.bundle][0]
+            check(first.address == "/touch/status_gen", "a status bundle starts with %s" % first.address)
+        alive = r.wait("/touch/alive", lambda x: x.at > r.all(m, "/touch/status_gen")[-1].at, since=m, timeout=2.5)
+        latest = [x.args[0] for x in r.all(m, "/touch/status_gen") if x.at <= alive.at][-1]
+        check(len(alive.args) == 8 and alive.args[7] == latest, "the alive carries %s, the last status bundle was %d" % (alive.args, latest))
+        m2 = r.mark()
+        r.send("/touch/status/send")
+        full = r.wait("/touch/osc_api", since=m2)
+        full_gen = [x.args[0] for x in r.all(m2, "/touch/status_gen") if x.bundle == full.bundle]
+        before = [x.args[0] for x in r.all(m, "/touch/status_gen") if x.at < full.at and x.bundle != full.bundle][-1]
+        check(full_gen and full_gen[0] == before, "a full status to one receiver took a new number: %s after %d" % (full_gen, before))
+        m3 = r.mark()
+        check(req(r, "/touch/device/t/label", "after") == ["ok", ""], "label after")
+        nxt = r.wait("/touch/status_gen", lambda x: x.args[0] > before, since=m3)
+        check(nxt.args[0] == before + 1, "the next change bundle is %d after %d" % (nxt.args[0], before))
+
+
+@test()
+def answers_reach_the_asking_hosts_lease_ports_too():
+    with Ctx("leaseanswers") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        other = c.receiver(subscribe=False)
+        m, mo = r.mark(), other.mark()
+        other.send("/touch/request", 41, "/touch/device/t/label", "from another port")
+        other.wait("/touch/reply", lambda x: x.args[0] == 41, since=mo)
+        r.wait("/touch/reply", lambda x: x.args[0] == 41, since=m)
+        other.send("/touch/ping")
+        other.wait("/touch/pong", since=mo)
+        r.wait("/touch/pong", since=m)
+        named = c.receiver(subscribe=False)
+        mn = named.mark()
+        other.send("/touch/subscribe", named.port, 99)
+        named.wait("/touch/error", lambda x: x.args[0] == "/touch/subscribe" and "1-60 seconds" in x.args[1], since=mn)
+        other.wait("/touch/error", lambda x: x.args[0] == "/touch/subscribe", since=mo)
+        check(len(r.all(m, "/touch/reply", lambda x: x.args[0] == 41)) == 1, "the lease port got the reply twice")
+
+
+@test()
+def a_subscription_can_ask_for_touches_status_or_plain_types():
+    with Ctx("subwhat") as c:
+        p = test_product()
+        s = c.screen(p)
+        c.daemon([device(p)])
+        t = c.receiver(subscribe=False)
+        t.send("/touch/subscribe", t.port, 10, "touches")
+        check(t.wait("/touch/subscribed").args == [t.port, 10, "touches"], "subscribed touches")
+        st = c.receiver(subscribe=False)
+        st.send("/touch/subscribe", st.port, 10, "status")
+        check(st.wait("/touch/subscribed").args == [st.port, 10, "status"], "subscribed status")
+        plain = raw_receiver(c.next_port)
+        c.next_port += 1
+        import watch
+        plain.sendto(watch.encode("/touch/subscribe", plain.getsockname()[1], 10, "all plain"), ("127.0.0.1", DAEMON_PORT))
+        connected(st)
+        t.wait("/touch/alive", timeout=2.5)
+        m_t, m_s = t.mark(), st.mark()
+        s.touch(0, 1, 100, 100)
+        s.frame()
+        s.lift(0)
+        s.frame()
+        t.wait("/touch/t/up", since=m_t)
+        msgs = raw_messages(plain, 2.5)
+        st.none("/touch/t/down", during=0.3, since=m_s)
+        check(not t.all(0, "/touch/health") and not t.all(0, "/touch/event"), "a touches lease got status or events")
+        st.wait("/touch/health", timeout=1)
+        sub = [x for x in msgs if x[0] == "/touch/subscribed"]
+        check(sub and sub[0][2] == [plain.getsockname()[1], 10, "all plain"], "subscribed plain %s" % sub)
+        downs = [x for x in msgs if x[0] == "/touch/t/down"]
+        check(downs and downs[0][1] == ",iffi", "a plain down %s" % downs)
+        counts = [x for x in msgs if x[0] == "/touch/device/t/counts"]
+        check(counts and counts[0][1] == ",iiiiii", "plain counts %s" % counts[:1])
+        check(not any("h" in x[1] for x in msgs), "a plain lease got an h argument: %s" % [x[:2] for x in msgs if "h" in x[1]][:3])
+        bad = c.receiver(subscribe=False)
+        bad.send("/touch/subscribe", bad.port, 10, "everything")
+        check("is not one of all, touches, status, plain" in bad.wait("/touch/error").args[1], "a bad what")
+        plain.close()
+
+
+@test()
+def doubles_work_and_other_argument_types_are_answered():
+    with Ctx("types") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        m = r.mark()
+        r.send("/touch/request", ("d", 7.0), "/touch/device/t/rotation", ("d", 90.0))
+        check(r.wait("/touch/reply", lambda x: x.args[0] == 7, since=m).args == [7, "ok", ""], "doubles")
+        r.wait("/touch/device/t/rotation", lambda x: x.args == [90], since=m)
+        r.send("/touch/device/t/label", ("b", b"\x01\x02\x03"))
+        e = r.wait("/touch/error", since=m)
+        check(e.args == ["/touch/device/t/label", "argument 1 is a blob (b): commands take numbers (i, h, f, d, T, F) and text (s)"], "blob %s" % e.args)
+
+
+@test()
+def hello_is_answered_for_any_host():
+    with Ctx("hello") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p)])
+        r = c.receiver(subscribe=False)
+        r.send("/touch/hello")
+        here = r.wait("/touch/here")
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "CMakeLists.txt")) as f:
+            version = f.read().split("project(touch-to-osc VERSION ", 1)[1].split()[0]
+        check(here.args[0] and here.args[1:] == [version, 6, DAEMON_PORT, 1, 1], "here %s" % here.args)
+        out = raw_receiver(c.next_port, "127.0.0.2")
+        import watch
+        out.sendto(watch.encode("/touch/hello"), ("127.0.0.1", DAEMON_PORT))
+        got = raw_messages(out, 1.0)
+        check([x[2][2:] for x in got if x[0] == "/touch/here"] == [[6, DAEMON_PORT, 1, 0]], "here for an outsider %s" % got)
+        out.sendto(watch.encode("/touch/ping"), ("127.0.0.1", DAEMON_PORT))
+        got = raw_messages(out, 1.0)
+        check([x[0] for x in got] == ["/touch/error"] and "may not send commands here" in got[0][2][1], "an outsider's ping %s" % got)
+        out.close()
+
+
+@test()
+def identify_pauses_touches_reports_each_screen_touched_and_ends_by_itself():
+    with Ctx("identify") as c:
+        p = test_product()
+        s = c.screen(p)
+        c.daemon([device(p, label="front")])
+        r = c.receiver()
+        connected(r)
+        m0 = r.mark()
+        s.touch(0, 1, 960, 540)
+        s.frame()
+        held = r.wait("/touch/t/down", since=m0).args[0]
+        m = r.mark()
+        check(req(r, "/touch/identify", 5) == ["ok", ""], "identify on")
+        cancel = r.wait("/touch/t/cancel", since=m)
+        check(cancel.args[:2] == [held, "identifying"], "cancel %s" % cancel.args)
+        r.wait("/touch/device/t/state", lambda x: x.args == ["identifying"], since=m)
+        r.wait("/touch/identify_s", lambda x: 0 < x.args[0] <= 5, since=m)
+        r.wait("/touch/reasons", lambda x: any("touches are paused while screens are identified" in a for a in x.args), since=m)
+        on = r.wait("/touch/event", lambda x: x.args[0] == "identify" and "for 5 s" in x.args[1], since=m)
+        check(on.args[3] == "", "identify on names a device: %s" % on.args)
+        s.lift(0)
+        s.frame()
+        s.touch(0, 2, 480, 270)
+        s.frame()
+        got = r.wait("/touch/identified", since=m)
+        check(got.args[:3] == ["t", "front", ""] and abs(got.args[3] - 0.25) < 0.01 and abs(got.args[4] - 0.25) < 0.01, "identified %s" % got.args)
+        ev = r.wait("/touch/event", lambda x: x.args[0] == "identify" and "was touched at 0.25, 0.25" in x.args[1], since=m)
+        check(ev.args[3] == "t", "the touch event %s" % ev.args)
+        ma = r.mark()
+        active = r.wait("/touch/device/t/active", since=ma, timeout=2.5)
+        check(active.args[1:] == [], "the active list while identifying %s" % active.args)
+        check(not r.all(m, "/touch/t/down"), "a touch went out while identifying")
+        md = r.mark()
+        check(req(r, "/touch/device/t/enabled", 0) == ["ok", ""], "off while identifying")
+        r.wait("/touch/device/t/enabled", lambda x: x.args == [0], since=md)
+        check(req(r, "/touch/device/t/enabled", 1) == ["ok", ""], "back on")
+        r.none("/touch/t/cancel", during=0.3, since=md)
+        m2 = r.mark()
+        check(req(r, "/touch/identify", 0) == ["ok", ""], "identify off")
+        r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m2)
+        r.wait("/touch/identify_s", lambda x: x.args == [0], since=m2)
+        s.touch(0, 2, 500, 300)
+        s.frame()
+        r.none("/touch/t/down", during=0.3, since=m2)
+        s.lift(0)
+        s.frame()
+        s.touch(0, 3, 100, 100)
+        s.frame()
+        r.wait("/touch/t/down", since=m2)
+        s.lift(0)
+        s.frame()
+        r.wait("/touch/t/up", since=m2)
+        contact_story(r.all(0))
+        m3 = r.mark()
+        check(req(r, "/touch/identify", 1) == ["ok", ""], "identify for 1 s")
+        r.wait("/touch/event", lambda x: x.args[0] == "identify" and "its time ran out" in x.args[1], since=m3, timeout=2.5)
+        r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m3, timeout=1)
+        s.touch(0, 4, 100, 100)
+        s.frame()
+        r.wait("/touch/t/down", since=m3)
+        check(req(r, "/touch/identify", 61)[0] == "refused", "61 s")
+
+
+@test()
+def guided_calibration_reports_raw_touches_and_a_fit_applies_and_saves_the_numbers():
+    with Ctx("calibrate") as c:
+        p = test_product()
+        s = c.screen(p)
+        d = c.daemon([device(p, calibration=[1, 0, 0.1, 0, 1, 0])])
+        r = c.receiver()
+        connected(r)
+        m = r.mark()
+        check(req(r, "/touch/device/t/calibrate", 10) == ["ok", ""], "calibrate on")
+        r.wait("/touch/device/t/state", lambda x: x.args == ["calibrating"], since=m)
+        r.wait("/touch/device/t/health", lambda x: x.args == ["warning"], since=m)
+        r.wait("/touch/device/t/calibrate_s", lambda x: 0 < x.args[0] <= 10, since=m)
+        check(req(r, "/touch/identify", 5)[0] == "refused", "identify while calibrating")
+        targets = [(0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9)]
+        points = []
+        for k, (x, y) in enumerate(targets):
+            # the panel is offset: each target is touched 0.02 to the right of where it is shown
+            s.touch(0, 10 + k, int((x + 0.02) * 1920), int(y * 1080))
+            s.frame()
+            found = r.wait("/touch/device/t/calibration/touch", lambda m_: m_.args[1] == "down", since=m, count=k + 1)
+            got = found[-1] if k else found
+            s.lift(0)
+            s.frame()
+            points += [x, y, got.args[2], got.args[3]]
+        ups = r.wait("/touch/device/t/calibration/touch", lambda m_: m_.args[1] == "up", since=m, count=4)
+        check(len(ups) == 4, "the lifts")
+        downs = r.all(m, "/touch/device/t/calibration/touch", lambda m_: m_.args[1] == "down")
+        check(abs(downs[0].args[2] - 0.12) < 0.002, "u is not the uncalibrated position: %s" % downs[0].args)
+        check(not r.all(m, "/touch/t/down"), "a touch went out while calibrating")
+        m2 = r.mark()
+        got = req(r, "/touch/device/t/calibration/fit", *points)
+        check(got[0] == "ok" and got[1].startswith("fitted from 4 points: worst miss 0.0% of the screen ("), "fit %s" % got)
+        fitted = r.wait("/touch/device/t/calibration/fitted", since=m2)
+        check(fitted.args[0] < 0.001 and fitted.args[1] >= 0, "fitted %s" % fitted.args)
+        cal = r.wait("/touch/device/t/calibration", since=m2).args
+        check(abs(cal[0] - 1) < 0.01 and abs(cal[2] + 0.02) < 0.002, "the calibration %s" % cal)
+        r.wait("/touch/event", lambda x: x.args[0] == "calibrate" and "fitted from 4 points" in x.args[1] and x.args[3] == "t", since=m2)
+        r.wait("/touch/overrides", lambda x: "device/t/calibration" in x.args, since=m2)
+        check(req(r, "/touch/device/t/calibrate", 0) == ["ok", ""], "calibrate off")
+        r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m2)
+        m3 = r.mark()
+        s.touch(0, 30, int(0.52 * 1920), 540)
+        s.frame()
+        down = r.wait("/touch/t/down", since=m3)
+        check(abs(down.args[1] - 0.5) < 0.005, "a touch after the fit lands at %s" % down.args)
+        s.lift(0)
+        s.frame()
+        refused = [
+            ((0.1, 0.1, 0.1, 0.1, 0.9, 0.9, 0.9, 0.9), "takes 3 to 16 points"),
+            ((0.1, 0.1, 0.1, 0.1, 0.5, 0.5, 0.5, 0.5, 0.9, 0.9, 0.9, 0.9), "lie on one line"),
+            ((0.1, 0.1, 0.1, 0.1, 0.9, 0.1, 0.9, 0.1, 0.1, 0.9, 0.1, 0.9, 0.9, 0.9, 0.5, 0.5), "worst miss"),
+            ((1.5, 0.1, 0.1, 0.1, 0.9, 0.1, 0.9, 0.1, 0.1, 0.9, 0.1, 0.9), "0..1 of the display"),
+        ]
+        for args, why in refused:
+            got = req(r, "/touch/device/t/calibration/fit", *args)
+            check(got[0] == "refused" and why in got[1], "%s: %s" % (why, got))
+        contact_story(r.all(0))
+    with open(d.settings) as f:
+        check("calibration" in f.read(), "the fitted calibration was not saved")
+
+
+def description(r, since=None):
+    import json
+    m = r.mark() if since is None else since
+    r.send("/touch/describe")
+    done = r.wait("/touch/describe/done", since=m, timeout=3)
+    items = [json.loads(x.args[0]) for x in r.all(m, "/touch/describe/item")]
+    check(len(items) == done.args[0], "describe sent %d items and said %d" % (len(items), done.args[0]))
+    return {(i.get("kind"), i.get("address", i.get("id"))): i for i in items}
+
+
+@test()
+def describe_lists_every_setting_action_and_device_with_its_values():
+    with Ctx("describe") as c:
+        p = test_product()
+        c.screen(p)
+        c.daemon([device(p, label="front")])
+        r = c.receiver()
+        connected(r)
+        d = description(r)
+        rot = d[("setting", "device/t/rotation")]
+        check(rot["type"] == "int" and rot["values"] == [0, 90, 180, 270] and rot["value"] == 0 and rot["config"] == 0 and rot["source"] == "config" and
+              rot["effect"] == "cancels" and rot["device"] == "t", "rotation %s" % rot)
+        check(d[("device", "t")]["label"] == "front", "device %s" % d[("device", "t")])
+        check(d[("action", "device/t/usb_reset")]["confirm"].startswith("Every device on"), "usb_reset %s" % d[("action", "device/t/usb_reset")])
+        check(d[("action", "identify")]["args"] == [{"name": "seconds", "type": "int", "range": [0, 60]}], "identify %s" % d[("action", "identify")])
+        for key in [("setting", "device/t/%s" % k) for k in ("label", "enabled", "mirror", "calibration", "aspect", "silence_ms", "grab", "match_usb",
+                                                                   "match_serial", "match_port", "usb_recovery")] + \
+                   [("setting", k) for k in ("log_level", "allowed_ips", "saved_destinations", "listen", "prefix")] + \
+                   [("action", k) for k in ("restart", "devices/add", "devices/remove", "settings/forget", "device/t/calibrate", "device/t/calibration/fit")]:
+            check(key in d, "describe misses %s" % (key,))
+        check(d[("setting", "listen")]["effect"] == "restart" and d[("setting", "listen")]["value"] == "127.0.0.1:%d" % DAEMON_PORT, "listen %s" % d[("setting", "listen")])
+        check(req(r, "/touch/device/t/rotation", 90) == ["ok", ""], "rotation 90")
+        time.sleep(0.6)
+        d = description(r)
+        rot = d[("setting", "device/t/rotation")]
+        check(rot["value"] == 90 and rot["config"] == 0 and rot["source"] == "saved", "rotation after a change %s" % rot)
+        m = r.mark()
+        r.send("/touch/describe")
+        r.send("/touch/describe")
+        r.wait("/touch/error", lambda x: "at most 2 descriptions a second" in x.args[1], since=m)
+
+
+@test()
+def devices_added_and_removed_over_osc_are_saved_and_applied_by_a_restart():
+    with Ctx("devadd") as c:
+        pa, pb = test_product(), test_product()
+        c.screen(pa)
+        d = c.daemon([device(pa)])
+        r = c.receiver()
+        connected(r)
+        m = r.mark()
+        sb = c.screen(pb)
+        ours = lambda args: [a for a in args if " 7470:" in a]
+        unused = r.wait("/touch/unused_screens", lambda x: any("7470:%04x" % pb in a for a in x.args), since=m, timeout=8)
+        check(len(ours(unused.args)) == 1, "unused %s" % unused.args)
+        r.wait("/touch/event", lambda x: x.args[0] == "screens" and "7470:%04x" % pb in x.args[1] and "devices/add" in x.args[1], since=m, timeout=2)
+        for args, why in [(("t", "7470:%04x" % pb, ""), "there is a device t already"), (("B", "7470:%04x" % pb, ""), "the id may only use"),
+                          (("device", "7470:%04x" % pb, ""), "is a name touch-to-osc uses"), (("b", "", ""), "would match nothing"),
+                          (("b", "zz", ""), "match_usb must be")]:
+            got = req(r, "/touch/devices/add", *args)
+            check(got[0] == "refused" and why in got[1], "%s: %s" % (args, got))
+        run1 = r.wait("/touch/alive", timeout=2.5).args[1]
+        m = r.mark()
+        import watch
+        r.sock.sendto(watch.encode_bundle([watch.encode("/touch/request", 901, "/touch/devices/add", "b", "7470:%04x" % pb, ""),
+                                           watch.encode("/touch/device/t/rotation", 90)]), ("127.0.0.1", DAEMON_PORT))
+        got = r.wait("/touch/reply", lambda x: x.args[0] == 901, since=m).args[1:]
+        check(got == ["ok", "restarting to apply it; then touch-to-osc reads b too"], "add %s" % got)
+        late = r.wait("/touch/error", lambda x: x.args[0] == "/touch/device/t/rotation", since=m)
+        check("touch-to-osc is restarting" in late.args[1], "a command after it in the bundle: %s" % late.args)
+        r.wait("/touch/bye", since=m)
+        r.wait("/touch/alive", lambda x: x.args[1] != run1, since=m, timeout=5)
+        r.wait("/touch/devices", lambda x: x.args == ["t", "b"], since=m, timeout=3)
+        connected(r, "b", since=m, timeout=4)
+        r.wait("/touch/overrides", lambda x: "devices" in x.args, since=m, timeout=3)
+        with open(d.settings) as f:
+            check("devices_added" in f.read(), "the added device was not saved")
+        r.wait("/touch/unused_screens", lambda x: ours(x.args) == [], since=m, timeout=8)
+        check(req(r, "/touch/device/b/label", "the second") == ["ok", ""], "a setting on the added device")
+        run2 = r.wait("/touch/alive", timeout=2.5).args[1]
+        m = r.mark()
+        got = req(r, "/touch/devices/remove", "b")
+        check(got == ["ok", "restarting to apply it; then touch-to-osc no longer reads b"], "remove %s" % got)
+        r.wait("/touch/alive", lambda x: x.args[1] != run2, since=m, timeout=5)
+        r.wait("/touch/devices", lambda x: x.args == ["t"], since=m, timeout=3)
+        r.wait("/touch/unused_screens", lambda x: len(ours(x.args)) == 1, since=m, timeout=8)
+        got = req(r, "/touch/devices/remove", "t")
+        check(got[0] == "refused" and "the only device" in got[1], "remove the last %s" % got)
+        got = req(r, "/touch/devices/remove", "zz")
+        check(got[0] == "refused" and "no device zz" in got[1], "remove a missing one %s" % got)
+        m = r.mark()
+        sb.destroy()
+        r.wait("/touch/event", lambda x: x.args[0] == "screens" and "went away" in x.args[1], since=m, timeout=8)
+        check(d.log_text().count("(osc_api 6), run") == 3, "expected three runs")
+
+
+@test()
+def listen_and_prefix_changed_over_osc_move_the_daemon_after_its_restart():
+    import socket
+    with Ctx("listen") as c:
+        p = test_product()
+        c.screen(p)
+        d = c.daemon([device(p)])
+        r = c.receiver()
+        connected(r)
+        busy = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        busy.bind(("127.0.0.1", DAEMON_PORT + 9))
+        try:
+            got = req(r, "/touch/listen", "127.0.0.1:%d" % (DAEMON_PORT + 9))
+            check(got[0] == "refused" and "cannot be used" in got[1], "a busy port %s" % got)
+        finally:
+            busy.close()
+        check(req(r, "/touch/listen", "nowhere")[0] == "refused", "a bad address")
+        run1 = r.wait("/touch/alive", timeout=2.5).args[1]
+        m = r.mark()
+        got = req(r, "/touch/listen", "127.0.0.1:%d" % (DAEMON_PORT + 8))
+        check(got == ["ok", "restarting to apply it; then touch-to-osc listens on 127.0.0.1:%d: send commands there" % (DAEMON_PORT + 8)], "listen %s" % got)
+        r.wait("/touch/alive", lambda x: x.args[1] != run1, since=m, timeout=5)
+        r.target = ("127.0.0.1", DAEMON_PORT + 8)
+        m = r.mark()
+        r.send("/touch/ping")
+        r.wait("/touch/pong", since=m)
+        r.wait("/touch/listen", lambda x: x.args == ["127.0.0.1:%d" % (DAEMON_PORT + 8)], timeout=3)
+        run2 = r.wait("/touch/alive", timeout=2.5).args[1]
+        m = r.mark()
+        got = req(r, "/touch/prefix", "/t2")
+        check(got == ["ok", "restarting to apply it; then every address starts with /t2"], "prefix %s" % got)
+        r.wait("/t2/alive", lambda x: x.args[1] != run2, since=m, timeout=5)
+        r.prefix = "/t2"
+        m = r.mark()
+        r.send("/t2/ping")
+        r.wait("/t2/pong", since=m)
+        _seq[0] += 1
+        s = _seq[0]
+        m = r.mark()
+        r.send("/t2/request", s, "/t2/settings/forget")
+        reply = r.wait("/t2/reply", lambda x: x.args[0] == s, since=m)
+        check(reply.args[1] == "ok", "forget %s" % reply.args)
+        r.prefix = "/touch"
+        r.target = ("127.0.0.1", DAEMON_PORT)
+        r.wait("/touch/alive", since=m, timeout=6)
+        connected(r, since=m, timeout=4)
+
+
+@test()
+def list_touch_names_the_unread_screen_that_was_touched():
+    with Ctx("listtouch") as c:
+        pa, pb = test_product(), test_product()
+        pid = os.getpid()
+        a = c.screen(pa, phys="tto-ta-%d" % pid)
+        b = c.screen(pb, phys="tto-tb-%d" % pid)
+        cfg = os.path.join(RUN_DIR, "listtouch.toml")
+        with open(cfg, "w") as f:
+            f.write('[osc]\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = ""\nstate = ""\n[[device]]\nid = "t"\nusb = "%04x:%04x"\n' % (TEST_VENDOR, pa))
+        time.sleep(0.3)
+        proc = subprocess.Popen([os.path.join(BUILD, "touch-to-osc"), "--list", "--touch", "8", "--config=" + cfg], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, universal_newlines=True)
+        time.sleep(1.0)
+        a.touch(0, 1, 100, 100)
+        a.frame()
+        time.sleep(0.3)
+        b.touch(0, 1, 100, 100)
+        b.frame()
+        out, _ = proc.communicate(timeout=12)
+        check(proc.returncode == 0 and "touched: " in out and "tto-tb-%d" % pid in out and 'match_usb = "%04x:%04x"' % (TEST_VENDOR, pb) in out and
+              "tto-ta-%d" % pid not in out.split("touched: ", 1)[1], "--list --touch: %d %s" % (proc.returncode, out))
+        quiet = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--list", "--touch=1", "--config=" + cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True, timeout=10)
+        check(quiet.returncode == 1 and "nothing was touched in 1 s" in quiet.stdout, "nothing touched: %d %s" % (quiet.returncode, quiet.stdout))
+
+
 @test()
 def a_journal_stream_variable_alone_does_not_change_how_it_logs():
     with Ctx("journalvar") as c:
@@ -1986,10 +2535,10 @@ def a_screen_that_drops_out_is_counted_and_health_is_ok_again_once_it_reads():
         m = r.mark()
         s.destroy()
         lost = r.wait("/touch/event", lambda x: x.args[0] == "device" and " lost: " in x.args[1], since=m)
-        check(lost.args[2:] == ["warning"], "the lost event %s" % lost.args)
+        check(lost.args[2:] == ["warning", "t"], "the lost event %s" % lost.args)
         c.screen(p)
         back = r.wait("/touch/event", lambda x: x.args[0] == "device" and " connected: " in x.args[1], since=m, timeout=4)
-        check(back.args[2:] == ["notice"], "the connected event %s" % back.args)
+        check(back.args[2:] == ["notice", "t"], "the connected event %s" % back.args)
         r.wait("/touch/health", lambda x: x.args == ["fault"], since=m, timeout=3)
         r.wait("/touch/device/t/state", lambda x: x.args == ["ok"], since=m, timeout=3)
         m2 = r.mark()
@@ -2048,11 +2597,11 @@ def a_port_check_waiting_on_the_kernel_never_holds_up_the_heartbeat():
         m = r.mark()
         let_one_check_through()
         unknown = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "cannot tell whether anything is plugged into USB port 3-3" in x.args[1], since=m, timeout=3)
-        check("003/001" in unknown.args[1] and unknown.args[2:] == ["warning"], "event %s" % unknown.args)
+        check("003/001" in unknown.args[1] and unknown.args[2:] == ["warning", "t"], "event %s" % unknown.args)
         started = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "t: resetting USB bus 3 as asked by 127.0.0.1" in x.args[1], since=m, timeout=3)
-        check(started.args[2:] == ["warning"], "event %s" % started.args)
+        check(started.args[2:] == ["warning", "t"], "event %s" % started.args)
         done = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "t: USB bus 3 reset in " in x.args[1], since=m, timeout=3)
-        check(done.args[2:] == ["notice"], "event %s" % done.args)
+        check(done.args[2:] == ["notice", "t"], "event %s" % done.args)
         for f in ("unbind", "bind"):
             with open(os.path.join(hub, f)) as fh:
                 check(fh.read().startswith("3-0:1.0"), "%s was not written" % f)
@@ -2062,7 +2611,7 @@ def a_port_check_waiting_on_the_kernel_never_holds_up_the_heartbeat():
         check(req(r, "/touch/device/t/usb_reset") == ["ok", ""], "usb_reset with a hub that does not bind")
         let_one_check_through()
         failed = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "could not be bound again (the kernel did not take it)" in x.args[1], since=m, timeout=4)
-        check(failed.args[2:] == ["error"], "event %s" % failed.args)
+        check(failed.args[2:] == ["error", "t"], "event %s" % failed.args)
         r.wait("/touch/reasons", lambda x: any("could not be bound again" in a for a in x.args), since=m, timeout=3)
         r.wait("/touch/device/t/usb_port_state", lambda x: x.args == ["being set up"] and x.at > failed.at, since=m, timeout=4)
         m = r.mark()

@@ -94,6 +94,10 @@ std::string text(const osc::Arg& a) {
         std::snprintf(b, sizeof b, "%g", double(*f));
         return b;
     }
+    if (auto d = std::get_if<double>(&a)) {
+        std::snprintf(b, sizeof b, "%g", *d);
+        return b;
+    }
     return std::get<std::string>(a);
 }
 
@@ -146,6 +150,7 @@ int status_command(const Config& cfg) {
         std::printf("saved over OSC (these win over the config file): %s\n", joined(got["overrides"]).c_str());
     std::printf("commands and subscriptions from: %s\n", one("allowed_ips").c_str());
     if (!got["subscribers"].empty()) std::printf("subscribers: %s\n", joined(got["subscribers"]).c_str());
+    for (const auto& s : got["unused_screens"]) std::printf("a touchscreen no device reads (port, usb id, name): %s\n", text(s).c_str());
     for (const auto& id : got["devices"]) {
         std::string b = "device/" + text(id) + "/";
         auto dev = [&](const char* k) { return one(b + k); };
@@ -188,7 +193,8 @@ int send_command(const Config& cfg, const std::vector<std::string>& words) {
                 }
                 if (m.address != cfg.osc.prefix + "/reply" || m.args.size() != 3 || text(m.args[0]) != std::to_string(seq)) continue;
                 if (text(m.args[1]) == "ok") {
-                    std::printf("ok\n");
+                    std::string note = text(m.args[2]);
+                    std::printf("ok%s%s\n", note.empty() ? "" : ": ", note.c_str());
                     return 0;
                 }
                 std::fprintf(stderr, "refused: %s\n", text(m.args[2]).c_str());
