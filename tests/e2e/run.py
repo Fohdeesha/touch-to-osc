@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end tests: the daemon, virtual touchscreens through uinput, a receiver like the engine.
+"""End-to-end tests: the daemon, virtual touchscreens through uinput, a receiver that subscribes like a real one.
 
 usage: tests/e2e/run.py [--quick] [NAME ...]   (as root, on a machine with /dev/uinput)
 
@@ -1886,14 +1886,14 @@ def list_names_the_device_reading_each_screen_and_a_block_for_the_rest():
         c.screen(p, phys="tto-lb-%d" % pid)
         cfg = os.path.join(RUN_DIR, "list.toml")
         with open(cfg, "w") as f:
-            f.write('[osc]\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = ""\nstate = ""\n[[device]]\nid = "face"\nusb = "%04x:%04x"\n' % (TEST_VENDOR, p))
+            f.write('[osc]\nallowed_ips = ["127.0.0.1"]\n[paths]\nsettings = ""\nstate = ""\n[[device]]\nid = "screen"\nusb = "%04x:%04x"\n' % (TEST_VENDOR, p))
         time.sleep(0.3)
         out = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--list", "--config=" + cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              universal_newlines=True, timeout=20).stdout
         blocks = out.split("\n\n")
         a = [b for b in blocks if "tto-la-%d" % pid in b]
         b = [b for b in blocks if "tto-lb-%d" % pid in b and "id %04x" % TEST_VENDOR in b]
-        check(len(a) == 1 and 'read as device "face" in the config' in a[0], "screen a: %s" % out)
+        check(len(a) == 1 and 'read as device "screen" in the config' in a[0], "screen a: %s" % out)
         check(len(b) == 1 and "not read by the config; to read it, add this to the config:" in b[0] and 'match_usb = "%04x:%04x"' % (TEST_VENDOR, p) in b[0] and
               'match_port = "tto-lb-%d"' % pid in b[0] and 'id = "screen2"' in b[0], "screen b: %s" % out)
         check("touch-to-osc --list --all shows them" in out and "not a touchscreen" not in out, "others: %s" % out)
@@ -1902,7 +1902,7 @@ def list_names_the_device_reading_each_screen_and_a_block_for_the_rest():
         check("not a touchscreen" in everything and "--list --all shows them" not in everything, "--all: %s" % everything)
         dump = subprocess.run([os.path.join(BUILD, "touch-to-osc"), "--dump=nope", "--config=" + cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               universal_newlines=True, timeout=20)
-        check(dump.returncode == 2 and 'no device "nope" in the config (its devices: face)' in dump.stdout, "--dump=nope: %d %s" % (dump.returncode, dump.stdout))
+        check(dump.returncode == 2 and 'no device "nope" in the config (its devices: screen)' in dump.stdout, "--dump=nope: %d %s" % (dump.returncode, dump.stdout))
 
 
 @test()

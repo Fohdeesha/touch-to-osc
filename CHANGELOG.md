@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.2 - 2026-10-28
+
+- The example config's screen is now `id = "screen"` with no label (it was `face`), so a
+  fresh install sends `/touch/screen/down` and so on. Existing configs are left as they
+  are. The docs, `--help` and messages use `screen` as the example too, and no longer name
+  any particular receiver.
+
 ## 0.7.1 - 2026-10-28
 
 - The README is cut down to the basics, and the OSC interface has its own short reference,
@@ -8,7 +15,7 @@
 
 ## 0.7.0 - 2026-10-26
 
-OSC interface version 6, agreed with Bridge Studio: an app can find touch-to-osc, read what
+OSC interface version 6: an app can find touch-to-osc, read what
 it can change, identify and calibrate screens and add them, and every problem can be shown
 for the screen it is about. Everything in version 5 is still sent as it was; version 6
 only adds addresses and appends arguments.
@@ -131,7 +138,7 @@ New:
   `--device`, says when nothing answers, and `--no-alive` really leaves out the counters.
 - Messages that say more: an unknown key or address names the closest known one, a value
   only reported by the status says it cannot be set, config errors name the device
-  (`device "face" (the 1st [[device]])`), the refusal to an outside host says where the
+  (`device "screen" (the 1st [[device]])`), the refusal to an outside host says where the
   allowed hosts come from, the start lines list the allowed hosts, a screen on another
   port than `match_port` says where it is, a finished USB reset names what else it
   dropped, a screen that reports no size says its aspect is a guess, and a screen that

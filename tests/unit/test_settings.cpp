@@ -10,7 +10,7 @@ namespace {
 
 Config base(const char* extra_osc = "", int rotation = 0) {
     std::string text = std::string("[osc]\nallowed_ips = [\"127.0.0.1\", \"192.168.1.27\"") + extra_osc +
-                       "]\n[paths]\nsettings = \"/tmp/x.toml\"\n[[device]]\nid = \"face\"\nusb = \"0712:0009\"\nrotation = " + std::to_string(rotation) + "\n";
+                       "]\n[paths]\nsettings = \"/tmp/x.toml\"\n[[device]]\nid = \"screen\"\nusb = \"0712:0009\"\nrotation = " + std::to_string(rotation) + "\n";
     auto c = parse_config(text, "t.toml");
     REQUIRE(c);
     return *c;
@@ -28,8 +28,8 @@ TEST_CASE("every kind of saved setting survives the settings file and comes back
     d.address = HostPort{"192.168.1.27", 9481};
     d.status = false;
     o.destinations_added = {d};
-    DeviceOverrides& x = o.devices["face"];
-    x.label = "the face";
+    DeviceOverrides& x = o.devices["screen"];
+    x.label = "the screen";
     x.enabled = false;
     x.rotation = 90;
     x.mirror = "x";
@@ -49,7 +49,7 @@ TEST_CASE("every kind of saved setting survives the settings file and comes back
     CHECK(override_names(back->overrides) == override_names(o));
     Config eff = apply_overrides(b, back->overrides);
     const DeviceConfig& f = eff.devices[0];
-    CHECK(f.label == "the face");
+    CHECK(f.label == "the screen");
     CHECK_FALSE(f.enabled);
     CHECK(f.rotation == 90);
     CHECK(f.mirror_x);
@@ -73,57 +73,57 @@ TEST_CASE("every kind of saved setting survives the settings file and comes back
 TEST_CASE("a setting equal to the config's value is not an override") {
     Config b = base();
     Overrides o;
-    o.devices["face"].rotation = 0;
-    o.devices["face"].match_usb = "0712:0009";
+    o.devices["screen"].rotation = 0;
+    o.devices["screen"].match_usb = "0712:0009";
     o.log_level = "info";
     o.allowed_added = b.osc.allowed_ips;
     o.allowed_removed = {"10.9.9.9"};
     drop_unchanged(o, b);
     CHECK(o.empty());
-    o.devices["face"].rotation = 180;
+    o.devices["screen"].rotation = 180;
     drop_unchanged(o, b);
-    CHECK(override_names(o) == std::vector<std::string>{"device/face/rotation"});
+    CHECK(override_names(o) == std::vector<std::string>{"device/screen/rotation"});
 }
 
 TEST_CASE("forgetting one setting, a whole list, a whole device or a missing one") {
     Overrides o;
-    o.devices["face"].rotation = 90;
-    o.devices["face"].label = "x";
+    o.devices["screen"].rotation = 90;
+    o.devices["screen"].label = "x";
     o.unused_devices["gone"].rotation = 180;
     o.log_level = "debug";
     o.allowed_added = {"10.0.0.5"};
-    CHECK(forget_override(o, "device/face/rotation"));
-    CHECK_FALSE(forget_override(o, "device/face/rotation"));
+    CHECK(forget_override(o, "device/screen/rotation"));
+    CHECK_FALSE(forget_override(o, "device/screen/rotation"));
     CHECK_FALSE(forget_override(o, "device/nope/label"));
     CHECK_FALSE(forget_override(o, "colour"));
-    CHECK(override_names(o) == std::vector<std::string>{"log_level", "allowed_ips", "device/face/label"});
+    CHECK(override_names(o) == std::vector<std::string>{"log_level", "allowed_ips", "device/screen/label"});
     CHECK(forget_override(o, "allowed_ips"));
     CHECK(forget_override(o, "device/gone"));
-    CHECK(forget_override(o, "device/face"));
+    CHECK(forget_override(o, "device/screen"));
     CHECK(forget_override(o, "log_level"));
     CHECK(o.empty());
 }
 
 TEST_CASE("a settings file with a bad value is refused naming the key, in the config's words") {
     Config b = base();
-    auto r = parse_settings("[device.face]\nrotation = 45\n", "s.toml", b);
+    auto r = parse_settings("[device.screen]\nrotation = 45\n", "s.toml", b);
     REQUIRE_FALSE(r);
-    CHECK(r.error().find("device.face.rotation: must be 0, 90, 180 or 270") != std::string::npos);
+    CHECK(r.error().find("device.screen.rotation: must be 0, 90, 180 or 270") != std::string::npos);
     CHECK(parse_settings("colour = 1\n", "s.toml", b).error().find("colour: unknown key") != std::string::npos);
-    CHECK(parse_settings("[device.face]\nmatch_usb = \"nope\"\n", "s.toml", b).error().find("device.face.match_usb") != std::string::npos);
+    CHECK(parse_settings("[device.screen]\nmatch_usb = \"nope\"\n", "s.toml", b).error().find("device.screen.match_usb") != std::string::npos);
     CHECK(parse_settings("allowed_ips = []\n", "s.toml", b).error().find("lock out every host") != std::string::npos);
     CHECK(parse_settings("allowed_ips_removed = [\"127.0.0.1\", \"192.168.1.27\"]\n", "s.toml", b).error().find("lock out every host") != std::string::npos);
-    CHECK(parse_settings("[device.face]\nmatch_usb = \"\"\n", "s.toml", b).error().find("would match nothing") != std::string::npos);
+    CHECK(parse_settings("[device.screen]\nmatch_usb = \"\"\n", "s.toml", b).error().find("would match nothing") != std::string::npos);
     CHECK(parse_settings("x = = 1", "s.toml", b).error().find("s.toml:1:") != std::string::npos);
 }
 
 TEST_CASE("settings for a device no longer in the config are kept but not used") {
     Config b = base();
-    auto r = parse_settings("[device.gone]\nrotation = 90\n[device.face]\nrotation = 180\n", "s.toml", b);
+    auto r = parse_settings("[device.gone]\nrotation = 90\n[device.screen]\nrotation = 180\n", "s.toml", b);
     REQUIRE(r);
     REQUIRE(r->notes.size() == 1);
     CHECK(r->notes[0].find("\"gone\" are kept but not used") != std::string::npos);
-    CHECK(override_names(r->overrides) == std::vector<std::string>{"device/face/rotation"});
+    CHECK(override_names(r->overrides) == std::vector<std::string>{"device/screen/rotation"});
     std::string text = settings_text(r->overrides, Overrides(), "c.toml");
     CHECK(text.find("[device.gone]") != std::string::npos);
 }
@@ -146,7 +146,7 @@ TEST_CASE("a host added to the config file is never hidden by allowed hosts chan
 }
 
 TEST_CASE("a config value changed after a setting was saved over OSC applies at the next start") {
-    const char* saved = "[device.face]\nrotation = 90\n[config_values.device.face]\nrotation = 0\n";
+    const char* saved = "[device.screen]\nrotation = 90\n[config_values.device.screen]\nrotation = 0\n";
     auto same = parse_settings(saved, "s.toml", base("", 0));
     REQUIRE(same);
     CHECK(same->notes.empty());
@@ -155,10 +155,10 @@ TEST_CASE("a config value changed after a setting was saved over OSC applies at 
     REQUIRE(edited);
     CHECK(edited->rewrite);
     REQUIRE(edited->notes.size() == 1);
-    CHECK(edited->notes[0] == "device/face/rotation: the config file changed from 0 to 180 after 90 was saved over OSC, so the config file's 180 applies now");
+    CHECK(edited->notes[0] == "device/screen/rotation: the config file changed from 0 to 180 after 90 was saved over OSC, so the config file's 180 applies now");
     CHECK(edited->overrides.empty());
     CHECK(edited->config_values.devices.empty());
-    auto older = parse_settings("[device.face]\nrotation = 90\n", "s.toml", base("", 180));
+    auto older = parse_settings("[device.screen]\nrotation = 90\n", "s.toml", base("", 180));
     REQUIRE(older);
     CHECK(older->notes.empty());
     CHECK(apply_overrides(base("", 180), older->overrides).devices[0].rotation == 90);
@@ -167,33 +167,33 @@ TEST_CASE("a config value changed after a setting was saved over OSC applies at 
 TEST_CASE("what the config file said is recorded when a setting changes, and only then") {
     Config file = base("", 0);
     Overrides values, before, after;
-    after.devices["face"].rotation = 90;
+    after.devices["screen"].rotation = 90;
     note_config_values(before, after, file, values);
-    REQUIRE(values.devices.count("face"));
-    CHECK(values.devices["face"].rotation == 0);
+    REQUIRE(values.devices.count("screen"));
+    CHECK(values.devices["screen"].rotation == 0);
     Config edited = base("", 180);
     Overrides later = after;
-    later.devices["face"].label = "x";
+    later.devices["screen"].label = "x";
     note_config_values(after, later, edited, values);
-    CHECK(values.devices["face"].rotation == 0);
-    CHECK(values.devices["face"].label == std::string("face"));
+    CHECK(values.devices["screen"].rotation == 0);
+    CHECK(values.devices["screen"].label == std::string("screen"));
     Overrides changed = later;
-    changed.devices["face"].rotation = 270;
+    changed.devices["screen"].rotation = 270;
     note_config_values(later, changed, edited, values);
-    CHECK(values.devices["face"].rotation == 180);
+    CHECK(values.devices["screen"].rotation == 180);
     Overrides forgot = changed;
-    forgot.devices["face"].rotation.reset();
+    forgot.devices["screen"].rotation.reset();
     note_config_values(changed, forgot, edited, values);
-    CHECK_FALSE(values.devices["face"].rotation);
+    CHECK_FALSE(values.devices["screen"].rotation);
     std::string text = settings_text(changed, values, "c.toml");
-    CHECK(text.find("[config_values.device.face]") != std::string::npos);
+    CHECK(text.find("[config_values.device.screen]") != std::string::npos);
 }
 
 TEST_CASE("the listen address, the prefix and devices added or removed over OSC survive the settings file") {
     Config b = base();
     Overrides o;
     o.listen = HostPort{"0.0.0.0", 9490};
-    o.prefix = "/face";
+    o.prefix = "/screen";
     DeviceConfig two;
     two.id = "back";
     two.label = "back";
@@ -208,7 +208,7 @@ TEST_CASE("the listen address, the prefix and devices added or removed over OSC 
     const Overrides& r = back->overrides;
     REQUIRE(r.listen);
     CHECK(r.listen->text() == "0.0.0.0:9490");
-    CHECK(r.prefix == std::optional<std::string>("/face"));
+    CHECK(r.prefix == std::optional<std::string>("/screen"));
     REQUIRE(r.devices_added.size() == 1);
     CHECK(r.devices_added[0].id == "back");
     CHECK(r.devices_added[0].port == "3-4");
@@ -217,14 +217,14 @@ TEST_CASE("the listen address, the prefix and devices added or removed over OSC 
     REQUIRE(eff.devices.size() == 2);
     CHECK(eff.devices[1].id == "back");
     CHECK(eff.devices[1].rotation == 90);
-    CHECK(eff.osc.prefix == "/face");
+    CHECK(eff.osc.prefix == "/screen");
     CHECK(eff.osc.listen.port == 9490);
     std::vector<std::string> names = override_names(r);
     CHECK(std::find(names.begin(), names.end(), "devices") != names.end());
     CHECK(std::find(names.begin(), names.end(), "listen") != names.end());
 
     Overrides gone;
-    gone.devices_removed = {"face"};
+    gone.devices_removed = {"screen"};
     gone.devices_added = {two};
     auto removed = parse_settings(settings_text(gone, Overrides(), "t.toml"), "s.toml", b);
     REQUIRE(removed);
@@ -232,7 +232,7 @@ TEST_CASE("the listen address, the prefix and devices added or removed over OSC 
     REQUIRE(only.devices.size() == 1);
     CHECK(only.devices[0].id == "back");
     Overrides none;
-    none.devices_removed = {"face"};
+    none.devices_removed = {"screen"};
     CHECK_FALSE(parse_settings(settings_text(none, Overrides(), "t.toml"), "s.toml", b));
     Overrides forget = r;
     CHECK(forget_override(forget, "devices"));
@@ -245,8 +245,8 @@ TEST_CASE("a device added over OSC that the config file now has by the same id i
     Config b = base();
     Overrides o;
     DeviceConfig twin;
-    twin.id = "face";
-    twin.label = "face";
+    twin.id = "screen";
+    twin.label = "screen";
     twin.port = "3-9";
     o.devices_added = {twin};
     auto back = parse_settings(settings_text(o, Overrides(), "t.toml"), "s.toml", b);

@@ -38,7 +38,7 @@ std::string slurp(const std::string& path) {
 
 TEST_CASE("what touch-to-osc keeps between runs comes back the same") {
     State s;
-    s.usb_ports["face"] = "3-3";
+    s.usb_ports["screen"] = "3-3";
     s.usb_ports["back"] = "1-1.4";
     s.config_path = "/etc/touch-to-osc/touch-to-osc.toml";
     s.config_text = "# a \"quoted\" comment\n[osc]\nallowed_ips = ['127.0.0.1'] # tab\there, a backslash \\ and \xc3\xa9\n";

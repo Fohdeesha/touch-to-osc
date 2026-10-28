@@ -1,4 +1,4 @@
-"""Runs the daemon against virtual touchscreens and a receiver that subscribes like the engine."""
+"""Runs the daemon against virtual touchscreens and a receiver that subscribes like a real one."""
 
 import os
 import random

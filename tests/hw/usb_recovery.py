@@ -2,7 +2,7 @@
 """USB recovery on a real touchscreen.
 
 usage: sudo python3 tests/hw/usb_recovery.py [--usb 0712:0009] [--binary build/touch-to-osc]
-       sudo python3 tests/hw/usb_recovery.py --service face [--listen 127.0.0.1:9480]
+       sudo python3 tests/hw/usb_recovery.py --service screen [--listen 127.0.0.1:9480]
 
 Needs a real USB touchscreen plugged in and root. By default it stops the touch-to-osc
 service for the duration (and starts it again) and runs its own daemon on 127.0.0.1:19480;

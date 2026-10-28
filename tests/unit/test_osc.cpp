@@ -7,7 +7,7 @@
 using namespace tto;
 
 TEST_CASE("a message survives encode and decode") {
-    osc::Message m{"/touch/face/down", {int32_t(7), 0.5f, 0.25f, int32_t(12), int64_t(1792567761176835)}};
+    osc::Message m{"/touch/screen/down", {int32_t(7), 0.5f, 0.25f, int32_t(12), int64_t(1792567761176835)}};
     auto bytes = osc::encode(m);
     auto back = osc::decode(bytes.data(), bytes.size());
     REQUIRE(back);
@@ -22,14 +22,14 @@ TEST_CASE("the bundle writer produces what the decoder reads, without allocating
     uint8_t buf[512];
     osc::Writer w(buf, sizeof buf);
     w.begin_bundle();
-    w.begin_message("/touch/face/down", "iffih");
+    w.begin_message("/touch/screen/down", "iffih");
     w.i(1);
     w.f(0.1f);
     w.f(0.2f);
     w.i(3);
     w.h(4);
     w.end_message();
-    w.begin_message("/touch/face/cancel", "isih");
+    w.begin_message("/touch/screen/cancel", "isih");
     w.i(2);
     w.s("resync");
     w.i(3);
@@ -40,9 +40,9 @@ TEST_CASE("the bundle writer produces what the decoder reads, without allocating
     auto msgs = osc::decode_packet(w.data(), w.size());
     REQUIRE(msgs);
     REQUIRE(msgs->size() == 2);
-    CHECK((*msgs)[0].address == "/touch/face/down");
+    CHECK((*msgs)[0].address == "/touch/screen/down");
     CHECK(std::get<float>((*msgs)[0].args[2]) == 0.2f);
-    CHECK((*msgs)[1].address == "/touch/face/cancel");
+    CHECK((*msgs)[1].address == "/touch/screen/cancel");
     CHECK(std::get<std::string>((*msgs)[1].args[1]) == "resync");
 }
 

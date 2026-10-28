@@ -19,7 +19,7 @@ That installs `touch-to-osc`, `touch-to-osc-watch` and the systemd service (enab
 started), and writes `/etc/touch-to-osc/touch-to-osc.toml` if there isn't one yet.
 
 Upgrading keeps your config and restarts the service, which ends any touches in progress,
-so do it between shows. `apt remove` keeps the config, `apt purge` deletes it.
+so do it when nobody's using the screen. `apt remove` keeps the config, `apt purge` deletes it.
 
 ## Setup
 
@@ -59,13 +59,13 @@ A bad key, type or value is refused with a message naming it. If the config is b
 the service starts, it keeps running on the last config that worked and its health says
 why (on a fresh install with no good config yet, it just stays stopped).
 
-**Settings changed over OSC win over the config file.** Anything changed over OSC (from
-Bridge Studio, or `--send`) is saved in `/var/lib/touch-to-osc/settings.toml` and beats
+**Settings changed over OSC win over the config file.** Anything changed over OSC (by a
+receiver, or with `--send`) is saved in `/var/lib/touch-to-osc/settings.toml` and beats
 the config. If you edit the config and nothing changes, that's why. `touch-to-osc --status`
 lists what's overridden. To drop them:
 
-    touch-to-osc --send settings/forget device/face/rotation    one setting
-    touch-to-osc --send settings/forget device/face             all of one screen's
+    touch-to-osc --send settings/forget device/screen/rotation    one setting
+    touch-to-osc --send settings/forget device/screen             all of one screen's
     touch-to-osc --send settings/forget                         everything
 
 If you change a value in the config file after it was overridden, the config's new value
@@ -76,22 +76,22 @@ takes over again from the next start.
 Run `touch-to-osc-watch --no-alive` and sort out rotation and mirror first. They apply
 live, so just try them:
 
-    touch-to-osc --send device/face/rotation 90     0, 90, 180 or 270, clockwise
-    touch-to-osc --send device/face/mirror x        x, y, xy, or "" for none
+    touch-to-osc --send device/screen/rotation 90     0, 90, 180 or 270, clockwise
+    touch-to-osc --send device/screen/mirror x        x, y, xy, or "" for none
 
 Touch the top right corner, it should read `1 0`. `0 0` means mirror `x`, `1 1` means
 mirror `y`, `0 1` means rotation 180. If moving your finger right moves the reading up or
 down, try rotation 90 or 270.
 
-Then calibration, if it's offset or a bit too big or small. Easiest is guided calibration
-from an app (Bridge Studio does it). By hand: clear it with
-`touch-to-osc --send device/face/calibration` (no numbers), touch targets at 0.1 and 0.9 on
+Then calibration, if it's offset or a bit too big or small. An app can do it for you with
+guided calibration (see OSC.md). By hand: clear it with
+`touch-to-osc --send device/screen/calibration` (no numbers), touch targets at 0.1 and 0.9 on
 each axis, write down what x reads (`u1`, `u2`) and what y reads (`v1`, `v2`), then:
 
     a = 0.8 / (u2 - u1)    c = 0.1 - a * u1
     e = 0.8 / (v2 - v1)    f = 0.1 - e * v1
 
-    touch-to-osc --send device/face/calibration <a> 0 <c> 0 <e> <f>
+    touch-to-osc --send device/screen/calibration <a> 0 <c> 0 <e> <f>
 
 Calibration lines the panel up with the display, not with a picture on it. Where a scaled
 or letterboxed picture sits is the receiver's job. If the screen doesn't report its size,
@@ -159,16 +159,16 @@ default):
 
 Then you get:
 
-    /touch/face/down    i contact  f x  f y  i frame  h t_us
-    /touch/face/move    i contact  f x  f y  i frame  h t_us
-    /touch/face/up      i contact  f x  f y  i frame  h t_us
-    /touch/face/cancel  i contact  s reason  i frame  h t_us
+    /touch/screen/down    i contact  f x  f y  i frame  h t_us
+    /touch/screen/move    i contact  f x  f y  i frame  h t_us
+    /touch/screen/up      i contact  f x  f y  i frame  h t_us
+    /touch/screen/cancel  i contact  s reason  i frame  h t_us
     /touch/alive ...    every second, with the contacts still down on each screen
 
 plus the status, events and replies. Every contact ends with exactly one `up` or `cancel`,
 and a `cancel` is never a tap. Drop everything you hold when the alives stop for 3 s or the
 `run` changes. Settings are changed at the same address the status reports them on
-(`/touch/device/face/rotation 90`). Nothing creates a touch.
+(`/touch/device/screen/rotation 90`). Nothing creates a touch.
 
 The rest (status fields, events, commands, the receiver rules, plain types for OSC
 libraries without 64-bit ints) is in [OSC.md](OSC.md).

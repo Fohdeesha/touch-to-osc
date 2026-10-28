@@ -1,7 +1,7 @@
 # touch-to-osc configuration
 #
-# Every key below shows its default, except the [[device]] block's id, label and
-# match_usb, which are for one QDtech MPI1168 screen. Unknown keys, wrong types and
+# Every key below shows its default, except the [[device]] block's id and match_usb,
+# which are for one QDtech MPI1168 screen. Unknown keys, wrong types and
 # out-of-range values are refused at start with a message that names the key.
 # Check a file without starting anything: sudo touch-to-osc --check-config=FILE
 # Find your screens and a block ready to paste for each: sudo touch-to-osc --list
@@ -13,9 +13,9 @@ listen = "0.0.0.0:9480"
 # Every address the daemon sends or answers starts with this.
 prefix = "/touch"
 # Hosts that may subscribe and send commands. Anything else gets an error that says so.
-# An empty list is refused unless open_to_any is set. Add the machine that runs the
-# receiver, for example Bridge Studio's engine. Hosts added or removed over OSC are kept
-# as changes on top of this list, so a host added here later is never hidden by them.
+# An empty list is refused unless open_to_any is set. Add each machine that runs a
+# receiver. Hosts added or removed over OSC are kept as changes on top of this list,
+# so a host added here later is never hidden by them.
 allowed_ips = ["127.0.0.1"]
 open_to_any = false
 
@@ -25,7 +25,7 @@ open_to_any = false
 level = "info"
 
 [paths]
-# Settings changed over OSC (for example from Bridge Studio) are saved here and win over
+# Settings changed over OSC are saved here and win over
 # this file, until this file's own value for one of them is changed: then this file's
 # new value applies from the next start. This file is never written. "" keeps such
 # changes only until a restart. The status lists which settings come from there
@@ -59,9 +59,9 @@ state = "/var/lib/touch-to-osc/state.toml"
 # A short name: a-z, 0-9, _ and -. Touches arrive as <prefix>/<id>/down and so on.
 # Required. device, devices, status, settings, describe, allowed_ips and
 # saved_destinations are taken by touch-to-osc's own addresses.
-id = "face"
+id = "screen"
 # What people call it, used in health messages. Defaults to the id.
-label = "face screen"
+label = ""
 # Which screen to read: its usb vendor:product in hex, its serial (as --list prints it),
 # its USB port path such as "3-3" (the kernel's name for the socket it is plugged into),
 # or several of them; every one given must match. Set at least match_usb or match_port.

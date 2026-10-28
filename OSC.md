@@ -2,7 +2,7 @@
 
 All UDP. Send commands and subscriptions to the daemon's `listen` port (9480). It sends from
 other ports, so a firewall in front of a receiver has to let in UDP from its machine.
-Addresses start with the prefix (`/touch`); each screen shows up by its config `id` (`face`
+Addresses start with the prefix (`/touch`); each screen shows up by its config `id` (`screen`
 below).
 
 - Numbers you send can be `i`, `h`, `d` or a whole `f` (`T`/`F` = 1/0). Strings are ASCII.
@@ -22,10 +22,10 @@ below).
 
 One bundle per screen frame that changed something, one message per changed contact:
 
-    /touch/face/down    i contact  f x  f y  i frame  h t_us
-    /touch/face/move    i contact  f x  f y  i frame  h t_us
-    /touch/face/up      i contact  f x  f y  i frame  h t_us
-    /touch/face/cancel  i contact  s reason  i frame  h t_us
+    /touch/screen/down    i contact  f x  f y  i frame  h t_us
+    /touch/screen/move    i contact  f x  f y  i frame  h t_us
+    /touch/screen/up      i contact  f x  f y  i frame  h t_us
+    /touch/screen/cancel  i contact  s reason  i frame  h t_us
 
 - `contact` counts up from 1 per run, never reused.
 - `x`, `y`: 0..1 of the display, top left `0 0`, after rotation, mirror and calibration.
@@ -41,7 +41,7 @@ One bundle per screen frame that changed something, one message per changed cont
     /touch/subscribe  i port [i seconds] [s what]  -> /touch/subscribed  i port  i seconds  s what
     /touch/unsubscribe  i port                     -> /touch/unsubscribed  i port
     /touch/alive  i counter  i run  s version  s health  i devices_connected  i devices_configured  i contacts_active  i status_gen
-    /touch/device/face/active  i frame  i contact ...
+    /touch/device/screen/active  i frame  i contact ...
     /touch/bye  i run
 
 - `hello` answers any host, broadcast too; `allowed` says if that host may subscribe.
@@ -69,68 +69,68 @@ Receiver rules:
 Sent in full on a new lease, on `status/send` and every 10 s, and each part again when it
 changes. Each status bundle starts with `status_gen`.
 
-    /touch/status_gen                    i
-    /touch/osc_api                       i 6
-    /touch/version                       s
-    /touch/run                           i
-    /touch/health                        s ok|warning|fault
-    /touch/reasons                       s ...      what's wrong and what to do
-    /touch/host                          s
-    /touch/config                        s
-    /touch/settings_file                 s
-    /touch/listen                        s          settable (restart)
-    /touch/prefix                        s          settable (restart)
-    /touch/log_level                     s          settable
-    /touch/allowed_ips                   s ...
-    /touch/saved_destinations            s ...      "ip:port touches status"
-    /touch/overrides                     s ...      settings saved over OSC
-    /touch/devices                       s id ...
-    /touch/unused_screens                s ...      "port usb name"
-    /touch/identify_s                    i
-    /touch/device/face/health            s ok|warning|fault
-    /touch/device/face/reasons           s ...
-    /touch/device/face/label             s          settable
-    /touch/device/face/enabled           i 0|1      settable
-    /touch/device/face/connected         i 0|1
-    /touch/device/face/state             s          below
-    /touch/device/face/reason            s
-    /touch/device/face/calibrate_s       i
-    /touch/device/face/match_usb         s          settable
-    /touch/device/face/match_serial      s          settable
-    /touch/device/face/match_port        s          settable
-    /touch/device/face/calibration       f a  f b  f c  f d  f e  f f    settable
-    /touch/device/face/grab              i 0|1      settable
-    /touch/device/face/usb_recovery      i 0|1      settable
-    /touch/device/face/usb_watched_port  s
-    /touch/device/face/usb_port_state    s
-    /touch/device/face/usb_resets        i
-    /touch/device/face/name              s
-    /touch/device/face/usb               s          "vvvv:pppp serial"
-    /touch/device/face/port              s
-    /touch/device/face/slots             i
-    /touch/device/face/size_mm           f w  f h
-    /touch/device/face/rotation          i 0|90|180|270   settable
-    /touch/device/face/mirror            s ""|x|y|xy      settable
-    /touch/device/face/aspect            f          settable
-    /touch/device/face/silence_ms        i          settable
-    /touch/device/face/grabbed           i 0|1
+    /touch/status_gen                      i
+    /touch/osc_api                         i 6
+    /touch/version                         s
+    /touch/run                             i
+    /touch/health                          s ok|warning|fault
+    /touch/reasons                         s ...      what's wrong and what to do
+    /touch/host                            s
+    /touch/config                          s
+    /touch/settings_file                   s
+    /touch/listen                          s          settable (restart)
+    /touch/prefix                          s          settable (restart)
+    /touch/log_level                       s          settable
+    /touch/allowed_ips                     s ...
+    /touch/saved_destinations              s ...      "ip:port touches status"
+    /touch/overrides                       s ...      settings saved over OSC
+    /touch/devices                         s id ...
+    /touch/unused_screens                  s ...      "port usb name"
+    /touch/identify_s                      i
+    /touch/device/screen/health            s ok|warning|fault
+    /touch/device/screen/reasons           s ...
+    /touch/device/screen/label             s          settable
+    /touch/device/screen/enabled           i 0|1      settable
+    /touch/device/screen/connected         i 0|1
+    /touch/device/screen/state             s          below
+    /touch/device/screen/reason            s
+    /touch/device/screen/calibrate_s       i
+    /touch/device/screen/match_usb         s          settable
+    /touch/device/screen/match_serial      s          settable
+    /touch/device/screen/match_port        s          settable
+    /touch/device/screen/calibration       f a  f b  f c  f d  f e  f f    settable
+    /touch/device/screen/grab              i 0|1      settable
+    /touch/device/screen/usb_recovery      i 0|1      settable
+    /touch/device/screen/usb_watched_port  s
+    /touch/device/screen/usb_port_state    s
+    /touch/device/screen/usb_resets        i
+    /touch/device/screen/name              s
+    /touch/device/screen/usb               s          "vvvv:pppp serial"
+    /touch/device/screen/port              s
+    /touch/device/screen/slots             i
+    /touch/device/screen/size_mm           f w  f h
+    /touch/device/screen/rotation          i 0|90|180|270   settable
+    /touch/device/screen/mirror            s ""|x|y|xy      settable
+    /touch/device/screen/aspect            f          settable
+    /touch/device/screen/silence_ms        i          settable
+    /touch/device/screen/grabbed           i 0|1
 
 `state`: `starting`, `ok`, `not connected`, `disabled`, `no permission`, `grab refused`,
 `read error`, `not a touchscreen`, `restarting`, `identifying`, `calibrating`.
 
 With every alive, to status receivers:
 
-    /touch/uptime_s                      i
-    /touch/device/face/contacts          i
-    /touch/device/face/oldest_s          f          -1 when none
-    /touch/device/face/last_event_s      f          -1 never
-    /touch/device/face/last_loss_s       f          -1 never
-    /touch/device/face/last_gone_s       f          -1 still gone or never
-    /touch/device/face/rate_hz           f
-    /touch/device/face/latency_us        i p50  i p99
-    /touch/device/face/counts            h frames  h touches  h resyncs  h send_drops  h cancels  h losses
-    /touch/subscribers                   s "ip:port seconds_left" ...
-    /touch/destinations                  s "ip:port ok|failing" ...
+    /touch/uptime_s                    i
+    /touch/device/screen/contacts      i
+    /touch/device/screen/oldest_s      f          -1 when none
+    /touch/device/screen/last_event_s  f          -1 never
+    /touch/device/screen/last_loss_s   f          -1 never
+    /touch/device/screen/last_gone_s   f          -1 still gone or never
+    /touch/device/screen/rate_hz       f
+    /touch/device/screen/latency_us    i p50  i p99
+    /touch/device/screen/counts        h frames  h touches  h resyncs  h send_drops  h cancels  h losses
+    /touch/subscribers                 s "ip:port seconds_left" ...
+    /touch/destinations                s "ip:port ok|failing" ...
 
 `fault` means an enabled screen isn't working or a USB reset failed. `warning` means
 something needs a look. `reasons` says which.
@@ -148,10 +148,10 @@ something needs a look. `reasons` says which.
     /touch/identify  i seconds                         1-60, 0 ends it
     -> /touch/identified  s device  s label  s usb_port  f x  f y
 
-    /touch/device/face/calibrate  i seconds            1-60, 0 ends it
-    -> /touch/device/face/calibration/touch  i contact  s down|up  f u  f v
-    /touch/device/face/calibration/fit  f x f y f u f v ...    3 to 16 points
-    -> /touch/device/face/calibration/fitted  f worst  f worst_mm
+    /touch/device/screen/calibrate  i seconds            1-60, 0 ends it
+    -> /touch/device/screen/calibration/touch  i contact  s down|up  f u  f v
+    /touch/device/screen/calibration/fit  f x f y f u f v ...    3 to 16 points
+    -> /touch/device/screen/calibration/fitted  f worst  f worst_mm
 
 Both pause touches (cancelled `identifying` or `calibrating`) and end by themselves. For
 calibration, show targets, collect where each was touched (`u v`, uncalibrated), and send
@@ -174,35 +174,35 @@ current and config values, and what a change does (`effect`: `live`, `cancels`, 
 Wrap any command in `request` to get exactly one reply; a repeated seq gets the same reply
 without running again. A bare command that's refused gets `/touch/error  s address  s note`.
 
-    /touch/ping [i port]                 -> /touch/pong i run
-    /touch/status/send [i port]          -> the full status (one every 200 ms, across all hosts)
-    /touch/restart                       restart the daemon (leases are kept)
-    /touch/device/face/usb_reset         reset the screen's USB hub now
+    /touch/ping [i port]            -> /touch/pong i run
+    /touch/status/send [i port]     -> the full status (one every 200 ms, across all hosts)
+    /touch/restart                  restart the daemon (leases are kept)
+    /touch/device/screen/usb_reset  reset the screen's USB hub now
 
 Settings live at the address the status reports them on, and are saved:
 
-    /touch/device/face/label         s
-    /touch/device/face/enabled       i 0|1
-    /touch/device/face/rotation      i 0|90|180|270
-    /touch/device/face/mirror        s ""|x|y|xy
-    /touch/device/face/calibration   f a  f b  f c  f d  f e  f f   (none to remove it)
-    /touch/device/face/aspect        f          0 = from the device
-    /touch/device/face/silence_ms    i          0 or 50-10000
-    /touch/device/face/grab          i 0|1
-    /touch/device/face/match_usb     s
-    /touch/device/face/match_serial  s
-    /touch/device/face/match_port    s
-    /touch/device/face/usb_recovery  i 0|1
-    /touch/log_level                 s
-    /touch/allowed_ips/add           s ip
-    /touch/allowed_ips/remove        s ip
-    /touch/saved_destinations/add    s "ip:port" [i touches  i status]
-    /touch/saved_destinations/remove s "ip:port"
-    /touch/devices/add               s id  s match_usb  s match_port
-    /touch/devices/remove            s id
-    /touch/listen                    s "ip:port"
-    /touch/prefix                    s
-    /touch/settings/forget           [s name]   one, device/<id>, or all
+    /touch/device/screen/label         s
+    /touch/device/screen/enabled       i 0|1
+    /touch/device/screen/rotation      i 0|90|180|270
+    /touch/device/screen/mirror        s ""|x|y|xy
+    /touch/device/screen/calibration   f a  f b  f c  f d  f e  f f   (none to remove it)
+    /touch/device/screen/aspect        f          0 = from the device
+    /touch/device/screen/silence_ms    i          0 or 50-10000
+    /touch/device/screen/grab          i 0|1
+    /touch/device/screen/match_usb     s
+    /touch/device/screen/match_serial  s
+    /touch/device/screen/match_port    s
+    /touch/device/screen/usb_recovery  i 0|1
+    /touch/log_level                   s
+    /touch/allowed_ips/add             s ip
+    /touch/allowed_ips/remove          s ip
+    /touch/saved_destinations/add      s "ip:port" [i touches  i status]
+    /touch/saved_destinations/remove   s "ip:port"
+    /touch/devices/add                 s id  s match_usb  s match_port
+    /touch/devices/remove              s id
+    /touch/listen                      s "ip:port"
+    /touch/prefix                      s
+    /touch/settings/forget             [s name]   one, device/<id>, or all
 
 `rotation`, `mirror` and `calibration` cancel the screen's contacts; `grab` and `match_*`
 reopen it; `devices`, `listen` and `prefix` restart the daemon. Hosts outside `allowed_ips`

@@ -37,7 +37,7 @@ void usage(FILE* f) {
                  "       touch-to-osc --dump[=ID] [--config=FILE]  print each touch frame of a configured device\n"
                  "       touch-to-osc --status [--config=FILE]  show the running service's health, screens and settings\n"
                  "       touch-to-osc [--config=FILE] --send ADDRESS [VALUE...]  send it one command, such as\n"
-                 "                                           --send device/face/rotation 90 (s:TEXT sends a number as text)\n"
+                 "                                           --send device/screen/rotation 90 (s:TEXT sends a number as text)\n"
                  "       touch-to-osc --version | --help\n"
                  "\n"
                  "Exit codes: 0 good or a clean stop, 1 wrong command line (--dump: the screen is not there or cannot be\n"

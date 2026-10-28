@@ -168,7 +168,7 @@ int status_command(const Config& cfg) {
 
 int send_command(const Config& cfg, const std::vector<std::string>& words) {
     if (words.empty()) {
-        std::fprintf(stderr, "--send needs an address, such as: touch-to-osc --send device/face/rotation 90\n");
+        std::fprintf(stderr, "--send needs an address, such as: touch-to-osc --send device/screen/rotation 90\n");
         return 1;
     }
     Link link;

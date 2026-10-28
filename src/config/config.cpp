@@ -47,7 +47,7 @@ std::string ordinal(size_t n) {
     return std::to_string(n) + end;
 }
 
-// errors name a table by what it says it is: device "face" (the 2nd [[device]])
+// errors name a table by what it says it is: device "screen" (the 2nd [[device]])
 std::string table_label(const toml::node& e, const char* name, const char* named_by, size_t index) {
     std::string where = "the " + ordinal(index) + " [[" + name + "]]";
     const toml::table* t = e.as_table();
@@ -117,7 +117,7 @@ bool parse_usb(const std::string& s, uint16_t& vendor, uint16_t& product) {
 
 void device_table(StrictTable& o, DeviceConfig& d) {
     o.str("id", d.id, 32, false);
-    if (o.ok() && d.id.empty()) o.fail("id", "is missing: give the device a short name such as \"face\"");
+    if (o.ok() && d.id.empty()) o.fail("id", "is missing: give the device a short name such as \"screen\"");
     if (o.ok()) o.check("id", check_device_id(d.id));
     o.str("label", d.label, 64);
     auto named = [&](const char* name, const char* older) -> const char* {
