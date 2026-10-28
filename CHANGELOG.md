@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1 - 2026-10-28
+
+- The README is cut down to the basics, and the OSC interface has its own short reference,
+  OSC.md, installed next to the README in `/usr/share/doc/touch-to-osc`. Nothing on the
+  wire changed (still osc_api 6).
+
 ## 0.7.0 - 2026-10-26
 
 OSC interface version 6, agreed with Bridge Studio: an app can find touch-to-osc, read what

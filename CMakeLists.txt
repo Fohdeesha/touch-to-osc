@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(touch-to-osc VERSION 0.7.0 LANGUAGES CXX)
+project(touch-to-osc VERSION 0.7.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,7 +52,7 @@ install(FILES config.example.toml DESTINATION ${CMAKE_INSTALL_DATADIR}/touch-to-
 install(PROGRAMS tools/watch.py DESTINATION ${CMAKE_INSTALL_DATADIR}/touch-to-osc)
 file(CREATE_LINK ../${CMAKE_INSTALL_DATADIR}/touch-to-osc/watch.py ${CMAKE_BINARY_DIR}/touch-to-osc-watch SYMBOLIC)
 install(FILES ${CMAKE_BINARY_DIR}/touch-to-osc-watch DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES README.md CHANGELOG.md packaging/deb/copyright DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(FILES README.md OSC.md CHANGELOG.md packaging/deb/copyright DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_GENERATOR DEB)
 set(CPACK_PACKAGE_NAME touch-to-osc)
