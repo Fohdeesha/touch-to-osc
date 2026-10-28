@@ -1,5 +1,7 @@
 # touch-to-osc
 
+![A USB touchscreen feeds touch-to-osc, which sends every touch as OSC over UDP](assets/diagram.svg)
+
 Reads USB touchscreens on Linux and sends every touch out as OSC over UDP. It also reports
 its own health over OSC: a heartbeat every second, a status you can subscribe to, events,
 and an answer to every command.
