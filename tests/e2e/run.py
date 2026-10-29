@@ -2352,6 +2352,8 @@ def devices_added_and_removed_over_osc_are_saved_and_applied_by_a_restart():
         d = c.daemon([device(pa)])
         r = c.receiver()
         connected(r)
+        # screens found by the first scan, about 1.5 s after the start, count as there from the start and are not announced
+        time.sleep(2)
         m = r.mark()
         sb = c.screen(pb)
         ours = lambda args: [a for a in args if " 7470:" in a]
@@ -2570,6 +2572,107 @@ def fake_usb_tree(name):
         f.write("1\n")
     os.mkfifo(os.path.join(devices, "usb3", "busnum"))
     return root
+
+
+def stuck_usb_tree(name, others=()):
+    """fake_usb_tree whose port 3-3 reads as plugged in but not set up (port-status/3-3), so recovery acts on it; others are
+    (name, product) of devices on the same bus."""
+    root = fake_usb_tree(name)
+    devices = os.path.join(root, "sys", "bus", "usb", "devices")
+    os.remove(os.path.join(devices, "usb3", "busnum"))
+    with open(os.path.join(devices, "usb3", "busnum"), "w") as f:
+        f.write("3\n")
+    os.makedirs(os.path.join(root, "port-status"))
+    set_port_status(root, 1)
+    for other, product in others:
+        os.makedirs(os.path.join(devices, other))
+        with open(os.path.join(devices, other, "product"), "w") as f:
+            f.write(product)
+    return root
+
+
+def set_port_status(root, status):
+    tmp = os.path.join(root, "port-status", ".3-3")
+    with open(tmp, "w") as f:
+        f.write("%d\n" % status)
+    os.replace(tmp, os.path.join(root, "port-status", "3-3"))
+
+
+def automatic_reset(attempt=None):
+    want = "but the kernel has not set it up; reset USB bus 3 in "
+    tail = "(attempt %d of 5, nothing else was on it)" % attempt if attempt else ""
+    return lambda x: x.args[0] == "usb" and want in x.args[1] and tail in x.args[1]
+
+
+@test(slow=True)
+def usb_recovery_stops_after_5_resets_and_an_unplug_starts_it_over():
+    root = stuck_usb_tree("usb-giveup")
+    unbind = os.path.join(root, "sys", "bus", "usb", "drivers", "hub", "unbind")
+    with Ctx("usbgiveup") as c:
+        c.daemon([device(test_product(), port="3-3")], env={"TTO_USB_ROOT": root})
+        r = c.receiver()
+        r.wait("/touch/device/t/usb_port_state", lambda x: x.args == ["plugged in but not set up"], timeout=4)
+        resets = r.wait("/touch/event", automatic_reset(), timeout=50, count=5)
+        for n, e in enumerate(resets, 1):
+            check("(attempt %d of 5, nothing else was on it)" % n in e.args[1] and e.args[2:] == ["warning", "t"], "reset %d: %s" % (n, e.args))
+        gave = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "did not bring it back" in x.args[1], timeout=25)
+        check(gave.args == ["usb", "t: something is plugged into USB port 3-3 but the kernel has not set it up, and 5 USB resets did not bring it back, so"
+                            " touch-to-osc stopped resetting it: check the cable and its joints, then unplug the screen and plug it back in, or send"
+                            " /touch/device/t/usb_reset to try again", "warning", "t"], "the give-up event %s" % gave.args)
+        check(gave.at - resets[-1].at >= 14, "gave up %.1f s after the last reset, not after waiting for it" % (gave.at - resets[-1].at))
+        r.wait("/touch/device/t/reason", lambda x: "5 USB resets did not bring it back" in x.args[0], timeout=3)
+        r.wait("/touch/reasons", lambda x: any("5 USB resets did not bring it back" in a for a in x.args), timeout=3)
+        m = r.mark()
+        r.none("/touch/event", lambda x: x.args[0] == "usb", during=20, since=m)
+        check(len(r.all(0, "/touch/event", automatic_reset())) == 5, "more than 5 automatic resets")
+        check(req(r, "/touch/device/t/usb_reset") == ["ok", ""], "a usb_reset asked for after recovery gave up")
+        r.wait("/touch/event", lambda x: x.args[0] == "usb" and "USB bus 3 reset in" in x.args[1] and "as asked" not in x.args[1], since=m, timeout=3)
+        r.wait("/touch/device/t/usb_resets", lambda x: x.args == [6], since=m, timeout=3)
+        m = r.mark()
+        r.none("/touch/event", automatic_reset(), during=4, since=m)
+        set_port_status(root, 0)
+        r.wait("/touch/device/t/usb_port_state", lambda x: x.args == ["nothing plugged in"], since=m, timeout=3)
+        with open(unbind, "w") as f:
+            f.truncate()
+        m = r.mark()
+        set_port_status(root, 1)
+        r.wait("/touch/event", automatic_reset(1), since=m, timeout=5)
+        with open(unbind) as f:
+            check(f.read() == "3-0:1.0", "the hub was not unbound for the reset after the replug")
+        r.wait("/touch/device/t/usb_resets", lambda x: x.args == [7], since=m, timeout=3)
+
+
+@test(slow=True)
+def usb_recovery_never_resets_a_hub_that_holds_other_devices():
+    root = stuck_usb_tree("usb-held", others=(("3-1", "Test Keyboard\n"), ("4-1", "Elsewhere\n")))
+    devices = os.path.join(root, "sys", "bus", "usb", "devices")
+    hub = os.path.join(root, "sys", "bus", "usb", "drivers", "hub")
+    with Ctx("usbheld") as c:
+        c.daemon([device(test_product(), port="3-3")], env={"TTO_USB_ROOT": root})
+        r = c.receiver()
+        held = r.wait("/touch/event", lambda x: x.args[0] == "usb", timeout=5)
+        check(held.args == ["usb", "t: something is plugged into USB port 3-3 but the kernel has not set it up; touch-to-osc does not reset USB bus 3 by"
+                            " itself, because that would also drop Test Keyboard (3-1): unplug the screen and plug it back in, give it a USB port of its own,"
+                            " or send /touch/device/t/usb_reset to reset it anyway", "warning", "t"], "the event %s" % held.args)
+        r.wait("/touch/device/t/reason", lambda x: "would also drop Test Keyboard (3-1)" in x.args[0], timeout=3)
+        m = r.mark()
+        r.none("/touch/event", lambda x: x.args[0] == "usb", during=5, since=m)
+        for f in ("unbind", "bind"):
+            with open(os.path.join(hub, f)) as fh:
+                check(fh.read() == "", "the hub's %s was written" % f)
+        check(r.all(0, "/touch/device/t/usb_resets")[-1].args == [0], "usb_resets counts a reset that did not happen")
+        m = r.mark()
+        check(req(r, "/touch/device/t/usb_recovery", 0) == ["ok", ""], "usb_recovery 0")
+        check(req(r, "/touch/device/t/usb_recovery", 1) == ["ok", ""], "usb_recovery 1")
+        r.wait("/touch/event", lambda x: x.args[0] == "usb" and "would also drop Test Keyboard (3-1)" in x.args[1], since=m, timeout=5)
+        shutil.rmtree(os.path.join(devices, "3-1"))
+        m = r.mark()
+        set_port_status(root, 0)
+        r.wait("/touch/device/t/usb_port_state", lambda x: x.args == ["nothing plugged in"], since=m, timeout=3)
+        set_port_status(root, 1)
+        r.wait("/touch/event", automatic_reset(1), since=m, timeout=5)
+        with open(os.path.join(hub, "unbind")) as fh:
+            check(fh.read() == "3-0:1.0", "the hub was not unbound once nothing else was on it")
 
 
 @test(slow=True)

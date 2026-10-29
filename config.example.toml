@@ -105,7 +105,8 @@ silence_ms = 200
 enabled = true
 # While this screen is gone, watch the USB port it was last on (or match_port, above):
 # when something is plugged in there that the kernel has given up on for 10 s, reset the
-# USB hub of that port so the kernel tries again. On a port of the computer itself that
-# drops every device on that USB bus for a moment (sudo touch-to-osc --list names them).
+# USB hub of that port so the kernel tries again, up to 5 times; unplugging the screen
+# starts it over. It never resets a hub that also holds other devices (on a port of the
+# computer itself that is the whole USB bus; sudo touch-to-osc --list names them).
 # See "USB recovery" in the README.
 usb_recovery = true

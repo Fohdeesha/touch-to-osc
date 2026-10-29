@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.3 - 2026-10-28
+
+- USB recovery gives up. It resets a stuck screen's USB at most 5 times (10, 20, 40, 80
+  and 160 s apart), then stops and says so in the health and an event, where it used to
+  go on every 5 minutes for as long as the screen stayed stuck. Unplugging the screen
+  starts it over, up to 10 resets until the screen reads touches again; turning
+  `usb_recovery` off and on starts it over too.
+- USB recovery never resets a hub that holds anything besides the screen (on a port of
+  the computer itself, that's the whole USB bus). It says what a reset would drop and
+  leaves it to you: `usb_reset` still resets it when you send it. `--list` says so too.
+- Nothing on the wire changed (still osc_api 6); the `usb` events and reasons read
+  differently.
+
 ## 0.7.2 - 2026-10-28
 
 - The example config's screen is now `id = "screen"` with no label (it was `face`), so a

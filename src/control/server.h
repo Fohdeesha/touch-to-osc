@@ -167,6 +167,7 @@ private:
     void finish_usb_reset(Nanos now, const UsbWorker::Done& done);
     void start_usb_reset(size_t index, const UsbPortRef& ref, const std::string& asked_by);
     std::string usb_reason(size_t index) const;
+    std::string usb_port_text(size_t index) const;
     void send_bye();
     void report_destinations(Nanos now);
 
@@ -232,6 +233,7 @@ private:
     std::vector<bool> usb_watching_;
     std::vector<std::string> usb_why_;
     std::vector<uint64_t> usb_resets_;
+    std::vector<std::string> usb_held_by_;
     UniqueFd osc_fd_;
     UniqueFd send_fd_;
     UniqueFd notify_fd_;

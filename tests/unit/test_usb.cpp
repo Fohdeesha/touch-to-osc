@@ -10,8 +10,10 @@
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 
 using namespace tto;
+using Step = UsbRecovery::Step;
 
 namespace {
 
@@ -63,21 +65,95 @@ TEST_CASE("USB port paths name the hub that holds the port") {
 TEST_CASE("recovery waits 10 s on a stuck port, then backs off, and never acts on an empty one") {
     UsbRecovery r;
     const Nanos s = kSec;
-    CHECK_FALSE(r.observe(0, PortState::stuck));
-    CHECK_FALSE(r.observe(9 * s, PortState::stuck));
-    CHECK(r.observe(10 * s, PortState::stuck));
+    CHECK(r.observe(0, PortState::stuck) == Step::wait);
+    CHECK(r.observe(9 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(10 * s, PortState::stuck) == Step::reset);
     r.reset_done(10 * s);
     CHECK(r.attempts() == 1);
-    CHECK_FALSE(r.observe(29 * s, PortState::stuck));
-    CHECK(r.observe(30 * s, PortState::stuck));
+    CHECK(r.observe(29 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(30 * s, PortState::stuck) == Step::reset);
     r.reset_done(30 * s);
-    CHECK_FALSE(r.observe(69 * s, PortState::stuck));
-    CHECK(r.observe(70 * s, PortState::stuck));
-    for (int i = 0; i < 10; ++i) r.reset_done(100 * s);
-    CHECK(UsbRecovery::wait_for(r.attempts()) == 300 * s);
-    CHECK(UsbRecovery::wait_for(2) == 40 * s);
-    CHECK(UsbRecovery::wait_for(4) == 160 * s);
-    for (Nanos t = 0; t < 1000 * s; t += s) CHECK_FALSE(r.observe(2000 * s + t, PortState::empty));
+    CHECK(r.observe(69 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(70 * s, PortState::stuck) == Step::reset);
+    CHECK(r.wait_for(2) == 40 * s);
+    CHECK(r.wait_for(4) == 160 * s);
+    CHECK(r.wait_for(9) == 160 * s);
+    CHECK(UsbRecovery(10).wait_for(0) == s);
+    for (Nanos t = 0; t < 1000 * s; t += s) CHECK(r.observe(2000 * s + t, PortState::empty) == Step::wait);
+}
+
+TEST_CASE("recovery stops after 5 resets that did not bring the screen back, and says so once") {
+    UsbRecovery r;
+    const Nanos s = kSec;
+    Nanos t = 0;
+    r.observe(t, PortState::stuck);
+    for (int i = 0; i < kUsbResetsPerSpell; ++i) {
+        t += r.wait_for(i);
+        CHECK(r.observe(t - 1, PortState::stuck) == Step::wait);
+        REQUIRE(r.observe(t, PortState::stuck) == Step::reset);
+        r.reset_done(t);
+    }
+    CHECK(r.attempts() == 5);
+    CHECK(r.tries() == 5);
+    CHECK_FALSE(r.gave_up());
+    CHECK(r.observe(t + 159 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(t + 160 * s, PortState::stuck) == Step::give_up);
+    CHECK(r.gave_up());
+    for (Nanos u = 161 * s; u < 3600 * s; u += 7 * s) CHECK(r.observe(t + u, PortState::stuck) == Step::wait);
+    r.observe(t + 3600 * s, PortState::empty);
+    CHECK_FALSE(r.gave_up());
+    CHECK(r.attempts() == 0);
+    CHECK(r.tries() == 5);
+    r.observe(t + 3601 * s, PortState::stuck);
+    CHECK(r.observe(t + 3611 * s, PortState::stuck) == Step::reset);
+}
+
+TEST_CASE("an unplug starts the tries over, up to 10 resets in all until the screen reads again") {
+    UsbRecovery r;
+    const Nanos s = kSec;
+    Nanos t = 0;
+    auto spell = [&](int resets) {
+        r.observe(t, PortState::stuck);
+        for (int i = 0; i < resets; ++i) {
+            t += r.wait_for(i);
+            REQUIRE(r.observe(t, PortState::stuck) == Step::reset);
+            r.reset_done(t);
+        }
+        t += r.wait_for(resets);
+        CHECK(r.observe(t, PortState::stuck) == Step::give_up);
+        r.observe(t + s, PortState::empty);
+        t += 7 * s;
+        r.observe(t, PortState::empty);
+    };
+    spell(5);
+    CHECK(r.tries() == 5);
+    CHECK_FALSE(r.gave_up());
+    spell(5);
+    CHECK(r.tries() == 10);
+    spell(0);
+    r.connected();
+    CHECK(r.tries() == 0);
+    r.observe(t, PortState::stuck);
+    CHECK(r.observe(t + 10 * s, PortState::stuck) == Step::reset);
+}
+
+TEST_CASE("a held reset stops the tries until an unplug or the screen reading again") {
+    UsbRecovery r;
+    const Nanos s = kSec;
+    r.observe(0, PortState::stuck);
+    REQUIRE(r.observe(10 * s, PortState::stuck) == Step::reset);
+    r.hold();
+    CHECK(r.held());
+    CHECK(r.tries() == 0);
+    for (Nanos t = 11 * s; t < 3600 * s; t += 7 * s) CHECK(r.observe(t, PortState::stuck) == Step::wait);
+    r.observe(3600 * s, PortState::empty);
+    CHECK_FALSE(r.held());
+    r.observe(3601 * s, PortState::stuck);
+    CHECK(r.observe(3610 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(3611 * s, PortState::stuck) == Step::reset);
+    r.hold();
+    r.connected();
+    CHECK_FALSE(r.held());
 }
 
 TEST_CASE("a moment of an empty port keeps the backoff; a real unplug forgets it; the screen coming back forgets it") {
@@ -98,8 +174,8 @@ TEST_CASE("a moment of an empty port keeps the backoff; a real unplug forgets it
     CHECK(r.attempts() == 1);
     r.connected();
     CHECK(r.attempts() == 0);
-    CHECK_FALSE(r.observe(30 * s, PortState::stuck));
-    CHECK(r.observe(40 * s, PortState::stuck));
+    CHECK(r.observe(30 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(40 * s, PortState::stuck) == Step::reset);
 }
 
 TEST_CASE("another state between stuck readings starts the wait again") {
@@ -107,15 +183,30 @@ TEST_CASE("another state between stuck readings starts the wait again") {
     const Nanos s = kSec;
     r.observe(0, PortState::stuck);
     r.observe(8 * s, PortState::enumerated);
-    CHECK_FALSE(r.observe(9 * s, PortState::stuck));
-    CHECK_FALSE(r.observe(18 * s, PortState::stuck));
-    CHECK(r.observe(19 * s, PortState::stuck));
+    CHECK(r.observe(9 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(18 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(19 * s, PortState::stuck) == Step::reset);
     UsbRecovery k;
     k.observe(0, PortState::stuck);
-    CHECK_FALSE(k.observe(9 * s, PortState::setting_up));
-    CHECK_FALSE(k.observe(10 * s, PortState::stuck));
-    CHECK_FALSE(k.observe(19 * s, PortState::stuck));
-    CHECK(k.observe(20 * s, PortState::stuck));
+    CHECK(k.observe(9 * s, PortState::setting_up) == Step::wait);
+    CHECK(k.observe(10 * s, PortState::stuck) == Step::wait);
+    CHECK(k.observe(19 * s, PortState::stuck) == Step::wait);
+    CHECK(k.observe(20 * s, PortState::stuck) == Step::reset);
+}
+
+TEST_CASE("under a test root the port status comes from a file") {
+    TempDir dir;
+    UsbPaths p = usb_paths_under(dir.path);
+    auto ref = parse_usb_port("3-3");
+    REQUIRE(ref);
+    CHECK(read_port_state(*ref, p, nullptr) == PortState::unknown);
+    mkdir(p.port_status.c_str(), 0755);
+    const std::pair<const char*, PortState> cases[] = {{"1\n", PortState::stuck}, {"3\n", PortState::setting_up}, {"0\n", PortState::empty}};
+    for (const auto& [text, state] : cases) {
+        std::ofstream(p.port_status + "/3-3") << text;
+        CHECK(read_port_state(*ref, p, nullptr) == state);
+    }
+    CHECK(UsbPaths().port_status.empty());
 }
 
 TEST_CASE("the port status bits: a port the kernel is still setting up is not stuck") {
@@ -244,12 +335,52 @@ TEST_CASE("a reset advances the wait of every screen watched on that hub, and on
     CHECK(recs[1].attempts() == 1);
     CHECK(recs[2].attempts() == 0);
     CHECK(recs[3].attempts() == 0);
-    CHECK_FALSE(recs[1].observe(11 * s, PortState::stuck));
-    CHECK_FALSE(recs[1].observe(29 * s, PortState::stuck));
-    CHECK(recs[1].observe(30 * s, PortState::stuck));
+    CHECK(recs[1].observe(11 * s, PortState::stuck) == Step::wait);
+    CHECK(recs[1].observe(29 * s, PortState::stuck) == Step::wait);
+    CHECK(recs[1].observe(30 * s, PortState::stuck) == Step::reset);
     reset_done_on_hub(recs, watched, 3, "", 40 * s);
     CHECK(recs[3].attempts() == 1);
     CHECK(recs[0].attempts() == 1);
+}
+
+TEST_CASE("an automatic reset leaves a hub alone that holds anything else, and says what") {
+    TempDir dir;
+    const std::string& root = dir.path;
+    UsbPaths p;
+    p.devices = root + "/devices";
+    p.hub_driver = root + "/hub";
+    mkdir(p.devices.c_str(), 0755);
+    mkdir(p.hub_driver.c_str(), 0755);
+    mkdir((p.devices + "/3-0:1.0").c_str(), 0755);
+    mkdir((p.devices + "/3-0:1.0/driver").c_str(), 0755);
+    mkdir((p.devices + "/4-1").c_str(), 0755);
+    UsbWorker w(p);
+    auto run = [&](bool only_if_alone) {
+        touch(p.hub_driver + "/unbind");
+        touch(p.hub_driver + "/bind");
+        w.reset(*parse_usb_port("3-3"), 0, only_if_alone);
+        REQUIRE(w.wait(2 * kSec));
+        UsbWorker::Done done;
+        REQUIRE(w.finished(done));
+        CHECK(done.reset);
+        return done;
+    };
+    auto alone = run(true);
+    CHECK_FALSE(alone.held);
+    CHECK(alone.result);
+    CHECK(alone.dropped.empty());
+    CHECK(slurp(p.hub_driver + "/unbind").find("3-0:1.0") == 0);
+    mkdir((p.devices + "/3-1").c_str(), 0755);
+    std::ofstream(p.devices + "/3-1/product") << "Test Keyboard\n";
+    auto held = run(true);
+    CHECK(held.held);
+    CHECK(held.dropped == std::vector<std::string>{"Test Keyboard (3-1)"});
+    CHECK(slurp(p.hub_driver + "/unbind").find("3-0:1.0") == std::string::npos);
+    CHECK(slurp(p.hub_driver + "/bind").find("3-0:1.0") == std::string::npos);
+    auto asked = run(false);
+    CHECK_FALSE(asked.held);
+    CHECK(asked.result);
+    CHECK(slurp(p.hub_driver + "/unbind").find("3-0:1.0") == 0);
 }
 
 TEST_CASE("a finished reset counts as busy until its result is collected") {

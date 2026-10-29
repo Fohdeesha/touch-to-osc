@@ -133,7 +133,10 @@ int list_devices(const Config* cfg, const SysPaths& paths, bool all) {
             std::string at = n.usb_port.empty() ? printable(n.phys) : n.usb_port;
             if (!at.empty()) std::printf("        match_port = \"%s\"\n", at.c_str());
         }
-        if (auto ref = parse_usb_port(n.usb_port)) std::printf("    a USB reset for it resets %s\n", usb_reset_reach(*ref, usb).c_str());
+        if (auto ref = parse_usb_port(n.usb_port)) {
+            std::printf("    a USB reset for it resets %s\n", usb_reset_reach(*ref, usb).c_str());
+            if (!usb_neighbours(*ref, usb).empty()) std::printf("    so usb_recovery never resets it by itself, only a usb_reset you send does\n");
+        }
         std::printf("\n");
     }
     if (screens == 0) std::printf("no touchscreens found\n\n");

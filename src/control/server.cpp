@@ -379,7 +379,8 @@ void Server::banner() {
                    d.enabled ? "" : ", turned off in the config");
     }
     if (!usb_root_.empty())
-        TTO_WARN("USB recovery looks for USB under %s, not the machine's own (TTO_USB_ROOT is set): that is for tests only, unset it", usb_root_.c_str());
+        TTO_WARN("USB recovery looks for USB under %s, not the machine's own, and waits a tenth as long between resets (TTO_USB_ROOT is set): that is for tests only, unset it",
+                 usb_root_.c_str());
     if (cfg_.destinations.empty()) TTO_NOTICE("no saved destinations: everything goes to subscribers");
     for (const auto& d : cfg_.destinations)
         TTO_NOTICE("destination %s:%d gets %s", d.address.host.c_str(), d.address.port,
@@ -440,12 +441,13 @@ int Server::run() {
         stats_.emplace_back();
         cfg_gen_.push_back(0);
         restart_gen_.push_back(0);
-        usb_rec_.emplace_back();
+        usb_rec_.emplace_back(usb_root_.empty() ? 1 : 10);
         usb_last_port_.emplace_back();
         usb_state_.push_back(PortState::unknown);
         usb_watching_.push_back(false);
         usb_why_.emplace_back();
         usb_resets_.push_back(0);
+        usb_held_by_.emplace_back();
         calibrate_until_.push_back(0);
     }
     std::string note;
@@ -1098,8 +1100,8 @@ void Server::watch_usb(Nanos now) {
                 usb_last_port_[i] = info.usb_port;
                 remember_port(i);
             }
-            if (usb_rec_[i].attempts() > 0)
-                emit(d.id + "/usb", log::Level::notice, "usb", d.id + " is back after " + count_text(unsigned(usb_rec_[i].attempts()), "USB reset"), d.id);
+            if (usb_rec_[i].tries() > 0)
+                emit(d.id + "/usb", log::Level::notice, "usb", d.id + " is back after " + count_text(unsigned(usb_rec_[i].tries()), "USB reset"), d.id);
             usb_rec_[i].connected();
         }
         std::optional<UsbPortRef> ref;
@@ -1133,7 +1135,16 @@ void Server::note_port(size_t index, const std::string& port, PortState state, c
     usb_why_[index] = state == PortState::unknown ? why : std::string();
     usb_state_[index] = state;
     usb_watching_[index] = true;
-    if (usb_rec_[index].observe(now, state) && !usb_due_) usb_due_ = index;
+    switch (usb_rec_[index].observe(now, state)) {
+    case UsbRecovery::Step::reset:
+        if (!usb_due_) usb_due_ = index;
+        break;
+    case UsbRecovery::Step::give_up:
+        emit(d.id + "/usb", log::Level::warning, "usb", d.id + ": something is " + usb_reason(index), d.id);
+        status_dirty_ = true;
+        break;
+    case UsbRecovery::Step::wait: break;
+    }
 }
 
 void Server::collect_usb(Nanos now, bool start_next) {
@@ -1168,18 +1179,21 @@ void Server::start_usb_reset(size_t index, const UsbPortRef& ref, const std::str
     if (usb_worker_manual_)
         emit(id + "/usb", log::Level::warning, "usb",
              id + ": resetting " + usb_worker_target_ + " as asked by " + asked_by + "; every device on it drops for a moment", id);
-    else
-        emit(id + "/usb", log::Level::warning, "usb",
-             id + ": something is plugged into USB port " + ref.path + " but the kernel has not set it up; resetting " + usb_worker_target_ + " (attempt " +
-                 std::to_string(usb_rec_[index].attempts() + 1) + "); every device on it drops for a moment",
-             id);
-    usb_worker_.reset(ref, monotonic_ns());
+    usb_worker_.reset(ref, monotonic_ns(), !usb_worker_manual_);
     status_dirty_ = true;
 }
 
 void Server::finish_usb_reset(Nanos now, const UsbWorker::Done& done) {
     size_t i = usb_worker_dev_;
     const std::string& id = cfg_.devices[i].id;
+    if (done.held) {
+        usb_held_by_[i].clear();
+        for (size_t k = 0; k < done.dropped.size(); ++k) usb_held_by_[i] += (k ? ", " : "") + done.dropped[k];
+        usb_rec_[i].hold();
+        emit(id + "/usb", log::Level::warning, "usb", id + ": something is " + usb_reason(i), id);
+        status_dirty_ = true;
+        return;
+    }
     ++usb_resets_[i];
     if (!usb_worker_manual_) {
         std::vector<std::string> watched(usb_rec_.size());
@@ -1194,8 +1208,16 @@ void Server::finish_usb_reset(Nanos now, const UsbWorker::Done& done) {
     if (done.result) {
         usb_problem_.clear();
         usb_problem_dev_ = SIZE_MAX;
-        emit(id + "/usb", log::Level::notice, "usb",
-             id + ": " + usb_worker_target_ + " reset in " + std::to_string(done.took / kMs) + " ms (" + also + "); waiting for the touchscreen to come back", id);
+        std::string took = std::to_string(done.took / kMs) + " ms";
+        if (usb_worker_manual_)
+            emit(id + "/usb", log::Level::notice, "usb",
+                 id + ": " + usb_worker_target_ + " reset in " + took + " (" + also + "); waiting for the touchscreen to come back", id);
+        else
+            emit(id + "/usb", log::Level::warning, "usb",
+                 id + ": something is plugged into USB port " + usb_port_text(i) + " but the kernel has not set it up; reset " + usb_worker_target_ + " in " + took +
+                     " (attempt " + std::to_string(usb_rec_[i].attempts()) + " of " + std::to_string(kUsbResetsPerSpell) + ", " + also +
+                     "); waiting for the touchscreen to come back",
+                 id);
     } else {
         usb_problem_ = done.result.error();
         usb_problem_dev_ = i;
@@ -1204,12 +1226,25 @@ void Server::finish_usb_reset(Nanos now, const UsbWorker::Done& done) {
     status_dirty_ = true;
 }
 
+std::string Server::usb_port_text(size_t index) const {
+    auto ref = usb_port_of(index);
+    return ref ? ref->path : std::string("?");
+}
+
 std::string Server::usb_reason(size_t index) const {
     auto ref = usb_port_of(index);
-    std::string port = ref ? ref->path : std::string("?");
-    std::string tries = count_text(usb_resets_[index], "reset") + " so far";
-    return "plugged into USB port " + port + " but the kernel has not set it up; touch-to-osc resets the USB connection by itself (" + tries +
-           "). If this keeps happening, check the cable and its joints";
+    std::string head = "plugged into USB port " + usb_port_text(index) + " but the kernel has not set it up";
+    std::string send = "send " + prefix_ + "/device/" + cfg_.devices[index].id + "/usb_reset";
+    const UsbRecovery& rec = usb_rec_[index];
+    if (rec.held())
+        return head + "; touch-to-osc does not reset " + (ref ? usb_target_text(*ref) : std::string("its USB hub")) + " by itself, because that would also drop " +
+               usb_held_by_[index] + ": unplug the screen and plug it back in, give it a USB port of its own, or " + send + " to reset it anyway";
+    if (rec.gave_up())
+        return head + ", and " + count_text(unsigned(rec.tries()), "USB reset") +
+               " did not bring it back, so touch-to-osc stopped resetting it: check the cable and its joints, then unplug the screen and plug it back in, or " + send +
+               " to try again";
+    return head + "; touch-to-osc resets the USB connection by itself (" + count_text(usb_resets_[index], "reset") +
+           " so far). If this keeps happening, check the cable and its joints";
 }
 
 std::string Server::disabled_reason(size_t index) const {
@@ -2017,6 +2052,7 @@ void Server::apply_effects(const Config& old) {
             usb_rec_[i].connected();
             usb_watching_[i] = false;
         }
+        if (a.usb_recovery != b.usb_recovery) usb_rec_[i].connected();
         if (reopen) claims_.set_device(i, b);
         if (reopen || remaps(a, b)) {
             std::lock_guard<std::mutex> lock(sh.cfg_mutex);

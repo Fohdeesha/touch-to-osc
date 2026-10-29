@@ -178,7 +178,7 @@ def main():
             reason = r.wait(base + "reason", lambda x: "the kernel has not set it up" in x.args[0], since=m, timeout=4).args[0]
             check("USB port %s" % port in reason, "reason %r" % reason)
             r.wait("/touch/health", lambda x: x.args == ["fault"], since=m)
-            reset = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "(attempt 1)" in x.args[1], since=m, timeout=15)
+            reset = r.wait("/touch/event", lambda x: x.args[0] == "usb" and "(attempt 1 of 5, nothing else was on it)" in x.args[1], since=m, timeout=15)
             back = connected(1, since=m, timeout=10)
             r.wait("/touch/event", lambda x: x.args[0] == "usb" and "is back after 1 USB reset" in x.args[1], since=m, timeout=3)
             r.wait(base + "usb_port_state", lambda x: x.args == [""], since=m, timeout=3)
@@ -204,7 +204,7 @@ def main():
             m2 = r.mark()
             check(req(r, base + "usb_recovery", 1) == ["ok", ""], "usb_recovery 1 refused")
             recovery_off_left[0] = False
-            r.wait("/touch/event", lambda x: x.args[0] == "usb" and "(attempt 1)" in x.args[1], since=m2, timeout=15)
+            r.wait("/touch/event", lambda x: x.args[0] == "usb" and "(attempt 1 of 5, nothing else was on it)" in x.args[1], since=m2, timeout=15)
             connected(1, since=m2, timeout=10)
 
         step("recovery off: nothing is reset; turned on, the screen comes back", recovery_off)

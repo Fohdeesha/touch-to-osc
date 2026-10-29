@@ -116,11 +116,13 @@ To find out which screen is which, `touch-to-osc --send identify 30` pauses touc
 A flaky USB connection (a bad extender, a loose plug) can leave a screen plugged in that
 the kernel has given up on until you replug it. With `usb_recovery = true` (the default),
 when the screen's port sits like that for 10 s the daemon resets the USB hub so the kernel
-tries again, backing off to once every 5 minutes if the screen doesn't come back.
+tries again. It tries 5 times (10, 20, 40, 80 and 160 s apart), then stops and says so in
+the health. Unplugging the screen starts it over. A port with nothing in it is never reset.
 
-On a port of the computer itself that drops everything on that USB bus for a moment.
-`sudo touch-to-osc --list` shows what else is on it. If that's a problem, put the screen on
-its own bus or set `usb_recovery = false`.
+On a port of the computer itself a reset drops everything on that USB bus, so the daemon
+only does it when nothing else is on it, and otherwise tells you what's in the way.
+`sudo touch-to-osc --list` shows what else is on it. Give the screen a bus of its own, or
+send `usb_reset` to reset it anyway.
 
 ## Troubleshooting
 
@@ -136,7 +138,7 @@ its own bus or set `usb_recovery = false`.
 | Touches rotated, flipped or offset | see Lining up the touch panel |
 | Two screens swapped | set `match_port` on each |
 | `--dump` shows nothing | the service holds the screen, stop it first |
-| Other USB devices drop out for a moment | a USB recovery reset, see above |
+| Other USB devices drop out for a moment | someone sent `usb_reset`, see USB recovery |
 | A tool gets no answer | answers go back to the port the command came from, so send and listen on the same one |
 
 ## Command line

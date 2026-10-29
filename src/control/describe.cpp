@@ -135,7 +135,7 @@ std::vector<std::string> Server::describe_items() const {
                           .add("value", d.serial).add("config", f.serial).add("source", source(bool(o.match_serial))).text());
         out.push_back(setting(b + "match_port", d.id, "USB port", "text", "reopens", "The USB socket the screen is plugged into, such as 3-3, to tell identical screens apart.")
                           .add("value", d.port).add("config", f.port).add("source", source(bool(o.match_port))).text());
-        out.push_back(setting(b + "usb_recovery", d.id, "USB recovery", "flag", "live", "Resets a USB connection the kernel gave up on while the screen is gone.")
+        out.push_back(setting(b + "usb_recovery", d.id, "USB recovery", "flag", "live", "Resets a USB connection the kernel gave up on while the screen is gone, up to 5 times, and never when that would drop other devices.")
                           .add("value", d.usb_recovery).add("config", f.usb_recovery).add("source", source(bool(o.usb_recovery))).text());
         auto ref = usb_port_of(k);
         action(b + "usb_reset", d.id, "Reset USB", "",

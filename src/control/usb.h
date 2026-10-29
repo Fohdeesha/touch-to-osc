@@ -19,6 +19,7 @@ struct UsbPaths {
     std::string devices = "/sys/bus/usb/devices";
     std::string hub_driver = "/sys/bus/usb/drivers/hub";
     std::string dev = "/dev/bus/usb";
+    std::string port_status;
 };
 
 UsbPaths usb_paths_under(const std::string& root);
@@ -44,20 +45,34 @@ std::vector<std::string> usb_neighbours(const UsbPortRef& ref, const UsbPaths& p
 std::string usb_target_text(const UsbPortRef& ref);
 std::string usb_reset_reach(const UsbPortRef& ref, const UsbPaths& paths);
 
+constexpr int kUsbResetsPerSpell = 5;
+constexpr int kUsbResetsUntilBack = 10;
+
 class UsbRecovery {
 public:
-    bool observe(Nanos now, PortState state);
+    enum class Step { wait, reset, give_up };
+
+    explicit UsbRecovery(int speedup = 1) : speedup_(speedup) {}
+    Step observe(Nanos now, PortState state);
     void reset_done(Nanos now);
+    void hold();
     void connected();
     int attempts() const { return attempts_; }
-    static Nanos wait_for(int attempts);
+    int tries() const { return tries_; }
+    bool held() const { return held_; }
+    bool gave_up() const { return gave_up_; }
+    Nanos wait_for(int attempts) const;
 
 private:
+    int speedup_ = 1;
     bool stuck_ = false;
     bool empty_ = false;
+    bool held_ = false;
+    bool gave_up_ = false;
     Nanos stuck_since_ = 0;
     Nanos empty_since_ = 0;
     int attempts_ = 0;
+    int tries_ = 0;
 };
 
 // a reset of a hub resets every port on it: each screen watched there (hub interface in `watched`, "" for none) waits as
@@ -79,6 +94,7 @@ class UsbWorker {
 public:
     struct Done {
         bool reset = false;
+        bool held = false;
         std::vector<UsbReading> readings;
         std::vector<std::string> dropped;
         Status result;
@@ -93,7 +109,7 @@ public:
     const UsbPaths& paths() const { return paths_; }
     void set_marker(std::string marker) { marker_ = std::move(marker); }
     void check(std::vector<std::pair<size_t, UsbPortRef>> ports, Nanos now);
-    void reset(const UsbPortRef& ref, Nanos now);
+    void reset(const UsbPortRef& ref, Nanos now, bool only_if_alone = false);
     bool busy() const { return job_ != nullptr; }
     bool resetting() const { return job_ && job_->reset; }
     Nanos busy_since() const { return job_ ? job_->started : 0; }

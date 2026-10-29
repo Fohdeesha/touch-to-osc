@@ -115,6 +115,10 @@ PortState port_state_from(uint16_t port_status, bool device_present) {
 
 PortState read_port_state(const UsbPortRef& ref, const UsbPaths& paths, std::string* why) {
     if (exists(paths.devices + "/" + ref.path)) return PortState::enumerated;
+    if (!paths.port_status.empty()) {
+        int status = read_int(paths.port_status + "/" + ref.path);
+        if (status >= 0) return port_state_from(uint16_t(status), false);
+    }
     std::string hub = paths.devices + "/" + ref.hub;
     int busnum = read_int(hub + "/busnum"), devnum = read_int(hub + "/devnum");
     if (busnum <= 0 || devnum <= 0) {
@@ -238,37 +242,50 @@ std::string usb_reset_reach(const UsbPortRef& ref, const UsbPaths& paths) {
     return target + ", which also holds " + list;
 }
 
-Nanos UsbRecovery::wait_for(int attempts) {
+Nanos UsbRecovery::wait_for(int attempts) const {
     static const int steps[] = {10, 20, 40, 80, 160};
-    if (attempts >= 0 && attempts < 5) return Nanos(steps[attempts]) * kSec;
-    return 300 * kSec;
+    return Nanos(steps[std::clamp(attempts, 0, 4)]) * kSec / speedup_;
 }
 
-bool UsbRecovery::observe(Nanos now, PortState state) {
+UsbRecovery::Step UsbRecovery::observe(Nanos now, PortState state) {
     if (state == PortState::empty) {
         if (!empty_) {
             empty_ = true;
             empty_since_ = now;
         }
-        if (now - empty_since_ >= kEmptyForgets) attempts_ = 0;
+        if (held_ || gave_up_ || now - empty_since_ >= kEmptyForgets) {
+            attempts_ = 0;
+            held_ = false;
+            gave_up_ = false;
+        }
     } else {
         empty_ = false;
     }
     if (state != PortState::stuck) {
         stuck_ = false;
-        return false;
+        return Step::wait;
     }
     if (!stuck_) {
         stuck_ = true;
         stuck_since_ = now;
     }
-    return now - stuck_since_ >= wait_for(attempts_);
+    if (held_ || gave_up_ || now - stuck_since_ < wait_for(attempts_)) return Step::wait;
+    if (attempts_ >= kUsbResetsPerSpell || tries_ >= kUsbResetsUntilBack) {
+        gave_up_ = true;
+        return Step::give_up;
+    }
+    return Step::reset;
 }
 
 void UsbRecovery::reset_done(Nanos now) {
     if (attempts_ < 1000) ++attempts_;
+    if (tries_ < 1000) ++tries_;
     stuck_ = true;
     stuck_since_ = now;
+}
+
+void UsbRecovery::hold() {
+    held_ = true;
 }
 
 void reset_done_on_hub(std::vector<UsbRecovery>& recs, const std::vector<std::string>& watched, size_t asked, const std::string& hub, Nanos now) {
@@ -280,7 +297,10 @@ void reset_done_on_hub(std::vector<UsbRecovery>& recs, const std::vector<std::st
 void UsbRecovery::connected() {
     stuck_ = false;
     empty_ = false;
+    held_ = false;
+    gave_up_ = false;
     attempts_ = 0;
+    tries_ = 0;
 }
 
 UsbPaths usb_paths_under(const std::string& root) {
@@ -288,6 +308,7 @@ UsbPaths usb_paths_under(const std::string& root) {
     p.devices = root + "/sys/bus/usb/devices";
     p.hub_driver = root + "/sys/bus/usb/drivers/hub";
     p.dev = root + "/dev/bus/usb";
+    p.port_status = root + "/port-status";
     return p;
 }
 
@@ -315,10 +336,11 @@ void UsbWorker::check(std::vector<std::pair<size_t, UsbPortRef>> ports, Nanos no
     });
 }
 
-void UsbWorker::reset(const UsbPortRef& ref, Nanos now) {
-    launch(true, now, [ref, paths = paths_, marker = marker_](Done& out) {
+void UsbWorker::reset(const UsbPortRef& ref, Nanos now, bool only_if_alone) {
+    launch(true, now, [ref, paths = paths_, marker = marker_, only_if_alone](Done& out) {
         out.dropped = usb_neighbours(ref, paths);
-        out.result = rebind_hub(ref.hub_interface, paths, marker);
+        out.held = only_if_alone && !out.dropped.empty();
+        if (!out.held) out.result = rebind_hub(ref.hub_interface, paths, marker);
     });
 }
 
