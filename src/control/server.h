@@ -6,7 +6,9 @@
 #include "config/state.h"
 #include "control/requests.h"
 #include "control/shared.h"
+#include "control/stall.h"
 #include "control/usb.h"
+#include "core/budget.h"
 #include "core/fd.h"
 #include "core/log.h"
 #include "input/probe.h"
@@ -29,12 +31,14 @@ constexpr int kRestartExit = 100;
 constexpr int kCheckSettingsRefused = 5;
 constexpr const char* kRestartedBy = "TTO_RESTARTED_BY";
 constexpr const char* kKeptLeases = "TTO_LEASES";
+constexpr const char* kRestartBudget = "TTO_RESTARTS";
 
 struct Launch {
     std::string config_path;
     std::string config_text;
     std::string config_problem;
     std::string exe;
+    std::string start_file;
 };
 
 class Server {
@@ -55,7 +59,8 @@ private:
         std::string error;
         uint64_t failures = 0;
         uint64_t reported = 0;
-        Nanos reported_at = 0;
+        bool told = false;
+        Budget log{10 * kSec, 6, 300 * kSec};
     };
     struct Sample {
         Nanos at;
@@ -95,6 +100,7 @@ private:
         std::string kind;
         log::Level level = log::Level::notice;
         std::string device;
+        Budget log{0, 60, 60 * kSec};
     };
 
     bool open_sockets();
@@ -116,14 +122,25 @@ private:
     Status commit(Overrides next, const Peer& peer, const std::string& what, std::string device = std::string());
     void apply_effects(const Config& old);
     void save_settings();
+    Status save_settings_now(const Overrides& o, const Overrides& values);
+    Status lockout(const Config& eff, const Peer& peer) const;
     void save_state();
     void collect_writes(Nanos now);
+    void note_write(const FileWriter::Outcome& o, Nanos now);
+    std::string write_hint(const Status& st) const;
+    void watch_readers(Nanos now);
+    [[noreturn]] void end_on_stalled_reader(size_t index, Nanos now, Nanos last, int32_t contacts);
+    void clear_usb_problem(const std::string& why);
+    void forget_usb_problem();
     void remember_port(size_t index);
     void repair_usb_hub();
     void keep_restart_reply();
     void restore_leases();
+    Status restart_budget(Nanos now) const;
+    void count_restart(Nanos now);
+    void settings_saved(const FileWriter::Outcome& o);
     bool wait_usb_worker(Nanos max, bool stopping);
-    Status restart_check();
+    Status restart_check(const Overrides* pending = nullptr, const Overrides* pending_values = nullptr);
     void refuse(const Peer& peer, const std::string& address, const std::string& why, bool limited, uint16_t also_port = 0);
     void reply_to(const Peer& to, const std::vector<osc::Message>& msgs);
     std::string outsider_reason(const Peer& peer) const;
@@ -148,9 +165,10 @@ private:
     void send_to(const Peer& to, const std::vector<osc::Message>& msgs);
     void send_target(const Target& t, const std::vector<uint8_t>& bytes);
     void send_status_changes(bool full);
-    void send_alive(Nanos now);
+    void send_alive(Nanos now, const Peer* only = nullptr);
     void send_event(const std::string& kind, const std::string& text, log::Level level, const std::string& device);
     void emit(const std::string& key, log::Level level, const std::string& kind, const std::string& text, const std::string& device = std::string());
+    void log_limited(Limit& l, log::Level level, const std::string& line, Nanos now);
     void report_suppressed(Nanos now);
     void expire_leases(Nanos now);
     void prune(Nanos now);
@@ -165,7 +183,7 @@ private:
     void note_port(size_t index, const std::string& port, PortState state, const std::string& why, Nanos now);
     void collect_usb(Nanos now, bool start_next);
     void finish_usb_reset(Nanos now, const UsbWorker::Done& done);
-    void start_usb_reset(size_t index, const UsbPortRef& ref, const std::string& asked_by);
+    bool start_usb_reset(size_t index, const UsbPortRef& ref, const std::string& asked_by);
     std::string usb_reason(size_t index) const;
     std::string usb_port_text(size_t index) const;
     void send_bye();
@@ -208,6 +226,16 @@ private:
     double refusal_tokens_ = 0;
     Nanos refusal_last_ = 0;
     uint64_t refusals_dropped_ = 0;
+    Budget unanswered_log_{10 * kSec, 6, 60 * kSec};
+    Budget outsider_log_{5 * kSec, 12, 60 * kSec};
+    Budget refused_log_{5 * kSec, 12, 60 * kSec};
+    Budget malformed_log_{30 * kSec, 10, 600 * kSec};
+    Budget oversize_log_{30 * kSec, 10, 600 * kSec};
+    Budget debug_log_{0, 200, 100 * kMs};
+    Budget usb_check_log_{60 * kSec, 5, 600 * kSec};
+    double restart_tokens_ = 0;
+    Nanos restart_last_ = 0;
+    std::string start_file_;
     Nanos next_second_ = 0;
     Nanos last_save_ = 0;
     Nanos dirty_since_ = 0;
@@ -259,6 +287,15 @@ private:
     bool screens_first_ = true;
     std::vector<std::string> unused_screens_;
     size_t usb_problem_dev_ = SIZE_MAX;
+    enum class HubFault { other, unbound, absent };
+    std::string usb_problem_hub_;
+    HubFault usb_problem_kind_ = HubFault::other;
+    Nanos usb_repair_at_ = 0;
+    Nanos usb_reset_asked_at_ = 0;
+    Nanos state_retry_at_ = 0;
+    std::vector<StallWatch> reader_stall_;
+    uint64_t libevdev_seen_ = 0;
+    Nanos libevdev_logged_ = 0;
     int ticks_ = 0;
     Nanos full_at_ = 0;
     Nanos status_reply_at_ = 0;

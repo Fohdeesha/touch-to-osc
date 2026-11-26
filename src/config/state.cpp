@@ -2,6 +2,7 @@
 
 #include "config/atomic_file.h"
 #include "config/config.h"
+#include "config/strict_toml.h"
 
 #include <toml++/toml.hpp>
 
@@ -62,14 +63,14 @@ std::string state_text(const State& s) {
     std::ostringstream os;
     os << "# Written by touch-to-osc: what it keeps between runs (the USB port each screen was last read on,\n"
        << "# and a copy of the last config file that started). Not settings; it may be deleted while touch-to-osc is stopped.\n\n"
-       << t << "\n";
+       << plain_toml(t) << "\n";
     return os.str();
 }
 
 State load_state(const std::string& path, std::string* problem) {
     struct stat st {};
     if (path.empty() || stat(path.c_str(), &st) != 0) return State();
-    auto text = read_file(path, 1 << 20);
+    auto text = read_file(path, 4 * kMaxConfigBytes);
     if (!text) {
         if (problem) *problem = "what touch-to-osc kept between runs cannot be read (" + text.error() + "): it starts without it";
         return State();

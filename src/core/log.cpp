@@ -108,12 +108,12 @@ void write(Level level, const char* fmt, ...) {
         if (buf[i] == '\n') buf[i] = ' ';
     }
     buf[len++] = '\n';
-    uint64_t dropped = g_dropped.load(std::memory_order_relaxed);
+    uint64_t dropped = g_dropped.exchange(0, std::memory_order_relaxed);
     if (dropped) {
         char note[160];
-        int k = std::snprintf(note, sizeof note, "%s%llu log lines were dropped because the journal could not keep up\n", to_journal() ? "<4>" : "",
+        int k = std::snprintf(note, sizeof note, "%s%llu log lines were dropped because they could not be written in time\n", to_journal() ? "<4>" : "",
                               (unsigned long long)dropped);
-        if (k > 0 && put(note, size_t(k))) g_dropped.fetch_sub(dropped, std::memory_order_relaxed);
+        if (k <= 0 || !put(note, size_t(k))) g_dropped.fetch_add(dropped, std::memory_order_relaxed);
     }
     if (!put(buf, len)) g_dropped.fetch_add(1, std::memory_order_relaxed);
 }

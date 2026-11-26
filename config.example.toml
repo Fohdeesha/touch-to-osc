@@ -1,7 +1,8 @@
 # touch-to-osc configuration
 #
-# Every key below shows its default, except the [[device]] block's id and match_usb,
-# which are for one QDtech MPI1168 screen. Unknown keys, wrong types and
+# Every key below shows its default, except allowed_ips (it has none: list your hosts)
+# and the [[device]] block's id and match_usb, which are for one QDtech MPI1168 screen.
+# Unknown keys, wrong types and
 # out-of-range values are refused at start with a message that names the key.
 # Check a file without starting anything: sudo touch-to-osc --check-config=FILE
 # Find your screens and a block ready to paste for each: sudo touch-to-osc --list
@@ -21,7 +22,7 @@ open_to_any = false
 
 [log]
 # crit, error, warning, notice, info or debug. debug adds a line for every command and
-# lease renewal. Touches are never logged.
+# lease renewal (200 in a row, then 10 a second). Touches are never logged.
 level = "info"
 
 [paths]
@@ -30,7 +31,8 @@ level = "info"
 # new value applies from the next start. This file is never written. "" keeps such
 # changes only until a restart. The status lists which settings come from there
 # (/touch/overrides), and <prefix>/settings/forget puts them back to what this file says.
-# The service can only write under /var/lib/touch-to-osc: keep both paths there.
+# The service can only write under /var/lib/touch-to-osc: keep both paths there, and
+# never point one at this file.
 settings = "/var/lib/touch-to-osc/settings.toml"
 # What touch-to-osc keeps between runs: the USB port each screen was last read on (for USB
 # recovery after a restart), a copy of the last config file that started (it runs on that
@@ -39,7 +41,8 @@ settings = "/var/lib/touch-to-osc/settings.toml"
 state = "/var/lib/touch-to-osc/state.toml"
 
 # Receivers that always get touches and status, without subscribing. None by default:
-# a receiver normally subscribes (see the README). Copy this block for each one.
+# a receiver normally subscribes (see the README). Copy this block for each one. The
+# address is the receiver's, never the listen address above.
 #
 # [[destination]]
 # address = "192.168.1.27:9481"
@@ -73,7 +76,7 @@ match_serial = ""
 match_port = ""
 # Hold the device exclusively, so nothing else on the machine (the console) acts on
 # the touches, and no other program can take it away. With false, another program that
-# takes it exclusively is only noticed when silence_ms is on.
+# takes it exclusively is noticed within a few seconds and reported as a fault.
 grab = true
 # Turns touch positions clockwise by 0, 90, 180 or 270 degrees to match the display:
 # with 90, a touch at the panel's top left lands at the display's top right. Then
@@ -88,9 +91,10 @@ mirror = ""
 aspect = 0
 # An optional fine correction applied after rotation and mirror, as six numbers
 # [a, b, c, d, e, f]: x' = a*x + b*y + c, y' = d*x + e*y + f, on 0..1 positions, each
-# between -100 and 100. [1, 0, 0, 0, 1, 0] changes nothing. It lines the touch panel up
-# with the display; never use it for a picture scaled or letterboxed on the display (the
-# receiver works that out). [] for none. The README shows how to work the numbers out.
+# between -100 and 100, with a*e - b*d not 0 (or every touch lands on one line).
+# [1, 0, 0, 0, 1, 0] changes nothing. It lines the touch panel up with the display; never
+# use it for a picture scaled or letterboxed on the display (the receiver works that
+# out). [] for none. The README shows how to work the numbers out.
 calibration = []
 # Cancel the contacts that are down when the device sends nothing for this long, in
 # milliseconds. Screens like this one report every 16-24 ms while a finger is down,
@@ -98,7 +102,9 @@ calibration = []
 # a held contact would stay down until the kernel notices (3.7 s when a USB extender
 # was pulled). 0 turns it off: needed for a screen that only reports changes, or still
 # fingers are cancelled after this long (the journal says so when it sees it).
-# Otherwise 50-10000.
+# Otherwise 50-10000. For some screens (the ones the kernel treats as Windows 8 touch
+# panels) the kernel itself lifts every finger 100 ms after the screen's last report:
+# that arrives as an ordinary lift, before this can cancel it, unless this is below 100.
 silence_ms = 200
 # false starts with the device turned off (a command can turn it on). A device turned
 # off here does not count against the health.
@@ -107,6 +113,7 @@ enabled = true
 # when something is plugged in there that the kernel has given up on for 10 s, reset the
 # USB hub of that port so the kernel tries again, up to 5 times; unplugging the screen
 # starts it over. It never resets a hub that also holds other devices (on a port of the
-# computer itself that is the whole USB bus; sudo touch-to-osc --list names them).
+# computer itself that is the whole USB bus; sudo touch-to-osc --list names them), and
+# leaves a screen alone while it is turned off.
 # See "USB recovery" in the README.
 usb_recovery = true

@@ -4,7 +4,7 @@ set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 build=${BUILD_DIR:-$here/build-deb}
 
-cmake -S "$here" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX=/usr -DTTO_WERROR=ON > /dev/null
+cmake -S "$here" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX=/usr -DTTO_WERROR=ON -DTTO_SANITIZE= > /dev/null
 ninja -C "$build"
 "$build/tto_tests" --minimal
 rm -f "$build"/touch-to-osc_*.deb

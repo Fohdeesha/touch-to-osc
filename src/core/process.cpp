@@ -13,8 +13,35 @@
 
 namespace tto {
 
-std::string errno_str(int e) { return std::strerror(e); }
-std::string errno_str() { return std::strerror(errno); }
+std::string errno_str(int e) {
+    char buf[128] = {};
+    // the GNU strerror_r, which returns the text and may leave buf alone
+    return std::string(strerror_r(e, buf, sizeof buf));
+}
+
+std::string errno_str() { return errno_str(errno); }
+
+sigset_t stop_signals() {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    // a blocked signal is delivered even when it is set to be ignored: what nohup or a shell had ignored stays out
+    for (int sig : {SIGINT, SIGHUP, SIGQUIT}) {
+        struct sigaction now {};
+        if (sigaction(sig, nullptr, &now) == 0 && now.sa_handler == SIG_IGN) continue;
+        sigaddset(&set, sig);
+    }
+    return set;
+}
+
+const char* stop_signal_name(int signo) {
+    switch (signo) {
+    case SIGINT: return "SIGINT";
+    case SIGHUP: return "SIGHUP";
+    case SIGQUIT: return "SIGQUIT";
+    default: return "SIGTERM";
+    }
+}
 
 void set_thread_name(const char* name) {
     char buf[16];
@@ -22,7 +49,7 @@ void set_thread_name(const char* name) {
     prctl(PR_SET_NAME, buf, 0, 0, 0);
 }
 
-void sd_notify_msg(const char* msg) {
+void sd_notify_msg(const char* msg, bool may_wait) {
     const char* path = std::getenv("NOTIFY_SOCKET");
     if (!path || !*path) return;
     sockaddr_un addr{};
@@ -34,7 +61,7 @@ void sd_notify_msg(const char* msg) {
     int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return;
     socklen_t alen = socklen_t(offsetof(sockaddr_un, sun_path) + len);
-    ssize_t ignored = sendto(fd, msg, std::strlen(msg), MSG_NOSIGNAL, reinterpret_cast<sockaddr*>(&addr), alen);
+    ssize_t ignored = sendto(fd, msg, std::strlen(msg), MSG_NOSIGNAL | (may_wait ? 0 : MSG_DONTWAIT), reinterpret_cast<sockaddr*>(&addr), alen);
     (void)ignored;
     close(fd);
 }

@@ -203,13 +203,16 @@ int touch_to_find(const Config* cfg, const SysPaths& paths, int seconds) {
         for (const auto& w : watched) p.push_back({w.o->fd, POLLIN, 0});
         int r = poll(p.data(), nfds_t(p.size()), int(left / kMs) + 1);
         if (r < 0 && errno != EINTR) return 1;
+        if (r <= 0) continue;
+        std::vector<size_t> gone;
         for (size_t i = 0; i < watched.size(); ++i) {
-            if (!(p[i].revents & POLLIN)) continue;
+            if (!p[i].revents) continue;
             libevdev* dev = watched[i].o->dev;
             bool touched = false;
-            for (;;) {
+            int rc = 0;
+            while (p[i].revents & POLLIN) {
                 input_event ev{};
-                int rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+                rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
                 if (rc == LIBEVDEV_READ_STATUS_SYNC) {
                     while (rc == LIBEVDEV_READ_STATUS_SYNC) rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_SYNC, &ev);
                 }
@@ -217,7 +220,10 @@ int touch_to_find(const Config* cfg, const SysPaths& paths, int seconds) {
                 if (ev.type == EV_KEY && ev.code == BTN_TOUCH && ev.value == 1) touched = true;
                 if (ev.type == EV_ABS && ev.code == ABS_MT_TRACKING_ID && ev.value >= 0) touched = true;
             }
-            if (!touched) continue;
+            if (!touched) {
+                if ((p[i].revents & (POLLHUP | POLLERR | POLLNVAL)) || (rc < 0 && rc != -EAGAIN)) gone.push_back(i);
+                continue;
+            }
             const NodeInfo& n = *watched[i].node;
             std::string at = n.usb_port.empty() ? printable(n.phys) : n.usb_port;
             std::printf("touched: %s \"%s\", usb %s, port %s; to read it, add this to the config:\n", n.node.c_str(), printable(n.name).c_str(),
@@ -225,6 +231,14 @@ int touch_to_find(const Config* cfg, const SysPaths& paths, int seconds) {
             std::printf("    [[device]]\n    id = \"%s\"\n    match_usb = \"%s\"\n", spare_id(cfg).c_str(), usb_text(n.vendor, n.product).c_str());
             if (!at.empty()) std::printf("    match_port = \"%s\"\n", at.c_str());
             return 0;
+        }
+        for (auto it = gone.rbegin(); it != gone.rend(); ++it) {
+            std::printf("%s \"%s\" was unplugged\n", watched[*it].node->node.c_str(), printable(watched[*it].node->name).c_str());
+            watched.erase(watched.begin() + long(*it));
+        }
+        if (watched.empty()) {
+            std::printf("no touchscreen is left to wait for\n");
+            return 1;
         }
     }
 }

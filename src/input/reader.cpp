@@ -35,7 +35,17 @@ void drain_fd(int fd) {
 
 const char* plural(int n) { return n == 1 ? "" : "s"; }
 
+std::atomic<uint64_t> g_libevdev_complaints{0};
+
+void libevdev_said(enum libevdev_log_priority priority, void*, const char*, int, const char*, const char*, va_list) {
+    if (priority == LIBEVDEV_LOG_ERROR) g_libevdev_complaints.fetch_add(1, std::memory_order_relaxed);
 }
+
+}
+
+void count_libevdev_complaints() { libevdev_set_log_function(libevdev_said, nullptr); }
+
+uint64_t libevdev_complaints() { return g_libevdev_complaints.load(std::memory_order_relaxed); }
 
 bool NodeClaims::claim(const std::string& sysname) {
     std::lock_guard<std::mutex> lock(m_);
@@ -351,10 +361,16 @@ bool DeviceReader::open_device() {
         set_state(DevState::read_error, "cannot read " + pick->node + ": " + errno_str(-rc) + "; unplug and replug the touchscreen");
         return false;
     }
-    if (!claims_.claim(pick->sysname)) {
+    // event numbers are reused: between the scan and the open another device may have taken this one's node
+    const char* phys = libevdev_get_phys(dev_);
+    bool same = uint16_t(libevdev_get_id_vendor(dev_)) == pick->vendor && uint16_t(libevdev_get_id_product(dev_)) == pick->product &&
+                pick->phys == (phys ? phys : "") && libevdev_has_property(dev_, INPUT_PROP_DIRECT) == 1 &&
+                (touch_kind(*pick) == TouchKind::multitouch ? libevdev_get_num_slots(dev_) > 0 : libevdev_has_event_code(dev_, EV_KEY, BTN_TOUCH) == 1);
+    if (!same || !claims_.claim(pick->sysname)) {
         libevdev_free(dev_);
         dev_ = nullptr;
         fd_.reset();
+        if (!same) set_state(DevState::read_error, pick->node + " is not the touchscreen that was found there a moment ago; looking again");
         return false;
     }
     sysname_ = pick->sysname;
@@ -631,9 +647,9 @@ bool DeviceReader::retry_grab() {
 
 bool DeviceReader::foreign_grab() {
     if (cfg_.grab) return false;
-    if (libevdev_grab(dev_, LIBEVDEV_GRAB) != 0) return true;
-    libevdev_grab(dev_, LIBEVDEV_UNGRAB);
-    return false;
+    int rc = libevdev_grab(dev_, LIBEVDEV_GRAB);
+    if (rc == 0) libevdev_grab(dev_, LIBEVDEV_UNGRAB);
+    return rc == -EBUSY;
 }
 
 void DeviceReader::session() {
@@ -715,7 +731,10 @@ void DeviceReader::session() {
             Nanos due = last_frame_ + Nanos(silence) * kMs;
             timeout = int(std::max<Nanos>(0, (due - now + kMs - 1) / kMs));
         }
-        if (base_state_ == DevState::grab_refused) timeout = timeout < 0 ? 2000 : std::min(timeout, 2000);
+        // without the grab another program can take the screen for itself at any time, and nothing tells this reader
+        bool unheld = !cfg_.grab && base_state_ == DevState::ok;
+        int check_ms = base_state_ == DevState::grab_refused ? kGrabCheckMs : !unheld ? -1 : grab_doubt_ ? kGrabDoubtMs : kGrabProbeMs;
+        if (check_ms > 0) timeout = timeout < 0 ? check_ms : std::min(timeout, check_ms);
         pollfd p[2] = {{fd_.get(), POLLIN, 0}, {sh_.wake.get(), POLLIN, 0}};
         int r = poll(p, 2, timeout);
         if (r < 0 && errno != EINTR) {
@@ -783,11 +802,24 @@ void DeviceReader::session() {
             event(EventKind::silence, log::Level::warning,
                   "%s sent nothing for %lld ms with contacts down; %d contact%s cancelled. If this repeats, check the touchscreen's USB cable", cfg_.id.c_str(),
                   (long long)(quiet / kMs), n, plural(n));
-            if (foreign_grab())
-                set_state(DevState::grab_refused,
-                          "another program took " + node_ + " exclusively, so no touches reach touch-to-osc: stop that program (fuser -v " + node_ + " names it)");
+            if (foreign_grab()) grab_taken();
+        } else if (unheld && r == 0 && (tracker_.announced() == 0 || silence <= 0) && base_state_ == DevState::ok && !cfg_.grab) {
+            // one refusal can be another reader's own check of the same kind landing on this one: only a second, a moment later, is a hold
+            bool refused = foreign_grab();
+            if (refused && grab_doubt_) grab_taken();
+            grab_doubt_ = refused && !grab_doubt_;
+        } else if (r > 0 && p[0].revents) {
+            grab_doubt_ = false;
         }
     }
+}
+
+void DeviceReader::grab_taken() {
+    int n = cancel("device lost");
+    event(EventKind::grab, log::Level::warning, "%s: another program took %s for itself; %d contact%s cancelled, and no touches reach touch-to-osc until it lets go",
+          cfg_.id.c_str(), node_.c_str(), n, plural(n));
+    set_state(DevState::grab_refused,
+              "another program took " + node_ + " exclusively, so no touches reach touch-to-osc: stop that program (fuser -v " + node_ + " names it)");
 }
 
 int DeviceReader::discard_events() {

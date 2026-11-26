@@ -1,5 +1,125 @@
 # Changelog
 
+## 0.8.0 - 2026-11-25
+
+Fixes from a full review. Nothing on the wire changed (still osc_api 6).
+
+Settings:
+
+- `listen`, `prefix`, `devices/add` and `devices/remove` are saved before the restart that
+  applies them. If the save fails they're refused and nothing restarts; it used to
+  restart anyway, cancel every contact and come back unchanged.
+- `--status` and `--send` look where the saved settings say the service listens, so they
+  still reach it after `listen` or `prefix` was changed over OSC.
+- A `listen` or `prefix` changed in the config file after one was saved over OSC wins at
+  the next start, as `log_level` and the per-screen settings already did. Settings saved
+  by older versions get this from now on.
+- When the listen port can't be used at a start, the message says whether it came from the
+  config file or was set over OSC, and how to put it back.
+- `settings/forget` with no name can no longer lock out the host that sends it.
+- Turning a screen off is saved at once instead of up to a second later (but, like any
+  setting, at most once a second). A settings file too damaged to read still keeps a
+  screen that was turned off turned off.
+- One saved setting the config file has since made impossible (the last device removed,
+  the last host taken off, a device left matching nothing) is dropped by itself with a
+  note; it used to set the whole settings file aside.
+- A config with `'''` in it no longer breaks the file the daemon keeps between runs, which
+  lost the last USB port and the config copy it falls back on. A failed write of that file
+  is tried again every 10 s.
+- Refused now: a calibration that puts every touch on one line, a settings or state path
+  that is the config file, anything but printable ASCII in a list, a saved device without
+  an id, and over OSC a destination that is the daemon's own listen address (in the config
+  file that one is a warning; a saved one is dropped with a note).
+- Files a save left unfinished (a kill or a power cut in the middle) are cleared at the
+  start.
+
+Screens:
+
+- With `grab = false`, another program taking the screen for itself is noticed within a
+  few seconds as a fault, and a finger held on a screen with `silence_ms = 0` is
+  cancelled. It used to go unnoticed until a finger was down with `silence_ms` on.
+- If the thread reading a screen with `silence_ms` on ever stops dead with contacts down,
+  the daemon says so, cancels what the other screens hold, sends `bye` and exits so its
+  service starts it again. Before, it would have gone on listing those contacts as down.
+- A new subscriber gets an alive at once, before its first touch, so it knows the run
+  the touch belongs to.
+- SIGHUP and SIGQUIT stop it cleanly like SIGTERM (contacts cancelled, then `bye`),
+  unless whoever started it had them ignored (nohup); SIGUSR1 and SIGUSR2 are ignored.
+  They used to kill it on the spot.
+- A screen event the screen's own description rules out is counted and noted in the
+  journal once a minute, instead of going to the journal raw.
+- Touch messages that couldn't be sent, kernel drops and silences in the first second of
+  a run now show in the health like later ones; they used to be missed.
+- At a stop or a restart the contacts are cancelled and `bye` is sent before anything else
+  is waited for. They used to wait for the thread that looks for unused touchscreens,
+  which can be held up for seconds by a USB device the kernel is busy with.
+
+USB recovery:
+
+- A failed reset no longer leaves a fault until the next restart: it clears when the
+  screen reads again or its hub is bound or gone. A hub that a failed reset left
+  unbound is bound again while running, every 10 s, instead of only at the next start.
+- A hub that isn't there isn't "reset", and isn't taken for one left unbound.
+- An automatic reset is skipped when the note that lets a cut-short reset be finished
+  can't be written, or when what else is on the hub can't be read. That isn't counted as a
+  reset and isn't tried over and over; `usb_reset` still does it.
+- A screen that's turned off is left alone.
+
+Tools:
+
+- `touch-to-osc-watch` keeps the contacts that are down by the receiver rules (the
+  `Contacts` class in it is there to copy) and says when one ends without its own `up` or
+  `cancel`. It no longer ends on a packet it can't read or stops renewing after a failed
+  send, and it leaves out packets that don't come from the daemon's address
+  (`--any-sender` takes them).
+- `--touch` and `--all` without `--list` are refused instead of starting a second daemon.
+  `--list --touch` ends when its screen is unplugged instead of spinning.
+- `--status` asks again when another host's request was just answered.
+
+The journal and the disk:
+
+- A service that can't start, or dies within a minute of starting, is no longer started
+  again every second for ever (about 300 journal lines a minute, and a disk sync for
+  every failed start). The first restart still comes at once; after that it waits 2, 4,
+  8, 16, 32 and then 60 s before each start, and says so. `systemctl restart touch-to-osc`
+  starts it at once. A run that lasts a minute, or a stop that was asked for, clears the
+  count, which is kept in `/run/touch-to-osc` (memory, not disk).
+- `restart`, and the settings that restart the daemon, are refused after 10 in a row,
+  whether they restarted it or were refused; one more is taken every 30 s. A host
+  sending `restart` in a loop used to restart it several times a second, 15 journal
+  lines each time.
+- `usb_reset` is refused for 5 s after the last one.
+- A screen that came back for a moment after every USB reset and dropped off again was
+  reset every 12 s or so for ever: reading again started the count of resets over. Now
+  the count is only forgotten once the screen has stayed read for a minute, so such a
+  screen gets its 5 resets and then the usual give-up.
+- A screen turned off and on in a loop no longer syncs the settings file to disk for
+  every turn-off (hundreds of syncs a second); settings are saved at most once a second.
+- A settings file that can't be written is said once, in the journal and in an event, and
+  once more when it works again, instead of every 10 s. The health goes on saying it.
+- Events of one kind that keep coming still reach receivers at one a second, but the
+  journal takes 60 in a row and then one a minute, with a count of what it left out.
+  Refused commands, hosts that aren't allowed and malformed packets are thinned the same
+  way. A destination that can't be sent to is logged 6 times, then every 5 minutes (its
+  `send` events too).
+- Log level `debug` logs 200 commands in a row, then 10 a second.
+- Since 0.7.0, once any input device had been plugged in or out, the daemon re-read every
+  input device's description 4 times a second for as long as it ran (about 1,000 system
+  calls a second with 7 input devices, 0.4% of a core). It looks every 5 s again.
+
+The rest:
+
+- The binary is built with stack protection, fortified libc calls and full RELRO.
+- The service starts without waiting for the network to be fully up, and its unit is
+  locked down a little more. With `listen` on one address rather than `0.0.0.0`, it
+  restarts at boot until that address is there, up to a minute apart (see above).
+- The package recommends python3, which `touch-to-osc-watch` needs. `scripts/install.sh`
+  no longer stops at a refused config, and installing the package over a script install
+  clears everything the script put under `/usr/local`.
+- OSC.md: the receiver rules say that a contact ended by the active list or a lost daemon
+  isn't a tap, and to take packets only from the daemon's address. The event kind `palm`
+  is gone from the list; nothing ever sent it.
+
 ## 0.7.3 - 2026-10-28
 
 - USB recovery gives up. It resets a stuck screen's USB at most 5 times (10, 20, 40, 80

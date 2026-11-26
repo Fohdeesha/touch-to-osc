@@ -16973,7 +16973,8 @@ TOML_ANON_NAMESPACE_START
 					weight += 1u;
 					val *= -1.0;
 				}
-				return weight + static_cast<size_t>(log10(val)) + 1u;
+				const double digits = log10(val);
+				return weight + (digits > 0.0 && digits < 400.0 ? static_cast<size_t>(digits) : size_t{}) + 1u;
 				break;
 			}
 

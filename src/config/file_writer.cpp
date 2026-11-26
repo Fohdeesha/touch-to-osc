@@ -4,6 +4,7 @@
 #include "core/process.h"
 
 #include <cerrno>
+#include <exception>
 #include <unistd.h>
 
 namespace tto {
@@ -81,10 +82,12 @@ void FileWriter::loop(std::shared_ptr<Shared> sh) {
         Outcome o;
         o.path = path;
         o.removed = job.remove;
-        if (job.remove) {
-            if (unlink(path.c_str()) != 0 && errno != ENOENT) o.result = err("removing " + path + " failed: " + errno_str());
-        } else {
-            o.result = write_file_atomic(path, job.contents);
+        try {
+            o.result = job.remove ? remove_file_durable(path) : write_file_atomic(path, job.contents);
+        } catch (const std::exception& e) {
+            o.result = err(std::string("internal error: ") + e.what());
+        } catch (...) {
+            o.result = err("internal error");
         }
         lock.lock();
         sh->busy = false;

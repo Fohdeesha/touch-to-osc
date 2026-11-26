@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(touch-to-osc VERSION 0.7.3 LANGUAGES CXX)
+project(touch-to-osc VERSION 0.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,8 +23,22 @@ if(TTO_WERROR)
 endif()
 
 if(TTO_SANITIZE)
-  add_compile_options(-fsanitize=${TTO_SANITIZE} -fno-omit-frame-pointer)
+  add_compile_options(-fsanitize=${TTO_SANITIZE} -fno-omit-frame-pointer -fno-sanitize-recover=all)
   add_link_options(-fsanitize=${TTO_SANITIZE})
+else()
+  # a root service that parses datagrams from the network: the distributions' usual hardening, also where the compiler
+  # does not turn it on by itself (Debian's does not)
+  set(TTO_HARDENING -fstack-protector-strong -D_GLIBCXX_ASSERTIONS)
+  add_link_options(-Wl,-z,relro,-z,now)
+  # fortified libc calls need an optimised build, and some compilers (Ubuntu's) already turn them on, at a level of their own
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_FLAGS -O2)
+  check_cxx_source_compiles("#ifndef _FORTIFY_SOURCE\n#error not fortified\n#endif\nint main() { return 0; }" TTO_COMPILER_FORTIFIES)
+  unset(CMAKE_REQUIRED_FLAGS)
+  string(TOUPPER "${CMAKE_BUILD_TYPE}" TTO_BUILD_TYPE)
+  if(NOT TTO_COMPILER_FORTIFIES AND NOT TTO_BUILD_TYPE STREQUAL "DEBUG")
+    list(APPEND TTO_HARDENING -D_FORTIFY_SOURCE=2)
+  endif()
 endif()
 
 configure_file(src/core/version.h.in ${CMAKE_BINARY_DIR}/generated/tto_version.h @ONLY)
@@ -37,11 +51,11 @@ file(GLOB TTO_CORE_SOURCES CONFIGURE_DEPENDS
   src/core/*.cpp src/osc/*.cpp src/config/*.cpp src/input/*.cpp src/control/*.cpp src/tools/*.cpp)
 add_library(tto_core STATIC ${TTO_CORE_SOURCES})
 target_include_directories(tto_core PUBLIC src ${CMAKE_BINARY_DIR}/generated)
-target_compile_options(tto_core PRIVATE ${TTO_WARNINGS})
+target_compile_options(tto_core PRIVATE ${TTO_WARNINGS} ${TTO_HARDENING})
 target_link_libraries(tto_core PUBLIC tto_thirdparty PkgConfig::LIBEVDEV Threads::Threads)
 
 add_executable(touch-to-osc src/main.cpp)
-target_compile_options(touch-to-osc PRIVATE ${TTO_WARNINGS})
+target_compile_options(touch-to-osc PRIVATE ${TTO_WARNINGS} ${TTO_HARDENING})
 target_link_libraries(touch-to-osc PRIVATE tto_core)
 
 include(GNUInstallDirs)
@@ -53,6 +67,7 @@ install(PROGRAMS tools/watch.py DESTINATION ${CMAKE_INSTALL_DATADIR}/touch-to-os
 file(CREATE_LINK ../${CMAKE_INSTALL_DATADIR}/touch-to-osc/watch.py ${CMAKE_BINARY_DIR}/touch-to-osc-watch SYMBOLIC)
 install(FILES ${CMAKE_BINARY_DIR}/touch-to-osc-watch DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES README.md OSC.md CHANGELOG.md packaging/deb/copyright DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(FILES assets/diagram.svg DESTINATION ${CMAKE_INSTALL_DOCDIR}/assets)
 
 set(CPACK_GENERATOR DEB)
 set(CPACK_PACKAGE_NAME touch-to-osc)
@@ -65,7 +80,7 @@ set(CPACK_DEBIAN_PACKAGE_SECTION misc)
 set(CPACK_DEBIAN_PACKAGE_PRIORITY optional)
 set(CPACK_DEBIAN_PACKAGE_HOMEPAGE https://github.com/Fohdeesha/touch-to-osc)
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-set(CPACK_DEBIAN_PACKAGE_SUGGESTS python3)
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS python3)
 set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "touchscreen touches as OSC
 Reads USB touchscreens through libevdev and sends every touch as OSC over UDP, with a
 heartbeat, a status receivers subscribe to and USB recovery for a screen whose

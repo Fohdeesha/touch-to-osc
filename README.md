@@ -51,7 +51,7 @@ Every key is in `config.example.toml` (also at `/usr/share/touch-to-osc/`) with 
 and what it does. The ones you'll actually use:
 
 - `[osc]`: `listen` (UDP port for commands and subscriptions, 9480), `prefix` (`/touch`),
-  `allowed_ips` (who may subscribe and send commands, 127.0.0.1 by default).
+  `allowed_ips` (who may subscribe and send commands; the config that ships has 127.0.0.1).
 - `[[device]]`, one per screen: `id` (goes into the addresses, `/touch/<id>/down`),
   `match_usb`, `match_port`, `match_serial`, `rotation`, `mirror`, `calibration`, `aspect`,
   `silence_ms`, `usb_recovery`.
@@ -117,7 +117,9 @@ A flaky USB connection (a bad extender, a loose plug) can leave a screen plugged
 the kernel has given up on until you replug it. With `usb_recovery = true` (the default),
 when the screen's port sits like that for 10 s the daemon resets the USB hub so the kernel
 tries again. It tries 5 times (10, 20, 40, 80 and 160 s apart), then stops and says so in
-the health. Unplugging the screen starts it over. A port with nothing in it is never reset.
+the health. Unplugging the screen starts it over. A port with nothing in it is never reset,
+and neither is the port of a screen that's turned off. If a reset itself fails, the health
+says so until the screen reads again or the hub is back.
 
 On a port of the computer itself a reset drops everything on that USB bus, so the daemon
 only does it when nothing else is on it, and otherwise tells you what's in the way.
@@ -140,6 +142,7 @@ send `usb_reset` to reset it anyway.
 | `--dump` shows nothing | the service holds the screen, stop it first |
 | Other USB devices drop out for a moment | someone sent `usb_reset`, see USB recovery |
 | A tool gets no answer | answers go back to the port the command came from, so send and listen on the same one |
+| The service keeps restarting, `cannot listen` in the journal | the listen port is taken, or its address isn't up yet; the message says whether it comes from the config or was set over OSC. It tries again by itself, up to a minute apart; `sudo systemctl restart touch-to-osc` tries at once |
 
 ## Command line
 
@@ -151,8 +154,8 @@ send `usb_reset` to reset it anyway.
     touch-to-osc --dump[=ID]                  raw touch frames (stop the service first)
     touch-to-osc-watch [--target IP:9480]     watch touches, status and events live
 
-`--status`, `--send` and the watcher need their machine in `allowed_ips` (127.0.0.1 is in
-it by default). `--help` lists the exit codes.
+`--status`, `--send` and the watcher need their machine in `allowed_ips` (the config that
+ships has 127.0.0.1 in it). `--help` lists the exit codes.
 
 ## OSC in short
 

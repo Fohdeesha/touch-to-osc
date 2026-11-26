@@ -1,3 +1,4 @@
+#include "config/atomic_file.h"
 #include "config/file_writer.h"
 #include "config/state.h"
 
@@ -108,4 +109,56 @@ TEST_CASE("a write stuck on the disk does not hold up the writer's owner going a
     usleep(300000);
     if (fd >= 0) close(fd);
     usleep(200000);
+}
+
+TEST_CASE("a config with quotes in threes, blank first lines or Windows line ends comes back from the state file byte for byte") {
+    for (const char* text : {"# see ''' below\n[osc]\n", "label = '''Face'''\n", "\n\n[osc]\nallowed_ips = ['127.0.0.1']\n", "[osc]\r\nprefix = \"/t\"\r\n",
+                             "a = \"\"\"x\"\"\"\n", "# ends without a newline", "'''", "\t# \\ \" ' \xc3\xa9\n"}) {
+        State s;
+        s.config_path = "/etc/touch-to-osc/touch-to-osc.toml";
+        s.config_text = text;
+        s.config_saved = "2026-11-25 09:00:00";
+        s.usb_ports["screen"] = "3-1.4";
+        std::string problem;
+        State back = parse_state(state_text(s), "state.toml", &problem);
+        INFO(text);
+        CHECK(problem.empty());
+        CHECK(back.config_text == s.config_text);
+        CHECK(back.usb_ports == s.usb_ports);
+    }
+}
+
+TEST_CASE("removing a file is an outcome like a write, and a missing file is not a failure") {
+    TempDir dir;
+    std::string a = dir.path + "/a.toml";
+    std::ofstream(a) << "x";
+    CHECK(remove_file_durable(a));
+    CHECK(access(a.c_str(), F_OK) != 0);
+    CHECK(remove_file_durable(a));
+    CHECK_FALSE(remove_file_durable(dir.path));
+}
+
+TEST_CASE("the leftovers of saves cut short are removed, and nothing else") {
+    TempDir dir;
+    std::string a = dir.path + "/settings.toml";
+    for (const char* name : {"/settings.toml", "/settings.toml.tmp.123", "/settings.toml.tmp.99999", "/settings.toml.tmp.", "/settings.toml.tmp.12a",
+                             "/settings.toml.refused", "/state.toml.tmp.5", "/xsettings.toml.tmp.5"})
+        std::ofstream(dir.path + name) << "x";
+    CHECK(remove_stale_temp_files(a) == 2);
+    CHECK(access((a + ".tmp.123").c_str(), F_OK) != 0);
+    CHECK(access((a + ".tmp.99999").c_str(), F_OK) != 0);
+    for (const char* kept : {"/settings.toml", "/settings.toml.tmp.", "/settings.toml.tmp.12a", "/settings.toml.refused", "/state.toml.tmp.5", "/xsettings.toml.tmp.5"})
+        CHECK_MESSAGE(access((dir.path + kept).c_str(), F_OK) == 0, kept);
+    CHECK(remove_stale_temp_files(a) == 0);
+    CHECK(remove_stale_temp_files("") == 0);
+    CHECK(remove_stale_temp_files(dir.path + "/no/such/dir/x.toml") == 0);
+}
+
+TEST_CASE("a save through a symlink planted at the temporary name is refused, not followed") {
+    TempDir dir;
+    std::string a = dir.path + "/a.toml", victim = dir.path + "/victim";
+    std::ofstream(victim) << "keep";
+    REQUIRE(symlink(victim.c_str(), (a + ".tmp." + std::to_string(getpid())).c_str()) == 0);
+    CHECK_FALSE(write_file_atomic(a, "new"));
+    CHECK(slurp(victim) == "keep");
 }

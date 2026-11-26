@@ -9,8 +9,9 @@ if [ "$1" = configure ]; then
     for old in /etc/systemd/system/$unit /usr/local/lib/systemd/system/$unit; do
         if [ -f "$old" ] && grep -q '^ExecStart=/usr/local/bin/touch-to-osc ' "$old"; then
             systemctl disable "$unit" > /dev/null 2>&1 || true
-            rm -f "$old" /usr/local/bin/touch-to-osc
-            echo "touch-to-osc: removed $old and /usr/local/bin/touch-to-osc from scripts/install.sh; the package's service takes over"
+            rm -f "$old" /usr/local/bin/touch-to-osc /usr/local/bin/touch-to-osc-watch
+            rm -rf /usr/local/share/touch-to-osc /usr/local/share/doc/touch-to-osc
+            echo "touch-to-osc: removed $old and what scripts/install.sh put under /usr/local; the package's service takes over"
         fi
     done
     if [ ! -e "$config" ]; then
@@ -39,6 +40,8 @@ if [ "$1" = configure ]; then
             else
                 systemctl try-restart "$unit" || true
             fi
+        elif [ "$checked" != 2 ]; then
+            echo "touch-to-osc: checking $config did not finish (exit $checked, see above), so the service was left as it is; try: sudo touch-to-osc --check-config, then sudo systemctl restart touch-to-osc"
         elif [ "$fresh" = no ] && systemctl is-active --quiet "$unit"; then
             echo "touch-to-osc: this version refuses $config (see above), so the running service was not restarted: it runs the old version until it stops. Fix the file, then run: sudo systemctl restart touch-to-osc"
         else

@@ -60,8 +60,8 @@ bool forget_override(Overrides& o, const std::string& name);
 DeviceOverrides device_values(const DeviceConfig& d);
 void note_config_values(const Overrides& before, const Overrides& after, const Config& file, Overrides& config_values);
 std::string settings_text(const Overrides& o, const Overrides& config_values, const std::string& config_path);
-Result<SettingsLoad> parse_settings(const std::string& text, const std::string& source, const Config& base);
-SettingsLoad load_settings(const Config& base, bool set_aside_refused);
+Result<SettingsLoad> parse_settings(const std::string& text, const std::string& source, const Config& base, bool file_wins = true);
+SettingsLoad load_settings(const Config& base, bool set_aside_refused, bool file_wins = true);
 std::string destination_text(const DestinationConfig& d);
 
 }

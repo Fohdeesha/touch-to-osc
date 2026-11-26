@@ -1,5 +1,6 @@
 #include "config/config.h"
 
+#include "config/atomic_file.h"
 #include "config/strict_toml.h"
 #include "core/log.h"
 #include "osc/osc.h"
@@ -8,7 +9,6 @@
 #include <arpa/inet.h>
 #include <cmath>
 #include <cstdio>
-#include <fstream>
 #include <iterator>
 #include <set>
 #include <sstream>
@@ -168,6 +168,11 @@ bool parse_host_port(const std::string& s, HostPort& out) {
     return true;
 }
 
+bool sends_to_itself(const HostPort& listen, const HostPort& to) {
+    if (to.port != listen.port) return false;
+    return to.host == listen.host || (listen.host == "0.0.0.0" && to.host.rfind("127.", 0) == 0);
+}
+
 std::string usb_text(uint16_t vendor, uint16_t product) {
     char b[16];
     std::snprintf(b, sizeof b, "%04x:%04x", vendor, product);
@@ -187,9 +192,16 @@ std::string check_aspect(double v) {
     return "must be 0 (taken from the device) or between 0.1 and 10";
 }
 
+bool calibration_is_flat(const std::vector<double>& v) {
+    bool finite = true;
+    for (double x : v) finite = finite && std::isfinite(x) && std::abs(x) <= 100.0;
+    return v.size() == 6 && finite && std::abs(v[0] * v[4] - v[1] * v[3]) < 1e-6;
+}
+
 std::string check_calibration(const std::vector<double>& v) {
     bool finite = true;
     for (double x : v) finite = finite && std::isfinite(x) && std::abs(x) <= 100.0;
+    if (calibration_is_flat(v)) return "would put every touch on one line or one spot (a*e - b*d is 0): [1, 0, 0, 0, 1, 0] changes nothing";
     if (v.empty() || (v.size() == 6 && finite)) return {};
     return "must be six numbers [a, b, c, d, e, f] as in config.example.toml, each between -100 and 100, or none";
 }
@@ -302,6 +314,8 @@ Result<Config> parse_config(const std::string& toml_text, const std::string& sou
     });
     if (root.ok() && !c.paths.state.empty() && c.paths.state == c.paths.settings)
         root.fail("paths", "settings and state must be two different files");
+    if (root.ok() && (c.paths.settings == source_name || c.paths.state == source_name))
+        root.fail("paths", "settings and state must not be the config file itself: touch-to-osc never writes that");
     table_list(root, "destination", "address", kMaxDestinations, [&](StrictTable& o) {
         DestinationConfig d;
         host_port(o, "address", d.address, false);
@@ -335,6 +349,10 @@ Result<Config> parse_config(const std::string& toml_text, const std::string& sou
 
 std::vector<std::string> overlap_warnings(const Config& c) {
     std::vector<std::string> out;
+    for (const auto& d : c.destinations) {
+        if (sends_to_itself(c.osc.listen, d.address))
+            out.push_back("destination " + d.address.text() + " is touch-to-osc's own listen address, so it sends to itself: give the receiver's address instead");
+    }
     for (size_t i = 0; i < c.devices.size(); ++i) {
         for (size_t j = i + 1; j < c.devices.size(); ++j) {
             const DeviceConfig& a = c.devices[i];
@@ -354,11 +372,10 @@ std::vector<std::string> overlap_warnings(const Config& c) {
 }
 
 Result<Config> load_config(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) return err(path + ": cannot be read (check the path, and that the file is readable)");
-    std::stringstream ss;
-    ss << in.rdbuf();
-    return parse_config(ss.str(), path);
+    auto text = read_file(path, kMaxConfigBytes);
+    if (!text && text.error().find(": larger than ") != std::string::npos) return err(text.error() + " (a config file is a few kilobytes: is this the right file?)");
+    if (!text) return err(text.error() + " (check the path, and that the file is readable)");
+    return parse_config(*text, path);
 }
 
 }

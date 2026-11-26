@@ -150,27 +150,49 @@ PortState read_port_state(const UsbPortRef& ref, const UsbPaths& paths, std::str
     return port_state_from(status, exists(paths.devices + "/" + ref.path));
 }
 
-Status rebind_hub(const std::string& hub_interface, const UsbPaths& paths, const std::string& marker) {
+bool hub_present(const std::string& hub_interface, const UsbPaths& paths) { return exists(paths.devices + "/" + hub_interface); }
+
+bool hub_bound(const std::string& hub_interface, const UsbPaths& paths) { return exists(paths.devices + "/" + hub_interface + "/driver"); }
+
+std::string hub_in_marker(const std::string& marker) {
+    if (marker.empty() || !exists(marker)) return {};
+    auto text = read_file(marker, 256);
+    std::string hub = text ? text->substr(0, text->find('\n')) : std::string();
+    bool valid = hub.size() > 4 && hub.size() <= 32 && hub.compare(hub.size() - 4, 4, ":1.0") == 0 &&
+                 hub.find_first_not_of("0123456789-.:") == std::string::npos;
+    return valid ? hub : std::string();
+}
+
+Status rebind_hub(const std::string& hub_interface, const UsbPaths& paths, const std::string& marker, bool marker_required, bool* tried) {
     std::string bound = paths.devices + "/" + hub_interface + "/driver";
+    if (tried) *tried = false;
+    if (!hub_present(hub_interface, paths))
+        return err("the USB hub " + hub_interface + " is not there, so there is nothing to reset: check the cable to it (an extender, a hub)");
     if (!marker.empty()) {
         Status m = write_file_atomic(marker, hub_interface + "\n");
-        (void)m;
+        if (!m && marker_required)
+            return err("the USB hub " + hub_interface + " was not reset: touch-to-osc could not write " + marker + " (" + m.error() +
+                       "), the note that lets it finish a reset a stop cuts short; check paths.state");
     }
     auto done = [&] {
         if (!marker.empty()) unlink(marker.c_str());
     };
+    if (tried) *tried = true;
     Status un = write_text(paths.hub_driver + "/unbind", hub_interface);
     if (!un && exists(bound)) {
         done();
         return err("the USB hub " + hub_interface + " could not be reset (" + un.error() + ")" + root_hint("reset USB ports (its service does)"));
     }
+    Status st = bind_hub(hub_interface, paths);
+    if (st) done();
+    return st;
+}
+
+Status bind_hub(const std::string& hub_interface, const UsbPaths& paths) {
     Status st;
     for (int i = 0; i < 5; ++i) {
         st = write_text(paths.hub_driver + "/bind", hub_interface);
-        if (exists(bound)) {
-            done();
-            return {};
-        }
+        if (hub_bound(hub_interface, paths)) return {};
         usleep(100000);
     }
     return err("the USB hub " + hub_interface + " could not be bound again (" + (st ? std::string("the kernel did not take it") : st.error()) +
@@ -179,12 +201,10 @@ Status rebind_hub(const std::string& hub_interface, const UsbPaths& paths, const
 
 Status bind_hub_left_unbound(const std::string& marker, const UsbPaths& paths, std::string* done) {
     if (marker.empty() || !exists(marker)) return {};
-    auto text = read_file(marker, 256);
-    std::string hub = text ? text->substr(0, text->find('\n')) : std::string();
-    bool valid = hub.size() > 4 && hub.size() <= 32 && hub.compare(hub.size() - 4, 4, ":1.0") == 0 &&
-                 hub.find_first_not_of("0123456789-.:") == std::string::npos;
+    std::string hub = hub_in_marker(marker);
     std::string bound = paths.devices + "/" + hub + "/driver";
-    if (!valid || exists(bound)) {
+    // a hub that is gone altogether is bound by the kernel when it comes back
+    if (hub.empty() || exists(bound) || !hub_present(hub, paths)) {
         unlink(marker.c_str());
         return {};
     }
@@ -203,10 +223,11 @@ Status bind_hub_left_unbound(const std::string& marker, const UsbPaths& paths, s
                paths.hub_driver + "/bind, or reboot");
 }
 
-std::vector<std::string> usb_neighbours(const UsbPortRef& ref, const UsbPaths& paths) {
+std::vector<std::string> usb_neighbours(const UsbPortRef& ref, const UsbPaths& paths, bool* listed) {
     std::vector<std::string> out;
     std::string under = ref.hub.rfind("usb", 0) == 0 ? std::to_string(ref.bus) + "-" : ref.hub + ".";
     DIR* d = opendir(paths.devices.c_str());
+    if (listed) *listed = d != nullptr;
     if (!d) return out;
     std::vector<std::string> names;
     while (dirent* e = readdir(d)) {
@@ -248,6 +269,7 @@ Nanos UsbRecovery::wait_for(int attempts) const {
 }
 
 UsbRecovery::Step UsbRecovery::observe(Nanos now, PortState state) {
+    back_ = false;
     if (state == PortState::empty) {
         if (!empty_) {
             empty_ = true;
@@ -284,13 +306,19 @@ void UsbRecovery::reset_done(Nanos now) {
     stuck_since_ = now;
 }
 
+void UsbRecovery::manual_reset_done(Nanos now) {
+    if (stuck_) stuck_since_ = now;
+}
+
 void UsbRecovery::hold() {
     held_ = true;
 }
 
-void reset_done_on_hub(std::vector<UsbRecovery>& recs, const std::vector<std::string>& watched, size_t asked, const std::string& hub, Nanos now) {
+void reset_done_on_hub(std::vector<UsbRecovery>& recs, const std::vector<std::string>& watched, size_t asked, const std::string& hub, Nanos now, bool manual) {
     for (size_t j = 0; j < recs.size(); ++j) {
-        if (j == asked || (j < watched.size() && !hub.empty() && watched[j] == hub)) recs[j].reset_done(now);
+        if (j != asked && !(j < watched.size() && !hub.empty() && watched[j] == hub)) continue;
+        if (manual) recs[j].manual_reset_done(now);
+        else recs[j].reset_done(now);
     }
 }
 
@@ -299,8 +327,24 @@ void UsbRecovery::connected() {
     empty_ = false;
     held_ = false;
     gave_up_ = false;
+    back_ = false;
     attempts_ = 0;
     tries_ = 0;
+}
+
+bool UsbRecovery::back(Nanos now) {
+    bool first = !back_;
+    if (first) back_since_ = now;
+    back_ = true;
+    stuck_ = false;
+    empty_ = false;
+    held_ = false;
+    if (now - back_since_ >= kUsbBackLasts / speedup_) {
+        gave_up_ = false;
+        attempts_ = 0;
+        tries_ = 0;
+    }
+    return first;
 }
 
 UsbPaths usb_paths_under(const std::string& root) {
@@ -320,8 +364,8 @@ UsbWorker::~UsbWorker() {
     else thread_.join();
 }
 
-void UsbWorker::check(std::vector<std::pair<size_t, UsbPortRef>> ports, Nanos now) {
-    launch(false, now, [ports = std::move(ports), paths = paths_, reader = reader_](Done& out) {
+bool UsbWorker::check(std::vector<std::pair<size_t, UsbPortRef>> ports, Nanos now) {
+    return launch(false, now, [ports = std::move(ports), paths = paths_, reader = reader_](Done& out) {
         for (const auto& [device, ref] : ports) {
             UsbReading r;
             r.device = device;
@@ -336,21 +380,43 @@ void UsbWorker::check(std::vector<std::pair<size_t, UsbPortRef>> ports, Nanos no
     });
 }
 
-void UsbWorker::reset(const UsbPortRef& ref, Nanos now, bool only_if_alone) {
-    launch(true, now, [ref, paths = paths_, marker = marker_, only_if_alone](Done& out) {
-        out.dropped = usb_neighbours(ref, paths);
+bool UsbWorker::reset(const UsbPortRef& ref, Nanos now, bool only_if_alone) {
+    return launch(true, now, [ref, paths = paths_, marker = marker_, only_if_alone](Done& out) {
+        bool listed = true;
+        out.dropped = usb_neighbours(ref, paths, &listed);
+        if (only_if_alone && !listed) {
+            out.refused = true;
+            out.result = err(usb_target_text(ref) + " was not reset by itself: what else is plugged into it could not be read from " + paths.devices +
+                             "; a usb_reset you send resets it all the same");
+            return;
+        }
         out.held = only_if_alone && !out.dropped.empty();
-        if (!out.held) out.result = rebind_hub(ref.hub_interface, paths, marker);
+        if (out.held) return;
+        bool tried = false;
+        out.result = rebind_hub(ref.hub_interface, paths, marker, only_if_alone, &tried);
+        out.refused = !tried;
     });
 }
 
-void UsbWorker::launch(bool reset, Nanos now, std::function<void(Done&)> work) {
+bool UsbWorker::repair(const std::string& hub_interface, Nanos now) {
+    return launch(false, now, [hub = hub_interface, paths = paths_, marker = marker_](Done& out) {
+        out.repair = true;
+        if (!hub_present(hub, paths)) return;
+        if (!hub_bound(hub, paths)) {
+            out.result = bind_hub(hub, paths);
+            if (!out.result) return;
+            out.note = "the USB hub " + hub + " is bound again";
+        }
+        if (hub_in_marker(marker) == hub) unlink(marker.c_str());
+    });
+}
+
+bool UsbWorker::launch(bool reset, Nanos now, std::function<void(Done&)> work) {
     if (thread_.joinable()) thread_.join();
     auto job = std::make_shared<Job>();
     job->reset = reset;
     job->started = now;
     job->out.reset = reset;
-    job_ = job;
     auto task = [job, work = std::move(work)] {
         set_thread_name("usb");
         Nanos t0 = monotonic_ns();
@@ -358,11 +424,20 @@ void UsbWorker::launch(bool reset, Nanos now, std::function<void(Done&)> work) {
             work(job->out);
         } catch (const std::exception& e) {
             job->out.result = err(std::string("internal error: ") + e.what());
+        } catch (...) {
+            job->out.result = err("internal error");
         }
         job->out.took = monotonic_ns() - t0;
         job->done.store(true);
     };
-    thread_ = std::thread(std::move(task));
+    try {
+        thread_ = std::thread(std::move(task));
+    } catch (const std::exception&) {
+        job_.reset();
+        return false;
+    }
+    job_ = job;
+    return true;
 }
 
 bool UsbWorker::finished(Done& out) {

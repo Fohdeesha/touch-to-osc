@@ -36,6 +36,13 @@ private:
 
 bool port_order(const NodeInfo& a, const NodeInfo& b);
 
+constexpr int kGrabCheckMs = 2000;
+constexpr int kGrabProbeMs = 5000;
+constexpr int kGrabDoubtMs = 150;
+
+void count_libevdev_complaints();
+uint64_t libevdev_complaints();
+
 class DeviceReader {
 public:
     DeviceReader(DeviceConfig cfg, size_t index, const std::string& prefix, DeviceShared& shared, int notify_fd, NodeClaims& claims, SysPaths paths);
@@ -66,6 +73,7 @@ private:
     void mode_frame(int n);
     bool retry_grab();
     bool foreign_grab();
+    void grab_taken();
     void pull_config();
     bool reconfigure();
     void recover(const char* what);
@@ -115,6 +123,7 @@ private:
     bool quiet_check_ = false;
     bool hinted_quiet_ = false;
     bool hinted_aspect_ = false;
+    bool grab_doubt_ = false;
     ReadMode mode_ = ReadMode::touches;
     int32_t quiet_tracking_[kMaxSlots] = {};
     std::string addr_down_, addr_move_, addr_up_, addr_cancel_;

@@ -2,8 +2,10 @@
 
 #include <doctest.h>
 
+#include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <unistd.h>
 
 using namespace tto;
 
@@ -132,4 +134,57 @@ TEST_CASE("devices that cannot be told apart are named, and ones that can are no
     auto port = two("port = \"3-3\"", "usb = \"0712:0009\"\nport = \"3-3\"");
     REQUIRE(port.size() == 1);
     CHECK(port[0].find("both name port 3-3") != std::string::npos);
+}
+
+TEST_CASE("values that pass as text or as a number but mean nothing are refused") {
+    CHECK(refused(std::string(kBase) + "[paths]\nstate = \"/x/s.toml\"\nsettings = \"/x/s.toml\"\n").find("two different files") != std::string::npos);
+    CHECK(refused(std::string(kBase) + "rotation = 1e300\n").find("rotation: must be between") != std::string::npos);
+    CHECK(refused(std::string(kBase) + "silence_ms = -1e30\n").find("silence_ms: must be between") != std::string::npos);
+    CHECK(refused("[osc]\nallowed_ips = [\"127.0.0.1\\u0000\"]\n[[device]]\nid = \"a\"\nusb = \"0001:0002\"\n").find("osc.allowed_ips: may only use printable ASCII") !=
+          std::string::npos);
+    CHECK(refused(std::string(kBase) + "calibration = [0, 0, 0, 0, 0, 0]\n").find("calibration: would put every touch on one line or one spot") != std::string::npos);
+    CHECK(refused(std::string(kBase) + "calibration = [1, 2, 0, 2, 4, 0]\n").find("one line or one spot") != std::string::npos);
+    CHECK(refused(std::string(kBase) + "calibration = [1, 0, 0, 0, 1, 0]\n").empty());
+    CHECK(refused(std::string(kBase) + "calibration = [0, 1, 0, -1, 0, 1]\n").empty());
+    std::string odd = refused(std::string(kBase) + "\"col\\u0000our\\u00e9\" = 1\n");
+    CHECK(odd.find("unknown key") != std::string::npos);
+    for (unsigned char c : odd) CHECK((c >= 0x20 && c < 0x7f));
+}
+
+TEST_CASE("the config file is never one of the files touch-to-osc writes, and no destination is its own listen address") {
+    std::string paths = "[osc]\nallowed_ips = [\"127.0.0.1\"]\n[paths]\nsettings = \"/etc/tto/t.toml\"\n[[device]]\nid = \"a\"\nusb = \"0001:0002\"\n";
+    CHECK(parse_config(paths, "/etc/tto/other.toml"));
+    auto same = parse_config(paths, "/etc/tto/t.toml");
+    REQUIRE_FALSE(same);
+    CHECK(same.error().find("paths: settings and state must not be the config file itself") != std::string::npos);
+    auto self = parse_config(std::string(kBase) + "[[destination]]\naddress = \"127.0.0.1:9480\"\n", "t.toml");
+    REQUIRE(self);
+    auto warned = overlap_warnings(*self);
+    REQUIRE(warned.size() == 1);
+    CHECK(warned[0].find("destination 127.0.0.1:9480 is touch-to-osc's own listen address") == 0);
+    for (const char* other : {"127.0.0.1:9481", "192.168.1.27:9480"}) {
+        auto fine = parse_config(std::string(kBase) + "[[destination]]\naddress = \"" + other + "\"\n", "t.toml");
+        REQUIRE(fine);
+        CHECK(overlap_warnings(*fine).empty());
+    }
+}
+
+TEST_CASE("a config file that is a folder, missing or too large is refused with the reason") {
+    auto dir = load_config("/tmp");
+    REQUIRE_FALSE(dir);
+    CHECK(dir.error().find("/tmp: ") == 0);
+    CHECK(dir.error().find("allowed_ips") == std::string::npos);
+    auto none = load_config("/tmp/tto-no-such-config.toml");
+    REQUIRE_FALSE(none);
+    CHECK(none.error().find("check the path") != std::string::npos);
+    std::string big = "/tmp/tto-big-config-" + std::to_string(getpid()) + ".toml";
+    {
+        std::ofstream out(big);
+        out << std::string(kMaxConfigBytes + 1, '#');
+    }
+    auto large = load_config(big);
+    std::remove(big.c_str());
+    REQUIRE_FALSE(large);
+    CHECK(large.error().find("larger than") != std::string::npos);
+    CHECK(large.error().find("is this the right file") != std::string::npos);
 }

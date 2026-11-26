@@ -13,6 +13,8 @@ struct HostPort {
     int port = 0;
 
     std::string text() const { return host + ":" + std::to_string(port); }
+    bool operator==(const HostPort& o) const { return host == o.host && port == o.port; }
+    bool operator!=(const HostPort& o) const { return !(*this == o); }
 };
 
 struct DestinationConfig {
@@ -70,18 +72,21 @@ struct Config {
 constexpr size_t kMaxDevices = 16;
 constexpr size_t kMaxDestinations = 16;
 constexpr size_t kMaxAllowedIps = 64;
+constexpr size_t kMaxConfigBytes = 1 << 20;
 
 Result<Config> parse_config(const std::string& toml_text, const std::string& source_name);
 Result<Config> load_config(const std::string& path);
 std::vector<std::string> overlap_warnings(const Config& c);
 
 bool parse_host_port(const std::string& s, HostPort& out);
+bool sends_to_itself(const HostPort& listen, const HostPort& to);
 std::string usb_text(uint16_t vendor, uint16_t product);
 
 std::string check_rotation(long long v);
 std::string check_mirror(const std::string& v);
 std::string check_aspect(double v);
 std::string check_calibration(const std::vector<double>& v);
+bool calibration_is_flat(const std::vector<double>& v);
 std::string check_silence(long long v);
 std::string check_usb(const std::string& v, uint16_t* vendor, uint16_t* product);
 std::string check_text(const std::string& v, size_t max_len);

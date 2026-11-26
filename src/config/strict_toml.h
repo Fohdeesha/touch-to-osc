@@ -8,10 +8,19 @@
 #include <cmath>
 #include <cstdio>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
 namespace tto {
+
+// every string as one quoted line with escapes: the writer's raw ''' form cannot hold text with ''' in it,
+// and its multi-line form drops a leading newline
+inline std::string plain_toml(const toml::table& t) {
+    std::ostringstream os;
+    os << toml::toml_formatter{t, toml::toml_formatter::default_flags & ~(toml::format_flags::allow_literal_strings | toml::format_flags::allow_multi_line_strings)};
+    return os.str();
+}
 
 class StrictTable {
 public:
@@ -62,6 +71,7 @@ public:
         } else if (v->is_floating_point()) {
             double d = v->as_floating_point()->get();
             if (!std::isfinite(d) || d != std::floor(d)) return fail(key, "must be a whole number");
+            if (d < double(lo) || d > double(hi)) return fail(key, "must be between " + std::to_string(lo) + " and " + std::to_string(hi));
             n = (long long)d;
         } else {
             return fail(key, "must be a number");
@@ -107,6 +117,9 @@ public:
         for (auto&& e : a) {
             if (!e.is_string() || e.as_string()->get().empty() || e.as_string()->get().size() > max_len)
                 return fail(key, "must be a list of non-empty strings");
+            for (unsigned char c : e.as_string()->get()) {
+                if (c < 0x20 || c >= 0x7f) return fail(key, "may only use printable ASCII characters");
+            }
             items.emplace_back(e.as_string()->get());
         }
         out = std::move(items);
@@ -132,7 +145,9 @@ public:
             (void)v;
             std::string key(k.str());
             if (!used_.count(key)) {
-                fail(key, "unknown key" + did_you_mean(key, asked_));
+                std::string shown;
+                for (unsigned char c : key.substr(0, 64)) shown += (c >= 0x20 && c < 0x7f) ? char(c) : '?';
+                fail(shown, "unknown key" + did_you_mean(shown, asked_));
                 return;
             }
         }

@@ -4,9 +4,11 @@
 #include "core/process.h"
 
 #include <cerrno>
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 namespace tto {
 
@@ -37,7 +39,7 @@ Status write_all(int fd, const std::string& data) {
 Status write_file_atomic(const std::string& path, const std::string& contents) {
     std::string dir = dir_of(path);
     std::string tmp = path + ".tmp." + std::to_string(getpid());
-    UniqueFd fd(open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640));
+    UniqueFd fd(open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0640));
     if (!fd) return err("cannot create " + tmp + ": " + errno_str());
     auto st = write_all(fd.get(), contents);
     if (!st) {
@@ -59,6 +61,38 @@ Status write_file_atomic(const std::string& path, const std::string& contents) {
     if (!dfd) return err("open " + dir + ": " + errno_str());
     if (fsync(dfd.get()) != 0) return err("fsync " + dir + ": " + errno_str());
     return {};
+}
+
+Status remove_file_durable(const std::string& path) {
+    if (unlink(path.c_str()) != 0) {
+        if (errno == ENOENT) return {};
+        return err("removing " + path + " failed: " + errno_str());
+    }
+    std::string dir = dir_of(path);
+    UniqueFd dfd(open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (!dfd) return err("open " + dir + ": " + errno_str());
+    if (fsync(dfd.get()) != 0) return err("fsync " + dir + ": " + errno_str());
+    return {};
+}
+
+int remove_stale_temp_files(const std::string& path) {
+    auto slash = path.rfind('/');
+    if (path.empty() || slash == std::string::npos) return 0;
+    std::string dir = dir_of(path);
+    std::string prefix = path.substr(slash + 1) + ".tmp.";
+    DIR* d = opendir(dir.c_str());
+    if (!d) return 0;
+    std::vector<std::string> stale;
+    while (dirent* e = readdir(d)) {
+        std::string name = e->d_name;
+        if (name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0 &&
+            name.find_first_not_of("0123456789", prefix.size()) == std::string::npos)
+            stale.push_back(dir + "/" + name);
+    }
+    closedir(d);
+    int removed = 0;
+    for (const auto& f : stale) removed += unlink(f.c_str()) == 0 ? 1 : 0;
+    return removed;
 }
 
 Result<std::string> read_file(const std::string& path, size_t max_bytes) {

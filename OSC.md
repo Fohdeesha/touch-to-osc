@@ -17,6 +17,11 @@ below).
 - Every second the contacts still down go out, so a lost `up` clears within a second.
 - A finger already down when reading starts is never announced. A `cancel` is never a tap.
 - Nothing creates a touch, and reading touches never waits on the network or the disk.
+- If the reading of a screen with `silence_ms` on ever stops dead with contacts down, the
+  daemon says so in an event, sends `bye` and exits so its service starts it again.
+- One thing the daemon can't see: for screens the kernel handles as Windows 8 touch panels,
+  the kernel itself lifts every finger 100 ms after the screen's last report. That arrives
+  as an `up`, unless `silence_ms` is set below 100 so the cancel comes first.
 
 ## Touches
 
@@ -51,7 +56,8 @@ One bundle per screen frame that changed something, one message per changed cont
   `plain` sends no `h` (touches without `t_us`, counts as `i`) for OSC libraries without
   64-bit ints.
 - `alive` comes every second with one `active` per screen: the contacts down as of `frame`.
-  `run` is random per start. `bye` comes on a clean stop or restart.
+  A new lease gets one at once, before its first touch. `run` is random per start. `bye`
+  comes on a clean stop or restart.
 
 Receiver rules:
 
@@ -60,9 +66,15 @@ Receiver rules:
    lost.
 3. On `active`, end held contacts on that screen that aren't listed and whose last frame is
    not above the list's `frame`.
-4. Ignore `move`, `up` and `cancel` for a contact whose `down` you never saw.
-5. Never treat a `cancel` as a tap.
+4. Ignore `move`, `up` and `cancel` for a contact you don't hold: one whose `down` you never
+   saw, or one that rule 2 or 3 already ended.
+5. Only an `up` is a lift. Never treat a `cancel`, or a contact ended by rule 2 or 3, as a
+   tap.
 6. If `status_gen` skips, ask for `status/send`.
+7. Take packets only from the address the daemon's packets come from.
+
+`tools/watch.py` (installed as `touch-to-osc-watch`) has rules 1 to 5 as a small class,
+`Contacts`, to copy.
 
 ## Status
 
@@ -140,7 +152,7 @@ something needs a look. `reasons` says which.
     /touch/event  s kind  s text  s level  s device
 
 `level` is `notice`, `warning` or `error`; `device` is "" when it's about no screen. Kinds:
-`device`, `resync`, `palm`, `grab`, `enabled`, `silence`, `usb`, `screens`, `identify`,
+`device`, `resync`, `grab`, `enabled`, `silence`, `usb`, `screens`, `identify`,
 `calibrate`, `restart`, `settings`, `subscriber`, `send`.
 
 ## Identify and calibrate
@@ -176,8 +188,8 @@ without running again. A bare command that's refused gets `/touch/error  s addre
 
     /touch/ping [i port]            -> /touch/pong i run
     /touch/status/send [i port]     -> the full status (one every 200 ms, across all hosts)
-    /touch/restart                  restart the daemon (leases are kept)
-    /touch/device/screen/usb_reset  reset the screen's USB hub now
+    /touch/restart                  restart the daemon (leases are kept; 10 in a row, then one every 30 s)
+    /touch/device/screen/usb_reset  reset the screen's USB hub now (one every 5 s)
 
 Settings live at the address the status reports them on, and are saved:
 
@@ -205,5 +217,6 @@ Settings live at the address the status reports them on, and are saved:
     /touch/settings/forget             [s name]   one, device/<id>, or all
 
 `rotation`, `mirror` and `calibration` cancel the screen's contacts; `grab` and `match_*`
-reopen it; `devices`, `listen` and `prefix` restart the daemon. Hosts outside `allowed_ips`
-can only `hello`. Nothing creates a touch.
+reopen it; `devices`, `listen` and `prefix` restart the daemon, and are refused when they
+can't be saved first, or after 10 restarts in a row (see `restart`). Hosts outside
+`allowed_ips` can only `hello`. Nothing creates a touch.

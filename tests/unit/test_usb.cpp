@@ -444,6 +444,7 @@ TEST_CASE("a reset held up in the kernel does not hold up stopping") {
     p.hub_driver = root + "/hub";
     mkdir(p.devices.c_str(), 0755);
     mkdir(p.hub_driver.c_str(), 0755);
+    mkdir((p.devices + "/3-0:1.0").c_str(), 0755);
     std::string unbind = p.hub_driver + "/unbind";
     REQUIRE(mkfifo(unbind.c_str(), 0600) == 0);
     std::atomic<bool> waited{true}, gone{false};
@@ -462,4 +463,217 @@ TEST_CASE("a reset held up in the kernel does not hold up stopping") {
     stopping.join();
     usleep(800000);
     if (fd >= 0) close(fd);
+}
+
+TEST_CASE("a hub that is not there is not reset, leaves no marker, and is not taken for a hub left unbound") {
+    TempDir dir;
+    const std::string& root = dir.path;
+    UsbPaths p;
+    p.devices = root + "/devices";
+    p.hub_driver = root + "/hub";
+    mkdir(p.devices.c_str(), 0755);
+    mkdir(p.hub_driver.c_str(), 0755);
+    touch(p.hub_driver + "/unbind");
+    touch(p.hub_driver + "/bind");
+    std::string marker = root + "/state.toml.usb-reset";
+    Status st = rebind_hub("3-1:1.0", p, marker);
+    REQUIRE_FALSE(st);
+    CHECK(st.error().find("the USB hub 3-1:1.0 is not there") == 0);
+    CHECK(access(marker.c_str(), F_OK) != 0);
+    CHECK(slurp(p.hub_driver + "/unbind").find("3-1:1.0") == std::string::npos);
+    CHECK_FALSE(hub_present("3-1:1.0", p));
+    CHECK_FALSE(hub_bound("3-1:1.0", p));
+    std::ofstream(marker) << "3-1:1.0\n";
+    CHECK(hub_in_marker(marker) == "3-1:1.0");
+    std::string done;
+    CHECK(bind_hub_left_unbound(marker, p, &done));
+    CHECK(done.empty());
+    CHECK(access(marker.c_str(), F_OK) != 0);
+    CHECK(slurp(p.hub_driver + "/bind").find("3-1:1.0") == std::string::npos);
+    std::ofstream(marker) << "../../etc:1.0\n";
+    CHECK(hub_in_marker(marker).empty());
+    CHECK(hub_in_marker(root + "/none").empty());
+}
+
+TEST_CASE("an automatic reset is not started when its marker cannot be written; one asked for is") {
+    TempDir dir;
+    const std::string& root = dir.path;
+    UsbPaths p;
+    p.devices = root + "/devices";
+    p.hub_driver = root + "/hub";
+    mkdir(p.devices.c_str(), 0755);
+    mkdir(p.hub_driver.c_str(), 0755);
+    touch(p.hub_driver + "/unbind");
+    touch(p.hub_driver + "/bind");
+    mkdir((p.devices + "/3-0:1.0").c_str(), 0755);
+    mkdir((p.devices + "/3-0:1.0/driver").c_str(), 0755);
+    std::string marker = root + "/no/such/dir/state.toml.usb-reset";
+    bool tried = true;
+    Status st = rebind_hub("3-0:1.0", p, marker, true, &tried);
+    REQUIRE_FALSE(st);
+    CHECK_FALSE(tried);
+    CHECK(st.error().find("the USB hub 3-0:1.0 was not reset: touch-to-osc could not write " + marker) == 0);
+    CHECK(slurp(p.hub_driver + "/unbind").find("3-0:1.0") == std::string::npos);
+    CHECK(rebind_hub("3-0:1.0", p, marker, false, &tried));
+    CHECK(tried);
+    UsbWorker w(p);
+    w.set_marker(marker);
+    w.reset(*parse_usb_port("3-3"), 0, true);
+    REQUIRE(w.wait(2 * kSec));
+    UsbWorker::Done done;
+    REQUIRE(w.finished(done));
+    CHECK(done.refused);
+    CHECK_FALSE(done.result);
+    CHECK(slurp(p.hub_driver + "/unbind").find("3-0:1.0") == 0);
+}
+
+TEST_CASE("an automatic reset is refused when what else is on the hub cannot be read") {
+    TempDir dir;
+    UsbPaths p;
+    p.devices = dir.path + "/no-devices";
+    p.hub_driver = dir.path + "/hub";
+    mkdir(p.hub_driver.c_str(), 0755);
+    touch(p.hub_driver + "/unbind");
+    bool listed = true;
+    CHECK(usb_neighbours(*parse_usb_port("3-3"), p, &listed).empty());
+    CHECK_FALSE(listed);
+    UsbWorker w(p);
+    w.reset(*parse_usb_port("3-3"), 0, true);
+    REQUIRE(w.wait(2 * kSec));
+    UsbWorker::Done done;
+    REQUIRE(w.finished(done));
+    CHECK(done.refused);
+    CHECK_FALSE(done.held);
+    REQUIRE_FALSE(done.result);
+    CHECK(done.result.error().find("USB bus 3 was not reset by itself: what else is plugged into it could not be read") == 0);
+    CHECK(slurp(p.hub_driver + "/unbind").find("3-0:1.0") == std::string::npos);
+}
+
+TEST_CASE("a hub left unbound by a failed reset is bound again by a repair, which leaves a bound or absent hub alone") {
+    TempDir dir;
+    const std::string& root = dir.path;
+    UsbPaths p;
+    p.devices = root + "/devices";
+    p.hub_driver = root + "/hub";
+    mkdir(p.devices.c_str(), 0755);
+    mkdir(p.hub_driver.c_str(), 0755);
+    touch(p.hub_driver + "/bind");
+    std::string marker = root + "/state.toml.usb-reset";
+    UsbWorker w(p);
+    w.set_marker(marker);
+    auto repair = [&] {
+        w.repair("3-0:1.0", 0);
+        REQUIRE(w.wait(3 * kSec));
+        UsbWorker::Done done;
+        REQUIRE(w.finished(done));
+        CHECK(done.repair);
+        CHECK_FALSE(done.reset);
+        return done;
+    };
+    auto absent = repair();
+    CHECK(absent.result);
+    CHECK(absent.note.empty());
+    CHECK(slurp(p.hub_driver + "/bind").find("3-0:1.0") == std::string::npos);
+    mkdir((p.devices + "/3-0:1.0").c_str(), 0755);
+    std::ofstream(marker) << "3-0:1.0\n";
+    auto failed = repair();
+    REQUIRE_FALSE(failed.result);
+    CHECK(failed.result.error().find("could not be bound again") != std::string::npos);
+    CHECK(slurp(p.hub_driver + "/bind").find("3-0:1.0") == 0);
+    CHECK(access(marker.c_str(), F_OK) == 0);
+    std::ofstream(p.hub_driver + "/bind", std::ios::trunc).flush();
+    std::thread kernel([&] {
+        for (int k = 0; k < 500 && slurp(p.hub_driver + "/bind").find("3-0:1.0") != 0; ++k) usleep(2000);
+        mkdir((p.devices + "/3-0:1.0/driver").c_str(), 0755);
+    });
+    auto bound = repair();
+    kernel.join();
+    CHECK(bound.result);
+    CHECK(bound.note == "the USB hub 3-0:1.0 is bound again");
+    CHECK(access(marker.c_str(), F_OK) != 0);
+    std::ofstream(p.hub_driver + "/bind", std::ios::trunc).flush();
+    auto again = repair();
+    CHECK(again.result);
+    CHECK(again.note.empty());
+    CHECK(slurp(p.hub_driver + "/bind").empty());
+}
+
+TEST_CASE("a reset someone asked for starts the wait over without counting as a try") {
+    constexpr Nanos s = kSec;
+    std::vector<UsbRecovery> recs(2);
+    std::vector<std::string> watched = {"3-0:1.0", "1-0:1.0"};
+    CHECK(recs[0].observe(0, PortState::stuck) == Step::wait);
+    CHECK(recs[1].observe(0, PortState::stuck) == Step::wait);
+    reset_done_on_hub(recs, watched, 0, "3-0:1.0", 9 * s, true);
+    CHECK(recs[0].attempts() == 0);
+    CHECK(recs[0].tries() == 0);
+    CHECK(recs[0].observe(10 * s, PortState::stuck) == Step::wait);
+    CHECK(recs[0].observe(18 * s, PortState::stuck) == Step::wait);
+    CHECK(recs[0].observe(19 * s, PortState::stuck) == Step::reset);
+    CHECK(recs[1].observe(10 * s, PortState::stuck) == Step::reset);
+}
+
+TEST_CASE("a screen that reads again for a moment keeps its count of resets; one that stays read loses it") {
+    UsbRecovery r;
+    const Nanos s = kSec;
+    r.observe(0, PortState::stuck);
+    REQUIRE(r.observe(10 * s, PortState::stuck) == Step::reset);
+    r.reset_done(10 * s);
+    CHECK(r.back(12 * s));
+    CHECK_FALSE(r.back(13 * s));
+    CHECK(r.attempts() == 1);
+    CHECK(r.tries() == 1);
+    // gone and stuck again 3 s later: the wait is the second one, 20 s, not the first
+    CHECK(r.observe(15 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(34 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(35 * s, PortState::stuck) == Step::reset);
+    r.reset_done(35 * s);
+    CHECK(r.back(40 * s));
+    CHECK(r.tries() == 2);
+    for (Nanos t = 41 * s; t < 100 * s; t += s) CHECK_FALSE(r.back(t));
+    CHECK(r.tries() == 2);
+    CHECK_FALSE(r.back(100 * s));
+    CHECK(r.tries() == 0);
+    CHECK(r.attempts() == 0);
+    r.observe(200 * s, PortState::stuck);
+    CHECK(r.observe(209 * s, PortState::stuck) == Step::wait);
+    CHECK(r.observe(210 * s, PortState::stuck) == Step::reset);
+}
+
+TEST_CASE("a screen that comes back for a moment after every reset is reset 5 times, not for ever") {
+    UsbRecovery r;
+    const Nanos s = kSec;
+    Nanos t = 0;
+    int resets = 0;
+    bool gave_up = false;
+    for (int round = 0; round < 40 && !gave_up; ++round) {
+        r.observe(t, PortState::stuck);
+        for (int k = 0; k < 400; ++k) {
+            t += s;
+            auto step = r.observe(t, PortState::stuck);
+            if (step == Step::give_up) gave_up = true;
+            if (step != Step::wait) break;
+        }
+        if (gave_up) break;
+        r.reset_done(t);
+        ++resets;
+        r.back(t + 2 * s);
+        r.back(t + 3 * s);
+        t += 5 * s;
+    }
+    CHECK(gave_up);
+    CHECK(resets == 5);
+    CHECK(r.gave_up());
+    // it reads again for a moment after the last one too: still given up
+    r.back(t);
+    CHECK(r.gave_up());
+    for (Nanos u = t + s; u < t + 3600 * s; u += 7 * s) CHECK(r.observe(u, PortState::stuck) == Step::wait);
+}
+
+TEST_CASE("a hold ends the moment the screen reads again") {
+    UsbRecovery r;
+    r.observe(0, PortState::stuck);
+    r.hold();
+    CHECK(r.back(kSec));
+    CHECK_FALSE(r.held());
 }

@@ -1,7 +1,6 @@
 [Unit]
 Description=touch-to-osc: touchscreen touches as OSC
-After=network-online.target
-Wants=network-online.target
+After=network.target
 StartLimitIntervalSec=0
 
 [Service]
@@ -15,6 +14,8 @@ WatchdogSec=10
 TimeoutStopSec=5
 User=root
 StateDirectory=touch-to-osc
+RuntimeDirectory=touch-to-osc
+RuntimeDirectoryPreserve=restart
 CapabilityBoundingSet=
 NoNewPrivileges=yes
 DevicePolicy=closed
@@ -24,7 +25,13 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+UMask=0027
+OOMScoreAdjust=-500
 RestrictAddressFamilies=AF_INET AF_UNIX
 RestrictRealtime=yes
 RestrictNamespaces=yes

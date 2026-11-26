@@ -13,6 +13,8 @@ ABS_X, ABS_Y = 0x00, 0x01
 ABS_MT_SLOT = 0x2F
 ABS_MT_POSITION_X, ABS_MT_POSITION_Y = 0x35, 0x36
 ABS_MT_TRACKING_ID = 0x39
+ABS_MT_TOOL_TYPE = 0x37
+MT_TOOL_FINGER, MT_TOOL_PALM = 0, 2
 INPUT_PROP_DIRECT = 1
 BUS_VIRTUAL = 0x06
 
@@ -39,7 +41,8 @@ def ui_get_sysname(length):
 
 
 class TouchScreen:
-    def __init__(self, name, vendor, product, slots=10, xmax=1920, ymax=1080, resolution=4, direct=True, phys=None, multitouch=True, btn_touch=True):
+    def __init__(self, name, vendor, product, slots=10, xmax=1920, ymax=1080, resolution=4, direct=True, phys=None, multitouch=True, btn_touch=True,
+                 tool=False):
         self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
         self.slots = slots
         self.multitouch = multitouch
@@ -58,6 +61,8 @@ class TouchScreen:
                 (ABS_MT_POSITION_Y, 0, ymax, resolution),
                 (ABS_MT_TRACKING_ID, 0, 65535, 0),
             ]
+            if tool:
+                axes.append((ABS_MT_TOOL_TYPE, 0, 2, 0))
         for code, lo, hi, res in axes:
             fcntl.ioctl(self.fd, UI_SET_ABSBIT, code)
             fcntl.ioctl(self.fd, UI_ABS_SETUP, struct.pack("H2xiiiiii", code, 0, lo, hi, 0, 0, res))
@@ -107,6 +112,11 @@ class TouchScreen:
             self.emit(EV_ABS, ABS_MT_POSITION_X, x)
             self.emit(EV_ABS, ABS_MT_POSITION_Y, y)
         self.active[slot] = (x, y)
+
+    def palm(self, slot, on=True):
+        """Mark the contact in a slot as a palm, as a screen with palm rejection does, or as a finger again."""
+        self.emit(EV_ABS, ABS_MT_SLOT, slot)
+        self.emit(EV_ABS, ABS_MT_TOOL_TYPE, MT_TOOL_PALM if on else MT_TOOL_FINGER)
 
     def lift(self, slot):
         if self.multitouch:

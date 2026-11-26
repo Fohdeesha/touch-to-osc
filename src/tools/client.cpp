@@ -16,6 +16,7 @@
 #include <poll.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 namespace tto {
 
@@ -78,11 +79,10 @@ struct Link {
         }
     }
 
-    void silent() const {
-        std::fprintf(stderr,
-                     "no answer from touch-to-osc on %s: is it running (systemctl status touch-to-osc), and is this machine "
-                     "(127.0.0.1) in osc.allowed_ips?\n",
+    void silent(const std::string& also) const {
+        std::fprintf(stderr, "no answer from touch-to-osc on %s: is it running (systemctl status touch-to-osc), and is this machine in osc.allowed_ips?\n",
                      target.c_str());
+        if (!also.empty()) std::fprintf(stderr, "%s\n", also.c_str());
     }
 };
 
@@ -120,25 +120,37 @@ osc::Arg word_arg(const std::string& w) {
 
 }
 
-int status_command(const Config& cfg) {
+int status_command(const Config& cfg, const std::string& if_silent) {
     Link link;
     if (!link.open(cfg)) return 6;
-    link.send({cfg.osc.prefix + "/status/send", {}});
     std::map<std::string, std::vector<osc::Arg>> got;
     std::vector<osc::Message> msgs;
-    Nanos until = monotonic_ns() + kFirstAnswer;
-    while (link.next(msgs, until)) {
-        for (auto& m : msgs) {
-            if (m.address == cfg.osc.prefix + "/error") {
-                std::fprintf(stderr, "touch-to-osc refused: %s\n", m.args.size() == 2 ? text(m.args[1]).c_str() : joined(m.args).c_str());
-                return 6;
+    for (int tries = 0; tries < 4 && got.empty(); ++tries) {
+        link.send({cfg.osc.prefix + "/status/send", {}});
+        bool busy = false;
+        Nanos until = monotonic_ns() + kFirstAnswer;
+        while (!busy && link.next(msgs, until)) {
+            for (auto& m : msgs) {
+                if (m.address == cfg.osc.prefix + "/error") {
+                    if (m.args.size() == 2 && text(m.args[0]) != cfg.osc.prefix + "/status/send") continue;
+                    std::string why = m.args.size() == 2 ? text(m.args[1]) : joined(m.args);
+                    if (why.find("status requests a second") != std::string::npos && tries < 3) {
+                        busy = true;
+                        break;
+                    }
+                    std::fprintf(stderr, "touch-to-osc refused: %s\n", why.c_str());
+                    return 6;
+                }
+                if (m.address.rfind(cfg.osc.prefix + "/", 0) == 0) got[m.address.substr(cfg.osc.prefix.size() + 1)] = std::move(m.args);
             }
-            if (m.address.rfind(cfg.osc.prefix + "/", 0) == 0) got[m.address.substr(cfg.osc.prefix.size() + 1)] = std::move(m.args);
+            until = monotonic_ns() + kQuietAfter;
         }
-        until = monotonic_ns() + kQuietAfter;
+        if (!busy) break;
+        got.clear();
+        usleep(250000);
     }
     if (got.empty()) {
-        link.silent();
+        link.silent(if_silent);
         return 6;
     }
     auto one = [&](const std::string& k) { return got.count(k) ? joined(got[k]) : std::string("?"); };
@@ -166,7 +178,7 @@ int status_command(const Config& cfg) {
     return 0;
 }
 
-int send_command(const Config& cfg, const std::vector<std::string>& words) {
+int send_command(const Config& cfg, const std::vector<std::string>& words, const std::string& if_silent) {
     if (words.empty()) {
         std::fprintf(stderr, "--send needs an address, such as: touch-to-osc --send device/screen/rotation 90\n");
         return 1;
@@ -188,6 +200,7 @@ int send_command(const Config& cfg, const std::vector<std::string>& words) {
         while (link.next(msgs, until)) {
             for (const auto& m : msgs) {
                 if (m.address == cfg.osc.prefix + "/error") {
+                    if (m.args.size() == 2 && text(m.args[0]) != cfg.osc.prefix + "/request") continue;
                     std::fprintf(stderr, "refused: %s\n", m.args.size() == 2 ? text(m.args[1]).c_str() : joined(m.args).c_str());
                     return 6;
                 }
@@ -202,7 +215,7 @@ int send_command(const Config& cfg, const std::vector<std::string>& words) {
             }
         }
     }
-    link.silent();
+    link.silent(if_silent);
     return 6;
 }
 

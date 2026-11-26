@@ -68,7 +68,7 @@ toml::table device_table(const DeviceOverrides& x) {
 
 bool has(const std::vector<std::string>& v, const std::string& s) { return std::find(v.begin(), v.end(), s) != v.end(); }
 
-void parse_device(StrictTable& d, DeviceOverrides& x) {
+void parse_device(StrictTable& d, DeviceOverrides& x, bool* flat_calibration = nullptr) {
     std::string s;
     if (d.str("label", s, 64)) x.label = s;
     bool b = false;
@@ -77,7 +77,10 @@ void parse_device(StrictTable& d, DeviceOverrides& x) {
     if (d.integer("rotation", n, -100000, 100000) && d.check("rotation", check_rotation(n))) x.rotation = int(n);
     if (d.str("mirror", s, 4) && d.check("mirror", check_mirror(s))) x.mirror = s;
     std::vector<double> cal;
-    if (d.numbers("calibration", cal) && d.check("calibration", check_calibration(cal))) x.calibration = cal;
+    if (d.numbers("calibration", cal)) {
+        if (flat_calibration && calibration_is_flat(cal)) *flat_calibration = true;
+        else if (d.check("calibration", check_calibration(cal))) x.calibration = cal;
+    }
     double a = 0;
     if (d.number("aspect", a) && d.check("aspect", check_aspect(a))) x.aspect = a;
     if (d.integer("silence_ms", n, -100000, 100000) && d.check("silence_ms", check_silence(n))) x.silence_ms = int(n);
@@ -134,6 +137,10 @@ void parse_config_values(const toml::node* v, Overrides& out) {
     StrictTable t(v, "config_values");
     std::string level;
     if (t.str("log_level", level, 16, false) && t.check("log_level", check_log_level(level))) vals.log_level = level;
+    std::string given;
+    HostPort listen;
+    if (t.str("listen", given, 64, false) && t.check("listen", check_listen(given, listen))) vals.listen = listen;
+    if (t.str("prefix", given, 64, false) && t.check("prefix", check_prefix(given))) vals.prefix = given;
     if (const toml::node* devs = t.take("device"); devs && devs->is_table()) {
         for (auto&& [k, node] : *devs->as_table()) {
             std::string id(k.str());
@@ -350,6 +357,10 @@ bool forget_override(Overrides& o, const std::string& name) {
 void note_config_values(const Overrides& before, const Overrides& after, const Config& file, Overrides& values) {
     if (!after.log_level) values.log_level.reset();
     else if (after.log_level != before.log_level) values.log_level = file.log.level;
+    if (!after.listen) values.listen.reset();
+    else if (after.listen != before.listen) values.listen = file.osc.listen;
+    if (!after.prefix) values.prefix.reset();
+    else if (after.prefix != before.prefix) values.prefix = file.osc.prefix;
     for (auto it = values.devices.begin(); it != values.devices.end();) {
         if (!after.devices.count(it->first) && !after.unused_devices.count(it->first)) it = values.devices.erase(it);
         else ++it;
@@ -404,9 +415,11 @@ std::string settings_text(const Overrides& o, const Overrides& values, const std
         for (const auto& [id, x] : o.unused_devices) devices.insert(id, device_table(x));
         t.insert("device", std::move(devices));
     }
-    if (values.log_level || !values.devices.empty()) {
+    if (values.log_level || values.listen || values.prefix || !values.devices.empty()) {
         toml::table v;
         if (values.log_level) v.insert("log_level", *values.log_level);
+        if (values.listen) v.insert("listen", values.listen->text());
+        if (values.prefix) v.insert("prefix", *values.prefix);
         if (!values.devices.empty()) {
             toml::table devices;
             for (const auto& [id, x] : values.devices) devices.insert(id, device_table(x));
@@ -414,16 +427,53 @@ std::string settings_text(const Overrides& o, const Overrides& values, const std
         }
         t.insert("config_values", std::move(v));
     }
+    std::string shown;
+    for (unsigned char c : config_path) shown += (c >= 0x20 && c < 0x7f) ? char(c) : '?';
     std::ostringstream os;
-    os << "# Written by touch-to-osc: the settings changed over OSC, on top of " << config_path << ".\n"
+    os << "# Written by touch-to-osc: the settings changed over OSC, on top of " << shown << ".\n"
        << "# They win over that file, unless the file's own value was changed after the setting was saved here\n"
        << "# (config_values says what the file said then). Send <prefix>/settings/forget to drop them,\n"
        << "# or delete this file and restart.\n\n"
-       << t << "\n";
+       << plain_toml(t) << "\n";
     return os.str();
 }
 
-Result<SettingsLoad> parse_settings(const std::string& text, const std::string& source, const Config& base) {
+namespace {
+
+bool remember_config_values(const Overrides& o, const Config& file, Overrides& values) {
+    bool changed = false;
+    if (o.log_level && !values.log_level) {
+        values.log_level = file.log.level;
+        changed = true;
+    }
+    if (o.listen && !values.listen) {
+        values.listen = file.osc.listen;
+        changed = true;
+    }
+    if (o.prefix && !values.prefix) {
+        values.prefix = file.osc.prefix;
+        changed = true;
+    }
+    for (const auto& d : file.devices) {
+        auto it = o.devices.find(d.id);
+        if (it == o.devices.end()) continue;
+        DeviceOverrides now = device_values(d);
+        DeviceOverrides& v = values.devices[d.id];
+        each(
+            [&](const char*, const auto& over, const auto& file_now, auto& slot) {
+                if (!over || slot) return;
+                slot = file_now;
+                changed = true;
+            },
+            it->second, now, v);
+        if (v.empty()) values.devices.erase(d.id);
+    }
+    return changed;
+}
+
+}
+
+Result<SettingsLoad> parse_settings(const std::string& text, const std::string& source, const Config& base, bool file_wins) {
     toml::table tbl;
     try {
         tbl = toml::parse(text, source);
@@ -451,6 +501,7 @@ Result<SettingsLoad> parse_settings(const std::string& text, const std::string& 
                 DeviceConfig dc;
                 std::string usb;
                 if (d.str("id", dc.id, 32, false)) d.check("id", check_device_id(dc.id));
+                if (d.ok() && dc.id.empty()) d.fail("id", "is missing");
                 if (d.str("match_usb", usb, 16) && !usb.empty() && d.check("match_usb", check_usb(usb, &dc.vendor, &dc.product))) dc.has_usb = true;
                 d.str("match_port", dc.port, 64);
                 if (d.ok() && !dc.has_usb && dc.port.empty()) d.fail("", "matches nothing: it needs match_usb or match_port");
@@ -525,11 +576,16 @@ Result<SettingsLoad> parse_settings(const std::string& text, const std::string& 
                              std::any_of(o.devices_added.begin(), o.devices_added.end(), [&](const DeviceConfig& d) { return d.id == id; });
                 StrictTable d(&node, "device." + id);
                 DeviceOverrides x;
-                if (d.ok()) parse_device(d, x);
+                bool flat = false;
+                if (d.ok()) parse_device(d, x, &flat);
                 d.finish();
                 if (!d.ok()) {
                     root.adopt(d.error());
                     break;
+                }
+                if (flat) {
+                    out.notes.push_back("device/" + id + "/calibration: the calibration saved over OSC would put every touch on one line, so it is dropped");
+                    out.rewrite = true;
                 }
                 if (x.empty()) continue;
                 if (known) {
@@ -544,40 +600,112 @@ Result<SettingsLoad> parse_settings(const std::string& text, const std::string& 
     if (const toml::node* v = root.take("config_values")) parse_config_values(v, out.config_values);
     root.finish();
     if (!root.ok()) return err(source + ": " + root.error());
+    auto file_won = [&](const std::string& name, const std::string& was, const std::string& now, const std::string& over) {
+        out.notes.push_back(name + ": the config file changed from " + was + " to " + now + " after " + over + " was saved over OSC, so the config file's " + now +
+                            " applies now");
+        out.rewrite = true;
+    };
+    if (file_wins && o.log_level && out.config_values.log_level && base.log.level != *out.config_values.log_level) {
+        file_won("log_level", value_text(*out.config_values.log_level), value_text(base.log.level), value_text(*o.log_level));
+        o.log_level.reset();
+        out.config_values.log_level.reset();
+    }
+    if (file_wins && o.listen && out.config_values.listen && base.osc.listen != *out.config_values.listen) {
+        file_won("listen", value_text(out.config_values.listen->text()), value_text(base.osc.listen.text()), value_text(o.listen->text()));
+        o.listen.reset();
+        out.config_values.listen.reset();
+    }
+    if (file_wins && o.prefix && out.config_values.prefix && base.osc.prefix != *out.config_values.prefix) {
+        file_won("prefix", value_text(*out.config_values.prefix), value_text(base.osc.prefix), value_text(*o.prefix));
+        o.prefix.reset();
+        out.config_values.prefix.reset();
+    }
+    for (const auto& d : base.devices) {
+        auto it = o.devices.find(d.id);
+        auto vit = out.config_values.devices.find(d.id);
+        if (!file_wins || it == o.devices.end() || vit == out.config_values.devices.end()) continue;
+        DeviceOverrides now = device_values(d);
+        each(
+            [&](const char* k, auto& over, const auto& was, const auto& file_now) {
+                if (!over || !was || !file_now || *was == *file_now) return;
+                file_won("device/" + d.id + "/" + k, value_text(*was), value_text(*file_now), value_text(*over));
+                over.reset();
+            },
+            it->second, vit->second, now);
+    }
+    auto dropped = [&](const std::string& what) {
+        out.notes.push_back(what);
+        out.rewrite = true;
+    };
+    if (apply_overrides(base, o).devices.empty()) {
+        o.devices_removed.clear();
+        dropped("the devices removed over OSC are all the config file has now, which would leave no device: they are read again");
+    }
+    for (const auto& d : apply_overrides(base, o).devices) {
+        if (d.has_usb || !d.port.empty()) continue;
+        auto it = o.devices.find(d.id);
+        if (it == o.devices.end()) continue;
+        it->second.match_usb.reset();
+        it->second.match_port.reset();
+        if (it->second.empty()) o.devices.erase(it);
+        dropped("device/" + d.id + ": its match_usb and match_port saved over OSC would leave it matching nothing with the config file as it is now, so the config file's apply");
+    }
     Config eff = apply_overrides(base, o);
+    if (!eff.osc.open_to_any && eff.osc.allowed_ips.empty()) {
+        o.allowed_removed.clear();
+        dropped("the hosts taken off the allowed hosts over OSC are all the config file allows now, which would lock out every host: they are allowed again");
+        eff = apply_overrides(base, o);
+    }
     if (eff.devices.empty()) return err(source + ": with these settings no device would be left");
     for (const auto& d : eff.devices) {
         if (!d.has_usb && d.port.empty()) return err(source + ": device." + d.id + " would match nothing: it has neither usb nor port");
     }
     if (!eff.osc.open_to_any && eff.osc.allowed_ips.empty()) return err(source + ": with these settings no host would be allowed, which would lock out every host");
-    if (o.log_level && out.config_values.log_level && base.log.level != *out.config_values.log_level) {
-        out.notes.push_back("log_level: the config file changed from " + value_text(*out.config_values.log_level) + " to " + value_text(base.log.level) + " after " +
-                            value_text(*o.log_level) + " was saved over OSC, so the config file's " + value_text(base.log.level) + " applies now");
-        o.log_level.reset();
-        out.config_values.log_level.reset();
-        out.rewrite = true;
+    auto to_itself = [&](const DestinationConfig& d) { return sends_to_itself(eff.osc.listen, d.address); };
+    if (o.listen && std::any_of(eff.destinations.begin(), eff.destinations.end(), to_itself)) {
+        o.listen.reset();
+        out.config_values.listen.reset();
+        dropped("the listen address saved over OSC is the address of a destination now: the config file's listen applies");
+        eff = apply_overrides(base, o);
     }
-    for (const auto& d : base.devices) {
-        auto it = o.devices.find(d.id);
-        auto vit = out.config_values.devices.find(d.id);
-        if (it == o.devices.end() || vit == out.config_values.devices.end()) continue;
-        DeviceOverrides now = device_values(d);
-        each(
-            [&](const char* k, auto& over, const auto& was, const auto& file_now) {
-                if (!over || !was || !file_now || *was == *file_now) return;
-                out.notes.push_back("device/" + d.id + "/" + k + ": the config file changed from " + value_text(*was) + " to " + value_text(*file_now) + " after " +
-                                    value_text(*over) + " was saved over OSC, so the config file's " + value_text(*file_now) + " applies now");
-                over.reset();
-                out.rewrite = true;
-            },
-            it->second, vit->second, now);
+    if (std::any_of(o.destinations_added.begin(), o.destinations_added.end(), to_itself)) {
+        o.destinations_added.erase(std::remove_if(o.destinations_added.begin(), o.destinations_added.end(), to_itself), o.destinations_added.end());
+        dropped("a destination saved over OSC is touch-to-osc's own listen address now: it is dropped");
     }
     drop_unchanged(o, base);
     note_config_values(o, o, base, out.config_values);
+    if (file_wins && remember_config_values(o, base, out.config_values)) out.rewrite = true;
+    if (!file_wins) out.rewrite = false;
     return out;
 }
 
 namespace {
+
+std::vector<std::string> turned_off_by_text(const std::string& text) {
+    std::vector<std::string> ids;
+    std::string id;
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::string s;
+        for (char c : line) {
+            if (c != ' ' && c != '\t' && c != '\r') s += c;
+        }
+        if (s.empty() || s[0] == '#') continue;
+        if (s[0] == '[') {
+            id.clear();
+            const std::string head = "[device.";
+            if (s.compare(0, head.size(), head) == 0 && s.back() == ']') {
+                id = s.substr(head.size(), s.size() - head.size() - 1);
+                if (id.size() >= 2 && (id.front() == '"' || id.front() == '\'') && id.back() == id.front()) id = id.substr(1, id.size() - 2);
+                if (!check_device_id(id).empty()) id.clear();
+            }
+            continue;
+        }
+        if (!id.empty() && s.compare(0, 13, "enabled=false") == 0 && (s.size() == 13 || s[13] == '#')) ids.push_back(id);
+    }
+    return ids;
+}
 
 std::vector<std::string> keep_turned_off(const std::string& text, const Config& base, Overrides& o) {
     std::vector<std::string> kept;
@@ -585,6 +713,12 @@ std::vector<std::string> keep_turned_off(const std::string& text, const Config& 
     try {
         tbl = toml::parse(text, std::string("settings"));
     } catch (const toml::parse_error&) {
+        for (const auto& id : turned_off_by_text(text)) {
+            auto d = std::find_if(base.devices.begin(), base.devices.end(), [&](const DeviceConfig& x) { return x.id == id; });
+            if (d == base.devices.end() || !d->enabled || o.devices[id].enabled) continue;
+            o.devices[id].enabled = false;
+            kept.push_back(id);
+        }
         return kept;
     }
     const toml::table* devices = tbl["device"].as_table();
@@ -603,7 +737,7 @@ std::vector<std::string> keep_turned_off(const std::string& text, const Config& 
 
 }
 
-SettingsLoad load_settings(const Config& base, bool set_aside_refused) {
+SettingsLoad load_settings(const Config& base, bool set_aside_refused, bool file_wins) {
     SettingsLoad none;
     const std::string& path = base.paths.settings;
     struct stat st {};
@@ -615,7 +749,7 @@ SettingsLoad load_settings(const Config& base, bool set_aside_refused) {
         return none;
     }
     auto text = read_file(path, 1 << 20);
-    Result<SettingsLoad> parsed = text ? parse_settings(*text, path, base) : Result<SettingsLoad>(err(text.error()));
+    Result<SettingsLoad> parsed = text ? parse_settings(*text, path, base, file_wins) : Result<SettingsLoad>(err(text.error()));
     if (parsed) {
         parsed->file_exists = true;
         return std::move(*parsed);
